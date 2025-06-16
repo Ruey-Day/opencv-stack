@@ -17,3 +17,5 @@ This repository is primarily for personal reference, but many starter materials 
 OpenCV: https://github.com/jasmcaus/opencv-course/tree/master
 
 Pytorch: https://github.com/patrickloeber/pytorchTutorial
+
+CUDA: 
