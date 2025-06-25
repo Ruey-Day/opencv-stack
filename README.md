@@ -32,4 +32,4 @@ OpenCV: https://github.com/jasmcaus/opencv-course/tree/master
 
 Pytorch: https://github.com/patrickloeber/pytorchTutorial
 
-CUDA: 
+CUDA: https://github.com/Infatoshi/cuda-course
