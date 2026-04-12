@@ -1,0 +1,9 @@
+*.pyc
+*.pkl
+*.log
+events.out.*
+__pycache__/
+*.pth 
+.claude/
+.claude_cache/
+.claude_cache_*
