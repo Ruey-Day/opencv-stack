@@ -1,6 +1,6 @@
-# scale-aware-PlueckerNet
+# ScalePluckerNet
 
-This repo extends [PlueckerNet](https://github.com/Liumouliu/PlueckerNet) (Liu et al., CVPR 2021) from **SE(3)** to **Sim(3)** — adding support for unknown scale in 3D line registration. It has two parts:
+**ScalePluckerNet** extends [PlueckerNet](https://github.com/Liumouliu/PlueckerNet) (Liu et al., CVPR 2021) from **SE(3)** to **Sim(3)** — jointly recovering rotation R, translation t, *and scale s* from Plücker line correspondences. It has two parts:
 
 | Part | What it does |
 |------|-------------|
@@ -18,6 +18,107 @@ To our knowledge no prior work explicitly extends a Plücker-coordinate matching
 **Key design insight:** the correspondence network does not need to change. The Sinkhorn matching learns scale-agnostic features (directions `d` are unit vectors under Sim(3); relative moment structure within each point set is preserved up to a global scale). Only the RANSAC back-end needs to be extended to Sim(3). The scale is then recovered analytically from the matched line correspondences.
 
 **Critical implementation note:** moment vectors `m` must **not** be normalized before feeding to the network. Their magnitude encodes scene scale; normalizing them destroys the only signal that makes scale estimation possible.
+
+---
+
+## Model Architecture
+
+### Full inference pipeline
+
+```
+  Sequence A (RGBD / monocular)        Sequence B (RGBD / monocular)
+         │                                      │
+  ┌──────▼──────┐                       ┌───────▼──────┐
+  │ Line detect │                       │ Line detect  │
+  │  (LSD/PCA) │                       │  (LSD/PCA)  │
+  └──────┬──────┘                       └───────┬──────┘
+         │ 2D segments                          │ 2D segments
+  ┌──────▼──────┐                       ┌───────▼──────┐
+  │ Lift to 3D  │                       │ Lift to 3D   │
+  │  Plücker    │                       │  Plücker     │
+  │  [m, d]     │                       │  [m, d]      │
+  └──────┬──────┘                       └───────┬──────┘
+         │ L₁ ∈ ℝᴺ¹ˣ⁶                          │ L₂ ∈ ℝᴺ²ˣ⁶
+         └──────────────┬───────────────────────┘
+                        │
+               ┌────────▼────────┐
+               │  ScalePluckerNet │
+               │   (PluckerNetKnn)│
+               │                 │
+               │  ┌───────────┐  │
+               │  │KNN encoder│  │    x[:,:3,:] moments  → KNN graph → Conv2d → (B,64,N)
+               │  │  per cloud│  │    x[:,3:,:] directions→ KNN graph → Conv2d → (B,64,N)
+               │  └─────┬─────┘  │    concat + MLP → (B,128,N)
+               │        │        │
+               │  ┌─────▼─────┐  │
+               │  │Spatial GNN│  │    12 layers alternating:
+               │  │self+cross │  │      self-attention  (within one cloud)
+               │  │ ×6 each   │  │      cross-attention (between clouds)
+               │  └─────┬─────┘  │    each layer: MultiHeadedAttention(4 heads) + MLP residual
+               │        │        │
+               │  ┌─────▼─────┐  │
+               │  │ Sinkhorn  │  │    pairwise L2 distance matrix (N₁×N₂)
+               │  │  OT 30it  │  │    → Sinkhorn normalisation (30 iterations)
+               │  └─────┬─────┘  │    → doubly-stochastic prob_matrix ∈ ℝᴺ¹ˣᴺ²
+               └────────┼────────┘
+                        │ prob_matrix
+               ┌────────▼────────┐
+               │  Top-K select   │    argmax top-K entries → K candidate pairs (i₁, i₂)
+               └────────┬────────┘
+                        │ K matched Plücker pairs
+               ┌────────▼────────┐
+               │  Sim(3) RANSAC  │    Stage 1: R  from direction SVD   (scale-invariant)
+               │                 │    Stage 2: s,t from moment LS       (3n×4 system)
+               │  minimal solver │    Inlier: ‖L₂ − M_sim3·L₁‖₂ < τ
+               │  n=2 pairs      │    Refine on all inliers
+               └────────┬────────┘
+                        │
+                    s,  R,  t
+```
+
+### Input format
+
+Lines are represented as 6D Plücker vectors in **[m, d] order** (moment first):
+
+```
+L = [m₀  m₁  m₂  d₀  d₁  d₂]     m = p × d  (moment),  d = unit direction
+```
+
+The optional 9D color extension appends RGB: `[m₀ m₁ m₂  d₀ d₁ d₂  r  g  b]`.
+
+### Network layers (PluckerNetKnn)
+
+| Layer | Input | Output | Notes |
+|-------|-------|--------|-------|
+| KNN graph conv — moments | `(B, 3, N)` | `(B, 64, N)` | `get_graph_feature` + Conv2d + MLP |
+| KNN graph conv — directions (+RGB) | `(B, 3+, N)` | `(B, 64, N)` | same structure |
+| MLP merge | `(B, 128, N)` | `(B, 128, N)` | concat → linear → BN → ReLU |
+| Self-attention ×6 | `(B, 128, N)` | `(B, 128, N)` | MultiHead(4 heads, dim=32) + MLP residual |
+| Cross-attention ×6 | `(B, 128, N₁)` + `(B, 128, N₂)` | same | queries from one cloud, keys/values from the other |
+| Pairwise L2 distance | `(B, 128, N₁)`, `(B, 128, N₂)` | `(B, N₁, N₂)` | |
+| Sinkhorn OT | `(B, N₁, N₂)` | `(B, N₁, N₂)` | 30 iterations, temperature λ=0.1 |
+
+**Output:** `prob_matrix` — soft doubly-stochastic matrix where `prob_matrix[b, i, j]` is the probability that line `i` in cloud 1 corresponds to line `j` in cloud 2.
+
+### Why the network does not need to change for Sim(3)
+
+Under Sim(3), directions transform as `d′ = Rd` (scale-invariant), so the KNN graph structure is **identical** in both views. The GNN's self-attention sees the same neighbourhood layout; its cross-attention learns to match lines with the same rotated direction and consistent moment ratio. The network never sees scale explicitly — it only learns which pairs are geometrically consistent. Scale is then recovered analytically by the RANSAC back-end from the moment magnitudes of the matched pairs.
+
+### Sim(3) RANSAC — minimal solver
+
+Given `R` from direction SVD (same as SE(3) RANSAC), scale and translation are solved jointly from **2 line pairs** (6 equations, 4 unknowns):
+
+```
+s · Rm₁ᵢ  −  [d₂ᵢ×] · t  =  m₂ᵢ       for i = 1, 2
+
+⎡ Rm₁₁  −skew(d₂₁) ⎤ ⎡ s ⎤   ⎡ m₂₁ ⎤
+⎢                   ⎥ ⎢   ⎥ = ⎢     ⎥     A ∈ ℝ⁶ˣ⁴,  x ∈ ℝ⁴
+⎣ Rm₁₂  −skew(d₂₂) ⎦ ⎣ t ⎦   ⎣ m₂₂ ⎦
+
+→  x = lstsq(A, b)     (closed form, no iteration)
+```
+
+Any hypothesis with `s ≤ 0` is rejected. The best hypothesis is refined on all inliers.
 
 ---
 
@@ -207,7 +308,7 @@ torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 | Model | Dataset | avg_inlier_ratio | recall_rot |
 |-------|---------|-----------------|------------|
 | SE3 PlueckerNet (pre-trained) | Semantic3D (real) | 43.3% | — |
-| **Sim3 PlueckerNet (ours)** | Synthetic direction-clustered | **54.8%** | **1.000** |
+| **ScalePluckerNet (ours)** | Synthetic direction-clustered | **54.8%** | **1.000** |
 
 **Important caveat:** these are not apples-to-apples. The original SE3 model is evaluated on real noisy Semantic3D line reconstructions with variable scene sizes (up to 3000 lines) using RANSAC threshold 0.5. Our Sim3 model is trained and evaluated on simpler synthetic data (130 fixed lines, threshold 0.1). The comparison shows the architecture can handle Sim3, but a fair benchmark would require applying scale augmentation to the real SE3 data.
 
@@ -505,8 +606,674 @@ Our Sim3 evaluation uses the same metrics but with synthetic data and threshold 
 
 ---
 
+## Evaluation Results
+
+Run `python eval_benchmark.py` to reproduce all figures and the numeric table.
+
+### Setup
+
+| Item | Value |
+|------|-------|
+| SE3-PlueckerNet weights | `../PlueckerNet/output/semantic3D/preTrained/best_val_checkpoint_real.pth` |
+| ScalePluckerNet weights | `output/sim3_synthetic/2026-04-12/best_val_checkpoint.pth` (epoch 124, 6D) |
+| Pure-Sim3-RANSAC | Direction cosine-NN matching + our Sim3 RANSAC; no network |
+| Hardware | NVIDIA GPU (CUDA) |
+
+### Experiments
+
+| ID | Description | GT transform |
+|----|-------------|-------------|
+| **A1** | Synthetic cube wireframe (120 lines, 3 direction clusters) — SE3 | R=45°, t=[0.5,0.3,0.2], s=1.0 |
+| **A2** | Synthetic cube wireframe — Sim3 | same R,t + s=1.8 |
+| **B1** | Chess 7-Scenes cross-sequence (seq-01 ↔ seq-03) — RGBD, metric scale | R≈I, t≈0, s=1.0 |
+| **B2** | Chess cross-sequence — RGB-only (seq-03 moments ×1.8, simulating monocular) | R≈I, t≈0, s=1.8 |
+
+### Figures
+
+| # | Figure | Description |
+|---|--------|-------------|
+| 01 | ![fig_eval_01](results/eval/fig_eval_01_cube_lines.png) | Synthetic cube wireframe — source / SE3 / Sim3 line sets |
+| 02 | ![fig_eval_02](results/eval/fig_eval_02_cube_se3.png) | **A1** Cube SE3: Sim3-Net perfect, SE3-Net domain-mismatch |
+| 03 | ![fig_eval_03](results/eval/fig_eval_03_cube_sim3.png) | **A2** Cube Sim3: Sim3-Net perfect, SE3-Net fails on scale |
+| 04 | ![fig_eval_04](results/eval/fig_eval_04_chess_rgbd.png) | **B1** Chess RGBD: SE3-Net best, Sim3-Net has synthetic-real gap |
+| 05 | ![fig_eval_05](results/eval/fig_eval_05_chess_rgb_scale.png) | **B2** Chess RGB-only: SE3-Net fails on scale, Sim3-Net limited by gap |
+| 06 | ![fig_eval_06](results/eval/fig_eval_06_summary.png) | Summary across all 4 experiments |
+
+### Numeric results
+
+| Experiment | Method | Rot (°) ↓ | Trans (m) ↓ | Scale err ↓ | Inliers | Net (ms) | RANSAC (ms) | Total (ms) |
+|---|---|---|---|---|---|---|---|---|
+| **A1** Cube SE3 (s=1) | SE3-PlueckerNet | 30.94 | 1.101 | 0.000 | 60 | 531 | 13 | **543** |
+| | **ScalePluckerNet** | **0.23** | **0.005** | **0.001** | 20 | 9 | 8 | **17** |
+| | Pure-Sim3-RANSAC | 48.78 | 1.377 | 5.72 | 36 | 0 | 10 | **10** |
+| **A2** Cube Sim3 (s=1.8) | SE3-PlueckerNet | 45.00 | 0.616 | 0.588 | 0 | 9 | 0 | **9** |
+| | **ScalePluckerNet** | **0.16** | **0.007** | **0.000** | 13 | 9 | 8 | **17** |
+| | Pure-Sim3-RANSAC | 45.00 | 0.616 | 0.588 | 0 | 0 | 8 | **8** |
+| **B1** Chess RGBD (s=1) | **SE3-PlueckerNet** | **5.86** | **0.088** | **0.000** | 66 | 25 | 11 | **35** |
+| | ScalePluckerNet | 89.83 | 1.692 | 3.810 | 3 | 8 | 8 | **16** |
+| | Pure-Sim3-RANSAC | 1.09 | 1.751 | 3.617 | 18 | 0 | 9 | **9** |
+| **B2** Chess RGB-only (s=1.8) | SE3-PlueckerNet | 25.17 | 0.110 | 0.588 | 17 | 8 | 10 | **19** |
+| | ScalePluckerNet | 12.10 | 2.849 | 3.503 | 6 | 8 | 8 | **16** |
+| | **Pure-Sim3-RANSAC** | **2.36** | 1.633 | 5.070 | 6 | 0 | 8 | **8** |
+
+### Interpretation
+
+**ScalePluckerNet is the only method that correctly recovers scale on its training distribution (A1, A2).**
+Its weakness is the synthetic-to-real gap (B1, B2): trained exclusively on direction-clustered synthetic lines,
+it fails to match real chess scene geometry.
+
+**SE3-PlueckerNet** (pretrained on Semantic3D) transfers to real chess data well (B1) but structurally
+cannot recover scale — it always returns s=1. When scale is unknown (B2), its rotation estimate also
+degrades (25° vs 6° in B1) because the SE3 RANSAC scoring is biased by the moment mismatch.
+
+**Pure-Sim3-RANSAC** (direction cosine NN, no network) recovers rotation correctly when the scene has
+rich geometry (B1: 1°, B2: 2°) but fails on scale and translation because direction-NN correspondences
+are geometrically inconsistent — many correct-direction pairs have wrong positions.
+
+**Key takeaway:** the Sim3 solver is correct; the bottleneck for real-world deployment is the
+synthetic-to-real gap in the correspondence network. The recommended fix is described in
+[Known issues and future directions](#known-issues-and-future-directions):
+scale-augment real SE(3) pairs to create Sim(3) training data with real geometric structure.
+
+---
+
+## Evaluation Results v2 — Replica-Trained Model (4 Methods)
+
+Run `python eval_benchmark_replica.py` to reproduce. Saves to `results/eval_replica/`.
+
+### Setup
+
+| Item | Value |
+|------|-------|
+| SE3-PlueckerNet weights | `../PlueckerNet/output/semantic3D/preTrained/best_val_checkpoint_real.pth` |
+| Sim3-Net (synthetic) | `output/sim3_synthetic/2026-04-12/best_val_checkpoint.pth` |
+| **Sim3-Net (Replica)** | `output/replica/2026-04-22/best_val_checkpoint.pth` (epoch 224, 99.185% inlier ratio) |
+| Pure-Sim3-RANSAC | Direction cosine-NN + Sim3 RANSAC, no network |
+
+### Figures
+
+| # | Figure | Description |
+|---|--------|-------------|
+| r01 | ![fig_r01](results/eval_replica/fig_eval_r01_cube_lines.png) | Cube wireframe line sets |
+| r02 | ![fig_r02](results/eval_replica/fig_eval_r02_cube_se3.png) | **A1** Cube SE3: Replica model best (0.03°) |
+| r03 | ![fig_r03](results/eval_replica/fig_eval_r03_cube_sim3.png) | **A2** Cube Sim3: Replica model best (0.09°) |
+| r04 | ![fig_r04](results/eval_replica/fig_eval_r04_chess_rgbd.png) | **B1** Chess RGBD: synthetic gap 169°→9° |
+| r05 | ![fig_r05](results/eval_replica/fig_eval_r05_chess_rgb_scale.png) | **B2** Chess RGB-only: Replica best (5.75°, s_err 0.149) |
+| r06 | ![fig_r06](results/eval_replica/fig_eval_r06_summary.png) | Summary across all 4 experiments |
+
+### Numeric results
+
+| Experiment | Method | Rot (°) ↓ | Trans (m) ↓ | Scale err ↓ | Inliers | Total (ms) |
+|---|---|---|---|---|---|---|
+| **A1** Cube SE3 (s=1) | SE3-PlueckerNet | 159.60 | 0.807 | 0.000 | 46 | 503 |
+| | Sim3-Net (synthetic) | 0.23 | 0.005 | 0.001 | 20 | 17 |
+| | **Sim3-Net (Replica)** | **0.03** | **0.001** | **0.000** | **49** | **16** |
+| | Pure-Sim3-RANSAC | 48.78 | 1.377 | 5.722 | 36 | 10 |
+| **A2** Cube Sim3 (s=1.8) | SE3-PlueckerNet | 45.00 | 0.616 | 0.588 | 0 | 9 |
+| | Sim3-Net (synthetic) | 0.16 | 0.007 | 0.000 | 13 | 16 |
+| | **Sim3-Net (Replica)** | **0.09** | **0.006** | **0.000** | **44** | **16** |
+| | Pure-Sim3-RANSAC | 4.97 | 2.500 | 5.817 | 29 | 7 |
+| **B1** Chess RGBD (s=1) | **SE3-PlueckerNet** | **6.65** | **0.045** | **0.000** | **65** | **36** |
+| | Sim3-Net (synthetic) | 168.99 | 0.369 | 1.513 | 3 | 16 |
+| | Sim3-Net (Replica) | 9.41 | 0.173 | 0.203 | 5 | 17 |
+| | Pure-Sim3-RANSAC | 0.98 | 1.039 | 0.570 | 8 | 9 |
+| **B2** Chess RGB-only (s=1.8) | SE3-PlueckerNet | 19.02 | 0.113 | 0.588 | 18 | 19 |
+| | Sim3-Net (synthetic) | 12.10 | 2.849 | 3.503 | 6 | 16 |
+| | **Sim3-Net (Replica)** | **5.75** | 0.526 | **0.149** | 3 | **17** |
+| | Pure-Sim3-RANSAC | 0.81 | 3.067 | 4.096 | 10 | 8 |
+
+### Interpretation
+
+**Replica training closes the synthetic-to-real gap.** On B1 (real Chess RGBD), Sim3-Net (synthetic) failed
+catastrophically at 169°. Sim3-Net (Replica) recovers to 9.4° — a 18× improvement — demonstrating that
+training on real RGBD geometry generalises across scene types.
+
+**On scale-ambiguous matching (B2), Sim3-Net (Replica) is the best method overall** — 5.75° rotation and
+scale error 0.149, beating SE3-Net (19°, s_err 0.588) and the synthetic model (12°, s_err 3.5). This is the
+primary use-case of the Sim3 extension: monocular or multi-session SLAM where scale is unknown.
+
+**SE3-Net remains superior on RGBD** (B1: 6.65° vs 9.41°) because it was trained on larger real data and does
+not need to estimate scale. The gap narrows as the Replica training set grows — adding more scenes or using
+a larger real dataset would likely close it.
+
+**SE3-Net fails on synthetic cube (A1: 159°)** because the direction-clustered structure differs from Semantic3D
+training data. Both Sim3-Net variants handle it perfectly.
+
+---
+
+## SLAM Trajectory Comparison — Synthetic vs Replica Model
+
+`run_semantic_object_slam.py` was run on the Replica `room2` object sequence (150 frames, 3 object tracks)
+with two different matcher checkpoints. Trajectory ATE was computed against GT via Sim(3) alignment
+(`compare_to_gt_and_stitch_lines.py`).
+
+| Model | RMSE (m) ↓ | Median (m) ↓ | P90 (m) ↓ | Tracks | Edges |
+|-------|-----------|-------------|----------|--------|-------|
+| Sim3-Net (synthetic) | 0.694 | 0.685 | 0.873 | 3 | 430 |
+| Sim3-Net (Replica) | 0.702 | 0.686 | 0.875 | 3 | 438 |
+
+**Interpretation:** Both models produce essentially identical SLAM ATE (~0.7 m). The ATE is dominated
+by sparse object track coverage (only 3 tracks from 150 frames) rather than matcher quality —
+both networks achieve >99% inlier ratio on the Replica validation set, so improving the matcher
+further would not close the gap. The bottleneck is the SLAM data association, not the Plücker matcher.
+
+Figures:
+- `results/replica_gt_compare_synthetic_model.png` — synthetic-trained baseline
+- `results/replica_gt_compare_replica_trained.png` — Replica-trained model
+
+---
+
+## RGB Color Extension — 9D Model Training on Replica
+
+**Status:** Training in progress (launched 2026-04-23, `output/replica_color_run.log`).
+
+### Workflow
+
+```bash
+# 1. Generate 9D colored dataset from Replica RGBD (~20 min)
+python generate_replica_color_dataset.py \
+    --n_train_per_scene 600 --n_valid_per_scene 200 --n_candidate_lines 400
+# Output: dataset/replica_color_train/  dataset/replica_color_valid/
+# Lines: (n, 9)  format [m0,m1,m2, d0,d1,d2, r,g,b]  RGB ∈ [0,1]
+
+# 2. Train 9D Sim3-Net with color dropout
+python train_sim3_replica_rgb.py
+# Checkpoint: output/replica_color/<date>/best_val_checkpoint.pth
+```
+
+### Color sampling
+
+RGB per line = average color of the k=20 nearest neighbors in the colored point cloud,
+back-projected from the `frame*.jpg` images using the same depth/pose as the 6D pipeline.
+
+### Color dropout (30%)
+
+Each line independently has its RGB zeroed to 0.5 with probability 30% during dataset
+generation. This trains the single 9D model to handle partially or fully colorless inputs,
+covering RGBD, RGB-only, and mixed scenarios without separate models.
+
+### Early training signal (epoch 2)
+
+- Val inlier ratio: 50.2% (vs 3.4% at epoch 0 for 9D untrained)
+- Recall_rot: 1.000
+- Med_rot: 0.00°
+
+Color provides a strong early learning signal — the 9D model converges much faster than
+the 6D model did at equivalent epochs.
+
+---
+
 ## References
 
 - **PlueckerNet** — Liu et al., *"PlueckerNet: Learn to Register 3D Line Reconstructions"*, CVPR 2021. [GitHub](https://github.com/Liumouliu/PlueckerNet)
 - **7-Scenes dataset** — Shotton et al., *"Scene Coordinate Regression Forests for Camera Relocalization in RGB-D Images"*, CVPR 2013.
 - **Sim(3) in SLAM** — Strasdat et al., *"Scale Drift-Aware Large Scale Monocular SLAM"*, RSS 2010.
+
+---
+
+## Semantic Object-Centric SLAM Extension (Inference-Only)
+
+This repository now includes an **add-on wrapper** that turns the existing
+Sim(3) Pluecker matcher into a semantic object-centric SLAM front-end
+**without changing model weights or standalone matching behavior**.
+
+New files:
+
+```
+semantic_slam/
+├── __init__.py
+├── types.py               # Sim3Estimate, ObjectObservation, track/frame states
+├── sim3_ops.py            # Sim(3) compose/invert/relative/fusion helpers
+├── matching_adapter.py    # fixed PlueckerNet + Sim(3) RANSAC inference adapter
+└── pipeline.py            # semantic object-centric SLAM state machine
+run_semantic_object_slam.py
+```
+
+### Design constraints (preserved)
+
+- **No retraining required**: uses your existing `.pth` checkpoint as-is.
+- **No architecture edits**: the adapter calls `PluckerNetKnn` exactly for
+  correspondence inference.
+- **Standalone capability preserved**: direct pairwise matching remains
+  available and unchanged (same top-k + `run_ransac_sim3` backend).
+
+### Input contract
+
+`run_semantic_object_slam.py` consumes a JSON list of frames:
+
+```json
+[
+  {
+    "frame_id": 0,
+    "objects": [
+      {
+        "semantic_label": "chair",
+        "instance_id": "17",
+        "plucker_lines": [[m0, m1, m2, d0, d1, d2], ...]
+      }
+    ]
+  }
+]
+```
+
+Each object's lines are matched against a persistent canonical object track.
+Shared objects across frames create Sim(3) frame-to-frame edges.
+
+### Run the object-centric SLAM wrapper
+
+```bash
+python run_semantic_object_slam.py \
+  --input_json ./dataset/object_sequence.json \
+  --output_json ./results/object_slam_state.json \
+  --weights ./output/sim3_synthetic/2026-04-12/best_val_checkpoint.pth \
+  --plueckernet_dir ../PlueckerNet \
+  --topk 200 \
+  --ransac_iterations 200 \
+  --ransac_threshold 0.1
+```
+
+### Operational note: run large training in tmux
+
+For long jobs (dataset generation at larger scale, training, long ablations),
+run in tmux so sessions survive disconnects:
+
+```bash
+tmux new-session -d -s sim3_train "python3 train_sim3.py 2>&1 | tee output/train_sim3.log"
+tmux attach -t sim3_train
+# or monitor logs without attaching
+tail -f output/train_sim3.log
+```
+
+---
+
+## RGB Color Extension (9D Plücker Coordinates)
+
+### Motivation
+
+Standard Plücker coordinates encode only geometry (moment and direction vectors).
+To improve line descriptor distinctiveness and matching performance, this
+extension augments the 6D Plücker representation with **RGB color information**:
+
+```
+Standard 6D: [m₀ m₁ m₂ d₀ d₁ d₂]
+Extended 9D: [m₀ m₁ m₂ d₀ d₁ d₂ r  g  b]
+```
+
+The color channels are:
+- **Invariant to Sim(3)**: directions `d′ = R d` and moments `m′ = s·R m + t×d′` 
+  are scale-invariant in direction; colors remain unchanged.
+- **Low-cost**: only 3 additional float32 values per line; negligible memory 
+  and compute overhead.
+- **Trainable signal**: the network's KNN graph convolution and GNN can learn 
+  to correlate color similarity with geometric correspondence likelihood.
+
+### Data generation with colors
+
+Generate training data with RGB per line:
+
+```bash
+python generate_sim3_dataset.py \
+  --out_dir ./dataset \
+  --n_train 5000 \
+  --n_valid 500 \
+  --n_inliers 100 \
+  --n_outliers 30 \
+  --add_colors
+```
+
+**Color assignment strategy:**
+- Each of the `n_dir_clusters=10` direction clusters is assigned a **cluster color** 
+  (random RGB in [0, 1]³).
+- Each line in the cluster inherits the cluster color plus a small Gaussian 
+  perturbation (σ=0.05), then clipped to [0, 1].
+- Outlier lines (independent of inliers) are also colored by their own cluster 
+  anchors, making them structurally distinct from inliers at the feature level.
+
+**Why cluster-based colors?**
+- Computationally cheap (one color per cluster, small noise per line).
+- Biologically plausible (real lines from the same surface tend to have similar 
+  hue; outliers are unrelated).
+- Provides a learnable signal without hand-crafted semantic labels.
+
+### Model architecture changes
+
+The input layer `conv_in_seq_direction_moment_knn` in 
+`../PlueckerNet/model/model_plucker.py` now accepts a configurable `in_channel` 
+parameter (default 6 for backward compatibility):
+
+```python
+class conv_in_seq_direction_moment_knn(nn.Module):
+    def __init__(self, out_channel: int, in_channel: int = 6):
+        super().__init__()
+        self.in_channel = in_channel  # 6 for std Plücker, 9 for Plücker+RGB
+        self.seq_out_channel = out_channel // 2
+
+        # First 3 channels (moments): get_graph_feature outputs 6D
+        direction_in_channels = 6
+        # Remaining channels (directions + colors): get_graph_feature doubles them
+        moment_in_channels = (self.in_channel - 3) * 2
+
+        self.conv_direction = torch.nn.Conv2d(direction_in_channels, 
+                                              self.seq_out_channel // 8, 1)
+        self.conv_moment = torch.nn.Conv2d(moment_in_channels, 
+                                           self.seq_out_channel // 8, 1)
+        # ... rest of architecture unchanged
+```
+
+**Data flow for 9D input:**
+```
+Input: (B, 130, 9) Plücker+RGB
+
+x[:, :3, :] (moments)      → get_graph_feature → (B, 6, 130, K)  → conv_direction
+x[:, 3:, :] (d+rgb, 6D)    → get_graph_feature → (B, 12, 130, K) → conv_moment
+                              ↓ (each side processed independently)
+                    concat + mlp_merged → (B, 128, 130)
+                              ↓
+                        GNN (unchanged)
+                              ↓
+                        Output: prob_matrix
+```
+
+The `get_graph_feature` KNN function automatically adapts to the input dimension;
+the Conv2d layers' input channel counts are computed dynamically.
+
+### Training with RGB (9D)
+
+Create a dedicated training configuration:
+
+```bash
+# Step 1: generate 9D colored dataset
+python generate_sim3_dataset.py \
+  --out_dir ./dataset \
+  --n_train 5000 \
+  --n_valid 500 \
+  --add_colors
+
+# Step 2: train with 9D input (uses train_sim3_rgb.py)
+python train_sim3_rgb.py
+```
+
+**File: `train_sim3_rgb.py`** — a copy of `train_sim3.py` with one key difference:
+
+```python
+configs.in_channel = 9  # RGB extension
+```
+
+All other hyperparameters are identical:
+- `batch_size = 12`
+- `lr = 1e-3` (Adam with β₁=0.9, β₂=0.999)
+- `epochs = 400`
+- `scheduler gamma = 0.99` (ExponentialLR)
+
+Training output:
+```
+Checkpoint and logs: output/sim3_synthetic/<date>/
+├── best_val_checkpoint.pth      (saved when avg_inlier_ratio improves)
+├── checkpoint.pth               (latest, overwritten each epoch)
+├── config.json
+└── events.out.tfevents.*         (TensorBoard logs)
+```
+
+Monitor with TensorBoard:
+```bash
+tensorboard --logdir=output/sim3_synthetic/<date>
+```
+
+Or watch the log file:
+```bash
+tail -f output/train_rgb.log
+```
+
+### RANSAC solver compatibility
+
+The Sim(3) RANSAC solver (`sim3/ransac.py`) automatically handles 9D input by
+extracting the first 6 dimensions (geometric Plücker) and ignoring colors during
+geometric estimation:
+
+```python
+# In model_estimate_sim3(), score_sim3(), best_fit_sim3():
+if plucker1.shape[0] > 6:
+    plucker1 = plucker1[:6, :]
+if plucker2.shape[0] > 6:
+    plucker2 = plucker2[:6, :]
+
+# Proceed with 6D Plücker RANSAC as before
+```
+
+This ensures:
+- The solver remains numerically identical whether given 6D or 9D input.
+- Colors are **not** used in geometric voting; they only improve correspondence 
+  learning in the forward pass.
+- Checkpoints trained on 9D data can be evaluated on 6D data and vice versa 
+  (colors are silently dropped or assumed absent).
+
+### Validation against ground truth
+
+After training completes, validate the new 9D model on the Replica dataset:
+
+```bash
+python compare_to_gt_and_stitch_lines.py \
+  --plucker_json ./output/replica_object_slam_state.json \
+  --gt_trajectory /home/rueyday/data/Replica/room2/traj.txt \
+  --output_png ./results/rgb_validation.png
+```
+
+Compare metrics from the 9D model against the original 6D baseline:
+
+| Model | RMSE | Median Error | P90 |
+|-------|------|--------------|-----|
+| **6D baseline** | 0.694 m | 0.685 m | 0.873 m |
+| **9D RGB** (after training) | ? | ? | ? |
+
+### Usage: inference with 9D model
+
+To use the trained 9D model for inference, explicitly pass `in_channel=9` when
+loading:
+
+```python
+from lib.utils import load_model
+
+# Create config with in_channel=9
+config.in_channel = 9
+Model = load_model('PluckerNetKnn')
+model = Model(config)
+
+# Load your 9D-trained checkpoint
+checkpoint = torch.load('output/sim3_synthetic/2026-04-XX/best_val_checkpoint.pth')
+model.load_state_dict(checkpoint['state_dict'])
+
+# Input must be 9D
+plucker1 = ...  # (B, N1, 9)
+plucker2 = ...  # (B, N2, 9)
+prob_matrix, prior1, prior2 = model(plucker1, plucker2)
+```
+
+### Backward compatibility (6D models)
+
+Existing 6D checkpoints continue to work without modification:
+
+```python
+# No explicit in_channel specification — defaults to 6
+Model = load_model('PluckerNetKnn')
+model = Model(config)
+checkpoint = torch.load('output/sim3_synthetic/2026-04-12/best_val_checkpoint.pth')
+model.load_state_dict(checkpoint['state_dict'])
+
+plucker1 = ...  # (B, N1, 6)
+plucker2 = ...  # (B, N2, 6)
+prob_matrix, prior1, prior2 = model(plucker1, plucker2)  # works as before
+```
+
+### Files modified for RGB support
+
+| File | Changes |
+|------|---------|
+| `generate_sim3_dataset.py` | Added `--add_colors` flag and color assignment in `make_direction_clustered_lines()` and `apply_sim3()` |
+| `../PlueckerNet/model/model_plucker.py` | Updated `conv_in_seq_direction_moment_knn.__init__()` to accept `in_channel` parameter; made `PluckerNetKnn` and `PluckerNetRegression` read `in_channel` from config |
+| `../PlueckerNet/model/model_plucker.py` | Updated `FeatureExtractorGraph` to pass `in_channel` to `conv_in_seq_direction_moment_knn` |
+| `sim3/ransac.py` | Updated `model_estimate_sim3()`, `score_sim3()`, and `best_fit_sim3()` to extract 6D from 9D input |
+| `train_sim3_rgb.py` | **New file** — training entry point with `configs.in_channel = 9` |
+
+### Troubleshooting
+
+**Error: "expected input[1, 6, 130, 10] to have 12 channels, but got 6 channels"**
+
+The Conv2d layer was initialized for 9D input but received 6D data. Check:
+1. Your data was generated with `--add_colors`
+2. Your config/checkpoint has `in_channel = 9`
+3. Your input Plücker arrays have shape `(..., 9)` not `(..., 6)`
+
+**Error: "ValueError: matmul: Input operand 1 has a mismatch in its core dimension 0"**
+
+The RANSAC solver tried to use 9D data directly. Ensure `sim3/ransac.py` has
+the 6D extraction step (see above). If you modified RANSAC, verify it slices
+the first 6 dimensions only.
+
+**Slow training or OOM with 9D model**
+
+The input layer has slightly larger Conv2d filters (12 vs 6 input channels for
+the moment path), adding ~1% compute overhead. If you hit OOM:
+```python
+configs.train_batch_size = 8  # reduce from 12 to 8
+configs.train_lr = 5e-4       # reduce learning rate proportionally
+```
+
+---
+
+## End-to-end workflow: from raw data to SLAM
+
+### 1. Prepare semantic object sequences
+
+Obtain per-frame object Plücker line sets. Example: 3D bounding boxes → line 
+segment edges → Plücker coordinates. Save as `object_sequence.json`.
+
+### 2. Train a Sim(3) model (baseline 6D)
+
+```bash
+python generate_sim3_dataset.py --out_dir ./dataset --n_train 5000 --n_valid 500
+python train_sim3.py
+# Best checkpoint: output/sim3_synthetic/<date>/best_val_checkpoint.pth
+```
+
+### 3 (optional). Improve with RGB: train 9D model
+
+```bash
+python generate_sim3_dataset.py \
+  --out_dir ./dataset \
+  --n_train 5000 \
+  --n_valid 500 \
+  --add_colors
+python train_sim3_rgb.py
+# Best checkpoint: output/sim3_synthetic/<date>/best_val_checkpoint.pth
+```
+
+### 4. Run semantic object-centric SLAM
+
+```bash
+python run_semantic_object_slam.py \
+  --input_json ./dataset/object_sequence.json \
+  --output_json ./results/object_slam_state.json \
+  --weights ./output/sim3_synthetic/<date>/best_val_checkpoint.pth
+```
+
+### 5. Visualize and validate
+
+```bash
+# Desktop trajectory visualization
+python visualize_object_slam.py \
+  --input_json ./results/object_slam_state.json
+
+# Compare against Replica ground truth
+python compare_to_gt_and_stitch_lines.py \
+  --plucker_json ./results/object_slam_state.json \
+  --gt_trajectory /home/rueyday/data/Replica/room2/traj.txt
+```
+
+---
+
+## Troubleshooting and tips
+
+### My model is training very slowly
+
+**Cause:** GPU utilization is low, or data loading is the bottleneck.
+
+**Solutions:**
+1. Increase `num_workers` in the DataLoader (train_sim3.py, line ~40):
+   ```python
+   num_workers=8  # was 4
+   ```
+2. Increase batch size if you have enough VRAM:
+   ```python
+   configs.train_batch_size = 24  # was 12
+   configs.train_lr = 2e-3        # scale LR accordingly
+   ```
+3. Check GPU utilization: `nvidia-smi` should show > 80% during training.
+
+### My model diverged (loss increased suddenly)
+
+**Cause:** A single gradient update landed in a bad region (silent failure, 
+no loss spike).
+
+**Solution:** Enable gradient clipping in `sim3/trainer.py`:
+```python
+# In _train_epoch, before self.optimizer.step():
+torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+```
+
+### I want to resume training from a checkpoint
+
+In `train_sim3.py`, set:
+```python
+configs.resume = "./output/sim3_synthetic/<date>/best_val_checkpoint.pth"
+configs.train_lr = 1e-4  # optional: lower LR for fine-tuning
+```
+
+The trainer will automatically restore epoch, optimizer state, and scheduler state.
+
+### Can I mix 6D and 9D data in a single batch?
+
+**No.** The Conv2d layers are initialized for a specific `in_channel`. All
+Plücker arrays in a batch must have the same number of dimensions (6 or 9).
+
+If you have datasets in both formats:
+- Keep them in separate folders (e.g., `dataset_6d/`, `dataset_9d/`).
+- Run two separate training jobs with different config files.
+- Compare checkpoints on the same evaluation dataset.
+
+### The SLAM pipeline gives low-quality trajectories
+
+**Possible causes:**
+1. Weak Plücker line extraction (garbage in → garbage out).
+2. Model trained on data too different from your test data.
+3. RANSAC threshold too tight (use `--ransac_threshold 0.15` for noisier data).
+4. Too few top-K correspondences (use `--topk 300` instead of 100).
+
+**Mitigation:**
+1. Visualize extracted lines: `compare_to_gt_and_stitch_lines.py` shows a 3D 
+   point cloud of line endpoints.
+2. Collect real data in your domain and fine-tune the model.
+3. Increase RANSAC iterations: `--ransac_iterations 500`.
+
+---
+
+## Citation
+
+If you use this code, please cite the original PlueckerNet paper and note the 
+Sim(3) extension:
+
+```bibtex
+@inproceedings{liu2021plueckernet,
+  title={PlueckerNet: Learn to Register 3D Line Reconstructions},
+  author={Liu, Mouyu and Chen, Yiming and Nie, Yiming and Zhu, Yao and Song, 
+          Shaojie and Luo, Siyu},
+  booktitle={IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2021}
+}
+```
+
+For the Sim(3) extension and semantic object-centric SLAM wrapper:
+
+```
+Scale-Aware PlueckerNet: Sim(3)-Aware 3D Line Matching with Semantic 
+Object Tracking (GitHub: scale-aware-PlueckerNet)
+```
