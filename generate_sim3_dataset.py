@@ -47,7 +47,7 @@ def make_lines(n, pos_range=2.0):
 
 
 def make_direction_clustered_lines(n, n_dir_clusters=10, dir_spread=0.15,
-                                   pos_range=2.0):
+                                   pos_range=2.0, add_colors=False):
     """Generate n Plücker lines with directions clustered around anchor directions.
 
     Why direction clustering?
@@ -72,6 +72,8 @@ def make_direction_clustered_lines(n, n_dir_clusters=10, dir_spread=0.15,
         0.15 rad ≈ 8.6°, giving tight but distinct clusters.
     pos_range : float
         Half-extent of the uniform distribution for point positions.
+    add_colors : bool
+        If True, append RGB colors [0,1] to each line.
     """
     n_per = n // n_dir_clusters
     extras = n - n_per * n_dir_clusters
@@ -79,6 +81,9 @@ def make_direction_clustered_lines(n, n_dir_clusters=10, dir_spread=0.15,
     # Random anchor directions, well-spread on the unit sphere
     anchor_dirs = np.random.randn(n_dir_clusters, 3).astype(np.float32)
     anchor_dirs /= np.linalg.norm(anchor_dirs, axis=1, keepdims=True)
+
+    # Random anchor colors per cluster (for visual consistency)
+    anchor_colors = np.random.rand(n_dir_clusters, 3).astype(np.float32) if add_colors else None
 
     parts = []
     for i, anchor_d in enumerate(anchor_dirs):
@@ -90,7 +95,16 @@ def make_direction_clustered_lines(n, n_dir_clusters=10, dir_spread=0.15,
         # Random point on the line
         p = np.random.uniform(-pos_range, pos_range, (cnt, 3)).astype(np.float32)
         m = np.cross(p, d)
-        parts.append(np.concatenate([m, d], axis=1))
+        line_data = np.concatenate([m, d], axis=1)  # (cnt, 6)
+        
+        if add_colors:
+            # Assign cluster color + small noise per line
+            colors = anchor_colors[i:i+1].repeat(cnt, axis=0)  # (cnt, 3)
+            colors = colors + 0.05 * np.random.randn(cnt, 3).astype(np.float32)
+            colors = np.clip(colors, 0.0, 1.0)  # Clamp to [0, 1]
+            line_data = np.concatenate([line_data, colors], axis=1)  # (cnt, 9)
+        
+        parts.append(line_data)
 
     lines = np.concatenate(parts, axis=0)
     idx = np.random.permutation(len(lines))
@@ -127,15 +141,24 @@ def apply_sim3(lines, s, R, t):
     Transformation law:
         d' = R d
         m' = s R m + t × d'
+    Colors are preserved (not transformed).
     """
     m = lines[:, :3]
-    d = lines[:, 3:]
+    d = lines[:, 3:6]
     d_new = (R @ d.T).T                         # (n, 3)
     m_new = s * (R @ m.T).T + np.cross(t, d_new)  # (n, 3)
-    return np.concatenate([m_new, d_new], axis=1)
+    
+    result = np.concatenate([m_new, d_new], axis=1)  # (n, 6)
+    
+    # Preserve colors if present
+    if lines.shape[1] > 6:
+        colors = lines[:, 6:]  # RGB or other features
+        result = np.concatenate([result, colors], axis=1)
+    
+    return result
 
 
-def generate_scene(n_inliers, n_outliers, scale_range=(0.3, 3.0), n_dir_clusters=10):
+def generate_scene(n_inliers, n_outliers, scale_range=(0.3, 3.0), n_dir_clusters=10, add_colors=False):
     """Generate one scene pair with a random Sim(3) transform.
 
     Uses direction-clustered lines so that the KNN structure in x[:,3:,:]
@@ -148,7 +171,7 @@ def generate_scene(n_inliers, n_outliers, scale_range=(0.3, 3.0), n_dir_clusters
     This is the ideal case for the GNN: rich intra-cluster context plus
     inter-cluster cross-attention.
     """
-    lines1_in = make_direction_clustered_lines(n_inliers, n_dir_clusters=n_dir_clusters)
+    lines1_in = make_direction_clustered_lines(n_inliers, n_dir_clusters=n_dir_clusters, add_colors=add_colors)
 
     # Random Sim(3) parameters — log-uniform scale for balanced coverage
     log_s = np.random.uniform(np.log(scale_range[0]), np.log(scale_range[1]))
@@ -161,8 +184,8 @@ def generate_scene(n_inliers, n_outliers, scale_range=(0.3, 3.0), n_dir_clusters
     # Outlier lines — direction-clustered with fewer clusters so outlier clusters
     # are detectable as "unmatched" by the GNN
     n_out_clusters = max(1, n_dir_clusters // 3)
-    lines1_out = make_direction_clustered_lines(n_outliers, n_dir_clusters=n_out_clusters)
-    lines2_out = make_direction_clustered_lines(n_outliers, n_dir_clusters=n_out_clusters)
+    lines1_out = make_direction_clustered_lines(n_outliers, n_dir_clusters=n_out_clusters, add_colors=add_colors)
+    lines2_out = make_direction_clustered_lines(n_outliers, n_dir_clusters=n_out_clusters, add_colors=add_colors)
 
     lines1 = np.concatenate([lines1_in, lines1_out], axis=0)
     lines2 = np.concatenate([lines2_in, lines2_out], axis=0)
@@ -190,7 +213,7 @@ def generate_scene(n_inliers, n_outliers, scale_range=(0.3, 3.0), n_dir_clusters
     }
 
 
-def generate_split(n_scenes, out_dir, n_inliers=100, n_outliers=30, n_dir_clusters=10):
+def generate_split(n_scenes, out_dir, n_inliers=100, n_outliers=30, n_dir_clusters=10, add_colors=False):
     """Generate n_scenes with fixed line counts so PyTorch can batch them.
 
     All scenes in a split must have the same total number of lines
@@ -206,7 +229,7 @@ def generate_split(n_scenes, out_dir, n_inliers=100, n_outliers=30, n_dir_cluste
     data = {k: [] for k in keys}
 
     for i in range(n_scenes):
-        scene = generate_scene(n_inliers, n_outliers, n_dir_clusters=n_dir_clusters)
+        scene = generate_scene(n_inliers, n_outliers, n_dir_clusters=n_dir_clusters, add_colors=add_colors)
         for k in keys:
             data[k].append(scene[k])
         if (i + 1) % 500 == 0:
@@ -231,23 +254,26 @@ def main():
     parser.add_argument('--n_dir_clusters', type=int, default=10,
                         help='direction clusters per scene; 10 gives 10 lines/cluster '
                              'for n_inliers=100, matching net_knn=10')
+    parser.add_argument('--add_colors', action='store_true',
+                        help='append RGB colors to Plücker vectors (9D instead of 6D)')
     parser.add_argument('--seed',       type=int, default=42)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
 
+    line_dim = 9 if args.add_colors else 6
     print(f"Generating {args.n_train} training scenes "
           f"({args.n_inliers} inliers + {args.n_outliers} outliers = "
           f"{args.n_inliers + args.n_outliers} lines per set, "
-          f"{args.n_dir_clusters} direction clusters)...")
+          f"{args.n_dir_clusters} direction clusters, line_dim={line_dim})...")
     generate_split(args.n_train,
                    os.path.join(args.out_dir, f'{args.dataset}_train'),
-                   args.n_inliers, args.n_outliers, args.n_dir_clusters)
+                   args.n_inliers, args.n_outliers, args.n_dir_clusters, args.add_colors)
 
     print(f"Generating {args.n_valid} validation scenes...")
     generate_split(args.n_valid,
                    os.path.join(args.out_dir, f'{args.dataset}_valid'),
-                   args.n_inliers, args.n_outliers, args.n_dir_clusters)
+                   args.n_inliers, args.n_outliers, args.n_dir_clusters, args.add_colors)
 
     print("Done.")
 

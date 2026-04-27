@@ -765,7 +765,7 @@ Figures:
 
 ## RGB Color Extension — 9D Model Training on Replica
 
-**Status:** Training in progress (launched 2026-04-23, `output/replica_color_run.log`).
+**Status:** Complete — best checkpoint epoch 255, **99.355%** avg\_inlier\_ratio. Output: `output/replica_color/2026-04-23/best_val_checkpoint.pth`.
 
 ### Workflow
 
@@ -792,14 +792,17 @@ Each line independently has its RGB zeroed to 0.5 with probability 30% during da
 generation. This trains the single 9D model to handle partially or fully colorless inputs,
 covering RGBD, RGB-only, and mixed scenarios without separate models.
 
-### Early training signal (epoch 2)
+### Training results
 
-- Val inlier ratio: 50.2% (vs 3.4% at epoch 0 for 9D untrained)
-- Recall_rot: 1.000
-- Med_rot: 0.00°
+| Checkpoint | avg_inlier_ratio | recall_rot | med_rot |
+|---|---|---|---|
+| Epoch 2 | 50.2% | 1.000 | 0.00° |
+| `best_val_checkpoint.pth` (epoch 255) | **99.355%** | 1.000 | 0.00° |
+| Epoch 400 (final) | 99.2% | 1.000 | 0.00° |
 
-Color provides a strong early learning signal — the 9D model converges much faster than
-the 6D model did at equivalent epochs.
+Color provides a strong early learning signal — the 9D model reaches 50% inlier ratio
+at epoch 2 (vs epoch 17 for the 6D synthetic model) and converges to 99.4% on the
+Replica validation set.
 
 ---
 
@@ -1063,7 +1066,7 @@ Compare metrics from the 9D model against the original 6D baseline:
 | Model | RMSE | Median Error | P90 |
 |-------|------|--------------|-----|
 | **6D baseline** | 0.694 m | 0.685 m | 0.873 m |
-| **9D RGB** (after training) | ? | ? | ? |
+| **9D RGB** (epoch 255) | not measured — bottleneck is sparse tracks, not matcher | — | — |
 
 ### Usage: inference with 9D model
 

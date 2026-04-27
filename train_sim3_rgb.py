@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-tail -f /home/rueyday/scale-aware-PlueckerNet/output/train_rgb.log
-Training entry point for Sim(3)-aware PlueckerNet.
+Training entry point for Sim(3)-aware PlueckerNet with RGB colors (9D Plücker).
 
-The network architecture (PluckerNetKnn) is reused unchanged from the
-original PlueckerNet repo.  Only the training data and validation solver
-are extended to Sim(3).
+Extended from train_sim3.py to use 9D colored Plücker coordinates instead of 6D.
+The network's input layer (conv_in_seq_direction_moment_knn) automatically adapts
+to the 9D input dimensions via the in_channel config parameter.
 
 Typical workflow:
-    # 1. Generate synthetic dataset (once)
-    python generate_sim3_dataset.py --out_dir ./dataset --n_train 5000 --n_valid 500
+    # 1. Generate synthetic dataset with colors (once)
+    python generate_sim3_dataset.py --out_dir ./dataset --n_train 5000 --n_valid 500 --add_colors
 
-    # 2. Train
-    python train_sim3.py
+    # 2. Train with RGB
+    python train_sim3_rgb.py
 """
 import os
 import sys
@@ -59,7 +58,7 @@ def main(configs):
 if __name__ == '__main__':
     configs = get_config()
 
-    # ---- experiment settings ---------------------------------------------
+    # ---- experiment settings for RGB training ----------------------------
     configs.dataset          = 'sim3_synthetic'
     configs.data_dir         = './dataset'
     configs.gpu_inds         = 0
@@ -69,7 +68,8 @@ if __name__ == '__main__':
     configs.train_epoches    = 400
     configs.best_val_metric  = 'avg_inlier_ratio'
     configs.resume_dir       = None
-    # ----------------------------------------------------------------------
+    configs.in_channel       = 9  # Key difference: 9D Plücker + RGB vs 6D standard
+    # --------------------------------------------------------------------------
 
     dconfig = vars(configs)
     dconfig['resume'] = None

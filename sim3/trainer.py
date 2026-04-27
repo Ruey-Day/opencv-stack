@@ -83,7 +83,7 @@ class Sim3Trainer:
         if config.resume is not None:
             if osp.isfile(config.resume):
                 logging.info(f"=> loading checkpoint '{config.resume}'")
-                state = torch.load(config.resume)
+                state = torch.load(config.resume, weights_only=False)
                 self.start_epoch = state['epoch']
                 self.model.load_state_dict(state['state_dict'])
                 self.scheduler.load_state_dict(state['scheduler'])
@@ -211,6 +211,7 @@ class Sim3Trainer:
                     (1.0 - 2.0 * matches) * prob_matrix
                 ).sum(dim=(-2, -1)).mean()
 
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             torch.cuda.empty_cache()
 
