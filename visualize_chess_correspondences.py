@@ -10,7 +10,7 @@ Layout (2 rows × 3 columns):
   Row 2 — Alignment: target lines (red) + source lines transformed by
            estimated pose (method color)
 
-Methods: Pure-RANSAC | SE3-PlueckerNet | Sim3-Net (Replica)
+Methods: Pure-RANSAC | SE3-PlueckerNet | ScalePluckerNet
 
 Output: results/chess_correspondence_viz.png  (new file, does not overwrite anything)
 """
@@ -70,6 +70,22 @@ def plucker_midpoint(line_md):
     """Representative 3-D point on the line (closest point to origin)."""
     m, d = line_md[:3], line_md[3:]
     return np.cross(d, m) / (np.dot(d, d) + 1e-12)
+
+
+def draw_cloud_pts(ax, pts, color, alpha=0.12, size=0.4, n_max=1500, seed=0):
+    """Scatter a subsampled point cloud on a 3-D axes."""
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(pts), min(n_max, len(pts)), replace=False)
+    p = pts[idx]
+    ax.scatter(p[:, 0], p[:, 1], p[:, 2],
+               c=color, s=size, alpha=alpha, linewidths=0, depthshade=True)
+
+
+def apply_rigid_pts(cloud, R, t):
+    """Apply rotation + translation to a point cloud.
+    Scale is intentionally omitted: both RGBD clouds are metric; s only affects
+    the Plücker moment representation used for matching."""
+    return (R @ cloud.T + t[:, None]).T
 
 
 def draw_lines(ax, L_md, color, alpha=0.65, half=0.40,
@@ -139,21 +155,27 @@ def run_pure(L1, L2, topk=100, threshold=0.4, max_iter=200):
 BG = '#111122'
 
 
-def _set_ax_limits(ax, *line_sets):
-    """Set axis limits to fit all line midpoints with a small margin."""
+def _set_ax_limits(ax, *arrays):
+    """Set equal-aspect axis limits to fit all points.
+
+    Accepts either Plücker line arrays (N×6) — midpoints are extracted —
+    or plain point-cloud arrays (N×3) — used directly.
+    """
     pts = []
-    for L in line_sets:
-        if len(L) == 0:
+    for A in arrays:
+        if A is None or len(A) == 0:
             continue
-        m, d = L[:, :3], L[:, 3:]
-        p = np.cross(d, m) / (np.sum(d ** 2, axis=1, keepdims=True) + 1e-12)
+        if A.shape[1] >= 6:           # Plücker lines — extract midpoints
+            m, d = A[:, :3], A[:, 3:]
+            p = np.cross(d, m) / (np.sum(d ** 2, axis=1, keepdims=True) + 1e-12)
+        else:                          # plain (N×3) point cloud
+            p = A
         pts.append(p)
     if not pts:
         return
     all_pts = np.vstack(pts)
-    lo, hi = all_pts.min(0) - 0.3, all_pts.max(0) + 0.3
-    # equal aspect ratio in 3D
-    r = (hi - lo).max() / 2
+    lo, hi = all_pts.min(0) - 0.25, all_pts.max(0) + 0.25
+    r   = (hi - lo).max() / 2
     mid = (lo + hi) / 2
     ax.set_xlim(mid[0] - r, mid[0] + r)
     ax.set_ylim(mid[1] - r, mid[1] + r)
@@ -241,9 +263,10 @@ def main():
     _render_figure(L1, L2, [
         ("Pure-RANSAC",        R_pure, t_pure, s_pure, i1_p, i2_p, mask_p, '#2ca02c', dt_pure),
         ("SE3-PlueckerNet",    R_se3,  t_se3,  s_se3,  i1_s, i2_s, mask_s, '#1f77b4', dt_se3),
-        ("Sim3-Net (Replica)", R_sim3, t_sim3, s_sim3, i1_r, i2_r, mask_r, '#00cccc', dt_sim3),
+        ("ScalePluckerNet", R_sim3, t_sim3, s_sim3, i1_r, i2_r, mask_r, '#00cccc', dt_sim3),
     ], R_gt, t_gt, s_gt=1.0,
-       title="Chess 7-Scenes: seq-01 ↔ seq-03 — Line Correspondences & Alignment\n"
+       cloud1=cloud1, cloud2=cloud3,
+       title="Chess 7-Scenes: seq-01 ↔ seq-03 — Point Cloud & Line Registration\n"
              "B1 RGBD — GT: R=I, t=0, s=1  (both sequences in world frame)",
        tgt_label="Seq-03 RGBD (tgt)",
        out_path=OUT_RGBD)
@@ -286,16 +309,22 @@ def main():
     _render_figure(L1, L2_rgb, [
         ("Pure-RANSAC",        R_p2, t_p2, s_p2, i1_p2, i2_p2, mask_p2, '#2ca02c', dt_p2),
         ("SE3-PlueckerNet",    R_s2, t_s2, s_s2, i1_s2, i2_s2, mask_s2, '#1f77b4', dt_s2),
-        ("Sim3-Net (Replica)", R_r2, t_r2, s_r2, i1_r2, i2_r2, mask_r2, '#00cccc', dt_r2),
+        ("ScalePluckerNet", R_r2, t_r2, s_r2, i1_r2, i2_r2, mask_r2, '#00cccc', dt_r2),
     ], R_gt, t_gt, s_gt=S_RGB,
-       title=f"Chess 7-Scenes: seq-01 ↔ seq-03 — Line Correspondences & Alignment\n"
+       cloud1=cloud1, cloud2=cloud3,
+       title=f"Chess 7-Scenes: seq-01 ↔ seq-03 — Point Cloud & Line Registration\n"
              f"B2 RGB-only — seq-03 moments ×{S_RGB} (monocular scale) — GT s={S_RGB}",
        tgt_label=f"Seq-03 RGB×{S_RGB} (tgt)",
        out_path=OUT_RGB)
 
 
-def _render_figure(L1, L2, methods, R_gt, t_gt, s_gt, title, tgt_label, out_path):
-    """Render 2-row × 3-col correspondence + alignment figure."""
+def _render_figure(L1, L2, methods, R_gt, t_gt, s_gt, title, tgt_label, out_path,
+                   cloud1=None, cloud2=None):
+    """Render 2-row × 3-col correspondence + alignment figure.
+
+    Row 1 — line correspondences with faint point cloud context
+    Row 2 — post-registration point clouds (transformed src + target) with aligned lines
+    """
     ELEV, AZIM = 22, -55
 
     fig = plt.figure(figsize=(18, 12))
@@ -307,12 +336,18 @@ def _render_figure(L1, L2, methods, R_gt, t_gt, s_gt, title, tgt_label, out_path
         se  = scale_err_log(s_e, s_gt)
         ic  = int(mask.sum()) if mask is not None else 0
 
-        # ── Row 1: correspondences ──────────────────────────────────────────
+        # ── Row 1: correspondences (lines + faint point cloud context) ──────
         ax = fig.add_subplot(2, 3, col, projection='3d')
-        draw_lines(ax, L1, '#4488ff', n=80, alpha=0.60,
-                   label='Seq-01 (src)', lw=1.1, seed=0)
-        draw_lines(ax, L2, '#ff5533', n=80, alpha=0.60,
-                   label=tgt_label, lw=1.1, seed=1)
+        if cloud1 is not None:
+            draw_cloud_pts(ax, cloud1, '#2255aa', alpha=0.07, size=0.3,
+                           n_max=800, seed=0)
+        if cloud2 is not None:
+            draw_cloud_pts(ax, cloud2, '#aa2200', alpha=0.07, size=0.3,
+                           n_max=800, seed=1)
+        draw_lines(ax, L1, '#6699ff', n=70, alpha=0.70,
+                   label='Seq-01 (src)', lw=1.2, seed=0)
+        draw_lines(ax, L2, '#ff6644', n=70, alpha=0.70,
+                   label=tgt_label, lw=1.2, seed=1)
         draw_correspondences(ax, L1, L2, i1, i2, mask,
                              max_shown=40, color='#99ffaa', alpha=0.55, lw=0.8)
         style_ax(ax, name, f'inlier matches: {ic}')
@@ -321,17 +356,33 @@ def _render_figure(L1, L2, methods, R_gt, t_gt, s_gt, title, tgt_label, out_path
         if col == 1:
             _styled_legend(ax)
 
-        # ── Row 2: alignment ────────────────────────────────────────────────
+        # ── Row 2: post-registration point clouds + aligned lines ────────────
         ax2 = fig.add_subplot(2, 3, col + 3, projection='3d')
         L1_tf = apply_sim3_md(L1, s_e, R_e, t_e)
-        draw_lines(ax2, L2,    '#ff5533', n=80, alpha=0.55,
-                   label=tgt_label, lw=1.1, seed=1)
-        draw_lines(ax2, L1_tf, mcol,      n=80, alpha=0.70,
-                   label='Seq-01 aligned', lw=1.1, seed=0)
-        se_str = f'∞' if not np.isfinite(se) else f'{se:.3f}'
+
+        # Point clouds: transform src by (R, t) only — both clouds are metric
+        # so we do not apply s to 3-D coordinates.
+        if cloud1 is not None and cloud2 is not None:
+            c1_tf = apply_rigid_pts(cloud1, R_e, t_e)
+            draw_cloud_pts(ax2, cloud2, '#ff5533', alpha=0.28, size=0.9,
+                           n_max=2000, seed=1)
+            draw_cloud_pts(ax2, c1_tf,  mcol,     alpha=0.28, size=0.9,
+                           n_max=2000, seed=0)
+
+        # Lines on top for reference
+        draw_lines(ax2, L2,    '#ff5533', n=50, alpha=0.45,
+                   label=tgt_label, lw=1.0, seed=1)
+        draw_lines(ax2, L1_tf, mcol,      n=50, alpha=0.60,
+                   label='Seq-01 aligned', lw=1.0, seed=0)
+
+        se_str = '∞' if not np.isfinite(se) else f'{se:.3f}'
         style_ax(ax2, f'Alignment — {name}',
                  f'rot: {re:.2f}°   s: {s_e:.3f} (err {se_str})   {dt:.0f} ms')
-        _set_ax_limits(ax2, L2, L1_tf)
+        ref_sets = [L2, L1_tf]
+        if cloud1 is not None:
+            _set_ax_limits(ax2, L2, L1_tf, cloud2, c1_tf)
+        else:
+            _set_ax_limits(ax2, *ref_sets)
         ax2.view_init(elev=ELEV, azim=AZIM)
         if col == 1:
             _styled_legend(ax2)

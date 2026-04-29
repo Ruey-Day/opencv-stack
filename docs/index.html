@@ -3,462 +3,538 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Scale-Aware PlueckerNet</title>
+  <title>ScalePluckerNet</title>
   <style>
     :root {
-      --accent: #2563eb;
-      --accent-light: #dbeafe;
-      --bg: #ffffff;
-      --surface: #f8fafc;
-      --border: #e2e8f0;
-      --text: #1e293b;
-      --muted: #64748b;
-      --good: #16a34a;
-      --warn: #dc2626;
-      --code-bg: #1e1e2e;
+      --accent: #6366f1;
+      --accent2: #8b5cf6;
+      --accent3: #06b6d4;
+      --bg: #0a0a0f;
+      --bg2: #111118;
+      --bg3: #16161f;
+      --surface: #1c1c28;
+      --border: rgba(255,255,255,0.08);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --good: #34d399;
+      --warn: #f87171;
+      --code-bg: #0d0d14;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-           color: var(--text); background: var(--bg); line-height: 1.6; }
+           color: var(--text); background: var(--bg); line-height: 1.65; overflow-x: hidden; }
+
+    /* ── scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 3px; }
+
+    /* ── nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(10,10,15,0.85); backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 2rem; height: 52px;
+    }
+    .nav-brand { font-weight: 700; font-size: 0.95rem; color: #fff; letter-spacing: -0.01em; }
+    .nav-brand span { color: var(--accent); }
+    .nav-links { display: flex; gap: 1.6rem; list-style: none; }
+    .nav-links a { font-size: 0.82rem; color: var(--muted); text-decoration: none;
+                   transition: color 0.15s; letter-spacing: 0.02em; text-transform: uppercase; }
+    .nav-links a:hover { color: #fff; }
 
     /* ── layout ── */
-    .container { max-width: 900px; margin: 0 auto; padding: 0 1.5rem; }
+    .container { max-width: 920px; margin: 0 auto; padding: 0 1.5rem; }
 
-    /* ── header ── */
-    header { background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
-             color: #fff; padding: 3.5rem 0 2.5rem; text-align: center; }
-    header h1 { font-size: 2.2rem; font-weight: 700; line-height: 1.2; margin-bottom: 0.6rem; }
-    header .subtitle { font-size: 1.1rem; opacity: 0.8; margin-bottom: 1.4rem; }
-    .authors { font-size: 1rem; margin-bottom: 0.4rem; }
-    .authors a { color: #93c5fd; text-decoration: none; }
-    .authors a:hover { text-decoration: underline; }
-    .affil { font-size: 0.9rem; opacity: 0.7; margin-bottom: 1.6rem; }
+    /* ── hero ── */
+    header {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      text-align: center; position: relative; overflow: hidden;
+      background: radial-gradient(ellipse 80% 60% at 50% 40%, rgba(99,102,241,0.18) 0%, transparent 70%),
+                  radial-gradient(ellipse 60% 50% at 80% 60%, rgba(6,182,212,0.10) 0%, transparent 65%),
+                  var(--bg);
+    }
+    header::before {
+      content: ""; position: absolute; inset: 0;
+      background-image: radial-gradient(rgba(255,255,255,0.04) 1px, transparent 1px);
+      background-size: 32px 32px; pointer-events: none;
+    }
+    .hero-inner { position: relative; z-index: 1; padding: 6rem 1.5rem 4rem; max-width: 800px; }
+    .hero-tag { display: inline-flex; align-items: center; gap: 0.4rem;
+                background: rgba(99,102,241,0.15); border: 1px solid rgba(99,102,241,0.4);
+                padding: 0.25rem 0.8rem; border-radius: 999px; font-size: 0.75rem;
+                color: #a5b4fc; letter-spacing: 0.06em; text-transform: uppercase;
+                margin-bottom: 1.4rem; }
+    h1 { font-size: clamp(2.4rem, 6vw, 3.6rem); font-weight: 800; line-height: 1.1;
+         margin-bottom: 0.8rem; letter-spacing: -0.03em;
+         background: linear-gradient(135deg, #fff 30%, #a5b4fc 70%, #67e8f9);
+         -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .hero-sub { font-size: 1.05rem; color: var(--muted); margin-bottom: 2rem; max-width: 580px; margin-left: auto; margin-right: auto; }
+    .author-line { font-size: 0.9rem; color: #cbd5e1; margin-bottom: 0.3rem; }
+    .author-line a { color: #a5b4fc; text-decoration: none; }
+    .affil-line { font-size: 0.82rem; color: var(--muted); margin-bottom: 2rem; }
     .badges { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; }
-    .badge { display: inline-flex; align-items: center; gap: 0.4rem;
-             background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.25);
-             padding: 0.4rem 1rem; border-radius: 999px; font-size: 0.85rem;
-             text-decoration: none; color: #fff; transition: background 0.15s; }
-    .badge:hover { background: rgba(255,255,255,0.22); }
+    .badge { display: inline-flex; align-items: center; gap: 0.45rem;
+             padding: 0.5rem 1.1rem; border-radius: 8px; font-size: 0.83rem; font-weight: 500;
+             text-decoration: none; transition: all 0.18s; }
+    .badge-primary { background: var(--accent); color: #fff; }
+    .badge-primary:hover { background: #7c3aed; transform: translateY(-1px); }
+    .badge-outline { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .badge-outline:hover { border-color: rgba(255,255,255,0.25); color: #fff; transform: translateY(-1px); }
+    .scroll-hint { position: absolute; bottom: 2rem; left: 50%; transform: translateX(-50%);
+                   color: var(--muted); font-size: 0.75rem; display: flex; flex-direction: column; align-items: center; gap: 0.4rem; }
+    .scroll-hint::after { content: ""; width: 1px; height: 32px;
+                          background: linear-gradient(to bottom, var(--muted), transparent); }
 
-    /* ── sections ── */
-    section { padding: 3rem 0; }
-    section:nth-child(even) { background: var(--surface); }
-    h2 { font-size: 1.55rem; font-weight: 700; margin-bottom: 1rem;
-         padding-bottom: 0.4rem; border-bottom: 2px solid var(--accent-light); }
-    h3 { font-size: 1.15rem; font-weight: 600; margin: 1.5rem 0 0.6rem; }
-    p { margin-bottom: 0.9rem; }
+    /* ── section ── */
+    section { padding: 5rem 0; border-top: 1px solid var(--border); }
+    h2 { font-size: 1.6rem; font-weight: 700; margin-bottom: 1.2rem;
+         letter-spacing: -0.02em;
+         background: linear-gradient(90deg, #fff, #a5b4fc);
+         -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    h3 { font-size: 1rem; font-weight: 600; color: #a5b4fc; margin: 1.6rem 0 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    p { margin-bottom: 0.9rem; color: var(--muted); }
+    p strong { color: var(--text); }
 
-    /* ── abstract box ── */
-    .abstract-box { background: var(--accent-light); border-left: 4px solid var(--accent);
-                    padding: 1.2rem 1.4rem; border-radius: 0 8px 8px 0; font-size: 0.97rem; }
+    /* ── abstract ── */
+    .abstract-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-left: 3px solid var(--accent); border-radius: 0 10px 10px 0;
+      padding: 1.4rem 1.6rem; font-size: 0.95rem; line-height: 1.75; color: #cbd5e1;
+    }
 
-    /* ── teaser ── */
-    .teaser { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin: 1.5rem 0; }
-    .teaser figure { text-align: center; }
-    .teaser img { width: 100%; border-radius: 6px; border: 1px solid var(--border); }
-    .teaser figcaption { font-size: 0.8rem; color: var(--muted); margin-top: 0.35rem; }
+    /* ── kpi row ── */
+    .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin: 1.4rem 0; }
+    .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+           padding: 1.2rem; text-align: center; transition: border-color 0.2s; }
+    .kpi:hover { border-color: rgba(99,102,241,0.5); }
+    .kpi .val { font-size: 2rem; font-weight: 800; line-height: 1;
+                background: linear-gradient(135deg, var(--accent), var(--accent3));
+                -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .kpi .lbl { font-size: 0.75rem; color: var(--muted); margin-top: 0.4rem; line-height: 1.4; }
 
     /* ── contributions ── */
-    .contrib-list { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
-    .contrib-list li { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-                       padding: 1rem 1.2rem; }
-    .contrib-list li::before { content: "✦"; color: var(--accent); margin-right: 0.5rem; font-size: 0.85rem; }
+    .contrib-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.2rem; }
+    .contrib-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                    padding: 1.2rem 1.4rem; transition: all 0.2s; }
+    .contrib-card:hover { border-color: rgba(99,102,241,0.45); transform: translateY(-2px); }
+    .contrib-icon { font-size: 1.4rem; margin-bottom: 0.5rem; display: block; }
+    .contrib-card h4 { font-size: 0.9rem; font-weight: 700; color: #fff; margin-bottom: 0.35rem; }
+    .contrib-card p { font-size: 0.84rem; margin: 0; }
 
     /* ── pipeline ── */
-    .pipeline-box { background: var(--code-bg); color: #cdd6f4; font-family: "Fira Mono", "Cascadia Code", monospace;
-                    font-size: 0.78rem; padding: 1.4rem; border-radius: 8px; overflow-x: auto;
-                    white-space: pre; line-height: 1.55; margin: 1rem 0; }
+    .code-block { background: var(--code-bg); color: #cdd6f4;
+                  font-family: "Fira Mono", "JetBrains Mono", "Cascadia Code", monospace;
+                  font-size: 0.77rem; padding: 1.4rem 1.6rem; border-radius: 10px;
+                  overflow-x: auto; white-space: pre; line-height: 1.6; margin: 1rem 0;
+                  border: 1px solid rgba(255,255,255,0.06); }
+    .kw { color: #89dceb; } .fn { color: #cba6f7; } .cm { color: #585b70; } .num { color: #a6e3a1; }
 
-    /* ── figure grid ── */
-    .fig-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin: 1.2rem 0; }
-    .fig-grid.single { grid-template-columns: 1fr; }
+    /* ── figures ── */
+    .fig-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin: 1.4rem 0; }
     .fig-grid.three { grid-template-columns: 1fr 1fr 1fr; }
-    .fig-item figure { text-align: center; }
-    .fig-item img { width: 100%; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; }
-    .fig-item figcaption { font-size: 0.82rem; color: var(--muted); margin-top: 0.4rem; }
+    .fig-grid.one { grid-template-columns: 1fr; }
+    figure { text-align: center; }
+    .fig-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                overflow: hidden; transition: all 0.2s; }
+    .fig-card:hover { border-color: rgba(99,102,241,0.4); transform: translateY(-2px); }
+    .fig-card img { width: 100%; display: block; cursor: zoom-in; }
+    .fig-card figcaption { padding: 0.65rem 0.9rem; font-size: 0.8rem; color: var(--muted); text-align: left; line-height: 1.45; }
 
-    /* ── lightbox ── */
-    #lb { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85);
-          z-index:999; align-items:center; justify-content:center; }
-    #lb.open { display:flex; }
-    #lb img { max-width:92vw; max-height:92vh; border-radius:6px; }
-    #lb-close { position:absolute; top:1rem; right:1.5rem; color:#fff; font-size:2rem;
-                cursor:pointer; background:none; border:none; }
+    /* ── teaser ── */
+    .teaser { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin: 1.6rem 0; }
+    .teaser figure { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .teaser img { width: 100%; display: block; }
+    .teaser figcaption { padding: 0.6rem 0.8rem; font-size: 0.78rem; color: var(--muted); }
 
     /* ── tables ── */
-    .tbl-wrap { overflow-x: auto; margin: 1rem 0; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-    th { background: var(--accent); color: #fff; padding: 0.5rem 0.7rem; text-align: left; }
-    td { padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border); }
-    tr:nth-child(even) td { background: var(--surface); }
-    .best { font-weight: 700; color: var(--good); }
+    .tbl-wrap { overflow-x: auto; margin: 1.2rem 0; border-radius: 10px;
+                border: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    th { background: var(--surface); color: var(--muted); padding: 0.6rem 0.85rem;
+         text-align: left; font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase;
+         border-bottom: 1px solid var(--border); }
+    td { padding: 0.5rem 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.04); color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+    .row-header td { background: rgba(99,102,241,0.08); color: #a5b4fc;
+                     font-size: 0.78rem; font-weight: 600; letter-spacing: 0.03em; }
+    .best { color: var(--good); font-weight: 700; }
     .fail { color: var(--warn); }
-    .row-header td { background: #e2e8f0 !important; font-weight: 600; font-size: 0.82rem;
-                     color: var(--muted); letter-spacing: 0.04em; }
+    td strong { color: var(--text); }
 
-    /* ── key number cards ── */
-    .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin: 1.2rem 0; }
-    .kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-           padding: 1.1rem; text-align: center; }
-    .kpi .val { font-size: 1.9rem; font-weight: 800; color: var(--accent); line-height: 1; }
-    .kpi .lbl { font-size: 0.78rem; color: var(--muted); margin-top: 0.3rem; }
+    /* ── equation chip ── */
+    .eq { display: inline-block; background: var(--code-bg); border: 1px solid rgba(255,255,255,0.07);
+          padding: 0.15rem 0.5rem; border-radius: 5px; font-family: "Fira Mono", monospace;
+          font-size: 0.82rem; color: #cba6f7; }
 
-    /* ── citation ── */
-    .cite-box { background: var(--code-bg); color: #cdd6f4;
-                font-family: "Fira Mono", "Cascadia Code", monospace; font-size: 0.8rem;
-                padding: 1.2rem; border-radius: 8px; white-space: pre; overflow-x: auto; }
+    /* ── badge tag ── */
+    .tag { display: inline-block; background: rgba(99,102,241,0.15); border: 1px solid rgba(99,102,241,0.35);
+           color: #a5b4fc; font-size: 0.72rem; padding: 0.15rem 0.55rem; border-radius: 999px;
+           letter-spacing: 0.04em; margin-right: 0.3rem; }
+
+    /* ── note ── */
+    .note { font-size: 0.8rem; color: var(--muted); opacity: 0.8; margin-top: 0.5rem; font-style: italic; }
+
+    /* ── cite ── */
+    .cite-box { background: var(--code-bg); color: #9aa3b5;
+                font-family: "Fira Mono", monospace; font-size: 0.79rem;
+                padding: 1.3rem 1.5rem; border-radius: 10px; white-space: pre;
+                overflow-x: auto; border: 1px solid rgba(255,255,255,0.06); }
+
+    /* ── lightbox ── */
+    #lb { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
+          z-index: 999; align-items: center; justify-content: center; }
+    #lb.open { display: flex; }
+    #lb img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
+    #lb-close { position: absolute; top: 1rem; right: 1.5rem; color: #fff;
+                font-size: 2rem; cursor: pointer; background: none; border: none; opacity: 0.7; }
+    #lb-close:hover { opacity: 1; }
 
     /* ── footer ── */
-    footer { background: #0f172a; color: #94a3b8; text-align: center;
-             padding: 1.5rem; font-size: 0.85rem; }
+    footer { background: var(--code-bg); border-top: 1px solid var(--border);
+             text-align: center; padding: 1.8rem; font-size: 0.82rem; color: var(--muted); }
+    footer a { color: #a5b4fc; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
 
-    @media (max-width: 640px) {
-      header h1 { font-size: 1.6rem; }
-      .teaser, .fig-grid, .fig-grid.three, .contrib-list, .kpi-row {
-        grid-template-columns: 1fr; }
+    /* ── scroll reveal ── */
+    .reveal { opacity: 0; transform: translateY(24px); transition: opacity 0.55s ease, transform 0.55s ease; }
+    .reveal.visible { opacity: 1; transform: none; }
+
+    /* ── responsive ── */
+    @media (max-width: 680px) {
+      nav { display: none; }
+      .kpi-row, .contrib-grid, .fig-grid, .fig-grid.three, .teaser { grid-template-columns: 1fr; }
+      h1 { font-size: 2rem; }
     }
   </style>
 </head>
 <body>
 
-<!-- ─── HEADER ─────────────────────────────────────────────────────── -->
+<!-- ── NAV ─────────────────────────────────────────────────────────── -->
+<nav>
+  <div class="nav-brand">Scale<span>Plücker</span>Net</div>
+  <ul class="nav-links">
+    <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#method">Method</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#slam">SLAM</a></li>
+    <li><a href="#cite">Cite</a></li>
+  </ul>
+</nav>
+
+<!-- ── HERO ─────────────────────────────────────────────────────────── -->
 <header>
-  <div class="container">
-    <h1>Scale-Aware PlueckerNet</h1>
-    <p class="subtitle">Extending Plücker Line Registration from SE(3) to Sim(3) with RGB Color Features</p>
-    <p class="authors"><a href="mailto:rueyday@umich.edu">Ruey Day</a></p>
-    <p class="affil">Department of Robotics · University of Michigan, Ann Arbor</p>
+  <div class="hero-inner">
+    <div class="hero-tag">
+      <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><circle cx="5" cy="5" r="5"/></svg>
+      Robotics · University of Michigan
+    </div>
+    <h1>ScalePluckerNet</h1>
+    <p class="hero-sub">Extending 3D line registration from SE(3) to Sim(3) — jointly recovering rotation, translation, and <em>scale</em> from Plücker line correspondences.</p>
+    <p class="author-line"><a href="mailto:rueyday@umich.edu">Ruey Day</a></p>
+    <p class="affil-line">Department of Robotics &middot; University of Michigan, Ann Arbor &middot; 2026</p>
     <div class="badges">
-      <a class="badge" href="https://github.com/rueyday/scale-aware-PlueckerNet">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.49.5.09.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1.01.07 1.54 1.03 1.54 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.26-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02A9.56 9.56 0 0112 6.8c.85.004 1.71.11 2.51.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.39.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.43-.01 2.76 0 .27.18.58.69.48A10.01 10.01 0 0022 12c0-5.52-4.48-10-10-10z"/></svg>
+      <a class="badge badge-primary" href="https://github.com/rueyday/scale-aware-PlueckerNet">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.49.5.09.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1.01.07 1.54 1.03 1.54 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.26-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02A9.56 9.56 0 0112 6.8c.85.004 1.71.11 2.51.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.39.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.43-.01 2.76 0 .27.18.58.69.48A10.01 10.01 0 0022 12c0-5.52-4.48-10-10-10z"/></svg>
         Code
       </a>
-      <a class="badge" href="report/scale_aware_plueckernet.pdf" onclick="return false;" title="PDF not hosted yet">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-        Paper
-      </a>
-      <a class="badge" href="https://github.com/Liumouliu/PlueckerNet">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.49.5.09.68-.22.68-.48 0-.24-.01-.87-.01-1.71-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1.01.07 1.54 1.03 1.54 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.26-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02A9.56 9.56 0 0112 6.8c.85.004 1.71.11 2.51.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.39.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.43-.01 2.76 0 .27.18.58.69.48A10.01 10.01 0 0022 12c0-5.52-4.48-10-10-10z"/></svg>
-        PlueckerNet (Liu et al., CVPR 2021)
+      <a class="badge badge-outline" href="https://github.com/Liumouliu/PlueckerNet">
+        Built on PlueckerNet (Liu et al., CVPR 2021)
       </a>
     </div>
   </div>
+  <div class="scroll-hint">scroll</div>
 </header>
 
-<!-- ─── TEASER ─────────────────────────────────────────────────────── -->
-<section style="padding: 2rem 0;">
+<!-- ── TEASER ───────────────────────────────────────────────────────── -->
+<section style="padding:3rem 0; border-top:none;">
   <div class="container">
-    <div class="teaser">
+    <div class="teaser reveal">
       <figure>
-        <img src="images/fig2_SE3_registration.png" alt="SE(3) registration succeeds" />
-        <figcaption>SE(3) solver — perfect alignment when scale = 1</figcaption>
+        <img src="images/fig2_SE3_registration.png" alt="SE(3) registration" />
+        <figcaption>SE(3) solver — perfect at s = 1</figcaption>
       </figure>
       <figure>
-        <img src="images/fig3_SIM3_registration_failure.png" alt="SE(3) solver fails under Sim(3)" />
-        <figcaption>SE(3) solver fails structurally when scale ≠ 1 — correct R, wrong t</figcaption>
+        <img src="images/fig3_SIM3_registration_failure.png" alt="SE(3) fails under Sim(3)" />
+        <figcaption>SE(3) solver fails structurally when scale ≠ 1</figcaption>
       </figure>
       <figure>
-        <img src="images/fig_eval_r06_summary.png" alt="4-method benchmark summary" />
-        <figcaption>Our Replica-trained Sim(3) model closes the gap on real data</figcaption>
+        <img src="images/fig_eval_r06_summary.png" alt="Benchmark summary" />
+        <figcaption>ScalePluckerNet closes the gap on real-scene data</figcaption>
       </figure>
     </div>
   </div>
 </section>
 
-<!-- ─── ABSTRACT ──────────────────────────────────────────────────── -->
-<section>
+<!-- ── ABSTRACT ─────────────────────────────────────────────────────── -->
+<section id="abstract">
   <div class="container">
     <h2>Abstract</h2>
-    <div class="abstract-box">
-      PlueckerNet (Liu et al., CVPR 2021) learns to register 3D line reconstructions under rigid SE(3)
-      transformations using a graph neural network over Plücker line coordinates. We show analytically and
-      empirically that its internal SE(3) solver <em>structurally fails</em> when an unknown scale factor is
-      present, as arises in monocular or scale-ambiguous camera systems. The moment term of a Plücker line
-      transforms as <strong>m′ = s·R·m + t × d′</strong> under Sim(3), and the SE(3) solver misinterprets
-      the residual <em>(s − 1)·R·m</em> as a spurious translation, yielding corrupted estimates.
+    <div class="abstract-card reveal">
+      PlueckerNet (Liu et al., CVPR 2021) registers 3D line reconstructions under rigid SE(3) transformations.
+      We show that its internal solver <strong>structurally fails</strong> when an unknown scale factor is present,
+      as in monocular camera systems — the moment term transforms as
+      <span class="eq">m′ = s·Rm + t×d′</span> under Sim(3), and the SE(3) solver
+      misinterprets the residual <span class="eq">(s−1)·Rm</span> as a spurious translation.
       <br /><br />
-      We address this with a minimal two-correspondence Sim(3) solver that decouples rotation estimation
-      (SVD on direction pairs) from a joint least-squares solve for scale and translation, and train the
-      <em>unmodified</em> PluckerNetKnn architecture on a synthetic dataset and on the Replica RGBD benchmark.
-      We further extend the input descriptor from 6D Plücker coordinates to 9D by appending per-line RGB
-      color, with 30% color dropout for mixed-input robustness. On the Chess 7-Scenes cross-sequence
-      benchmark with simulated monocular scale (s = 1.8), our Replica-trained Sim(3) model achieves
-      <strong>5.75° rotation error and scale-log-error 0.149</strong>, compared with 19.02° and 0.588 for
-      the original SE(3)-PlueckerNet. Replica validation yields <strong>99.2% inlier ratio</strong> (6D)
-      and <strong>99.4%</strong> (9D color).
+      We address this with a <strong>minimal two-correspondence Sim(3) solver</strong> — SVD for rotation,
+      then a joint least-squares solve for scale and translation — and train the <em>unmodified</em>
+      PluckerNetKnn architecture on the Replica RGBD benchmark (7 scenes, 4200 pairs).
+      On Chess 7-Scenes with simulated monocular scale (s = 1.8), ScalePluckerNet achieves
+      <strong>5.75° rotation error and scale-log-error 0.149</strong>, vs. 19.02° / 0.588 for SE(3)-PlueckerNet.
+      A 9D extension appends per-line RGB (with 30% dropout) and reaches <strong>99.4% inlier ratio</strong> on validation.
     </div>
   </div>
 </section>
 
-<!-- ─── KEY NUMBERS ────────────────────────────────────────────────── -->
-<section>
+<!-- ── KEY NUMBERS ───────────────────────────────────────────────────── -->
+<section style="padding:3rem 0; border-top:none;">
   <div class="container">
-    <h2>Key Numbers</h2>
-    <div class="kpi-row">
-      <div class="kpi"><div class="val">99.4%</div><div class="lbl">Replica val inlier ratio (9D color model)</div></div>
-      <div class="kpi"><div class="val">5.75°</div><div class="lbl">Rotation error — Chess RGB-only (s=1.8)</div></div>
-      <div class="kpi"><div class="val">0.149</div><div class="lbl">Scale log-error — Chess RGB-only (best method)</div></div>
-      <div class="kpi"><div class="val">18×</div><div class="lbl">Reduction in Chess RGBD rotation error (169° → 9.4°) after Replica training</div></div>
+    <div class="kpi-row reveal">
+      <div class="kpi">
+        <div class="val">99.4%</div>
+        <div class="lbl">Replica val inlier ratio<br />(9D color model)</div>
+      </div>
+      <div class="kpi">
+        <div class="val">5.75°</div>
+        <div class="lbl">Rotation error<br />Chess RGB-only (s = 1.8)</div>
+      </div>
+      <div class="kpi">
+        <div class="val">0.149</div>
+        <div class="lbl">Scale log-error<br />Chess RGB-only (best)</div>
+      </div>
+      <div class="kpi">
+        <div class="val">18×</div>
+        <div class="lbl">Reduction in Chess rotation error after real-data training (169° → 9.4°)</div>
+      </div>
     </div>
   </div>
 </section>
 
-<!-- ─── CONTRIBUTIONS ─────────────────────────────────────────────── -->
-<section>
+<!-- ── CONTRIBUTIONS ─────────────────────────────────────────────────── -->
+<section style="padding:2rem 0 4rem; border-top:none;">
   <div class="container">
-    <h2>Contributions</h2>
-    <ul class="contrib-list">
-      <li><strong>Failure analysis.</strong> Analytical proof and experimental verification that the SE(3) Plücker solver fails structurally under Sim(3) — correct rotation, badly biased translation.</li>
-      <li><strong>Sim(3) RANSAC solver.</strong> Minimal closed-form solver for (s, R, t) from 2 line correspondences: SVD for rotation, then a 6×4 least-squares system for scale and translation jointly.</li>
-      <li><strong>Real-data training.</strong> Trained PluckerNetKnn on Replica RGBD geometry (7 scenes, 4200 pairs) — closes the 89° synthetic-to-real gap to 9.4° on Chess.</li>
-      <li><strong>9D color extension.</strong> Augments 6D Plücker coordinates with per-line RGB; 30% color dropout makes a single model handle RGBD, RGB-only, and mixed inputs. Best val: 99.355%.</li>
-    </ul>
+    <div class="contrib-grid reveal">
+      <div class="contrib-card">
+        <span class="contrib-icon">🔍</span>
+        <h4>Failure Analysis</h4>
+        <p>Analytical proof + experiments showing the SE(3) Plücker solver fails structurally under Sim(3): correct rotation, biased translation.</p>
+      </div>
+      <div class="contrib-card">
+        <span class="contrib-icon">⚙️</span>
+        <h4>Sim(3) RANSAC Solver</h4>
+        <p>Minimal 2-correspondence solver: SVD on direction pairs for R, then a 6×4 least-squares system for (s, t) jointly.</p>
+      </div>
+      <div class="contrib-card">
+        <span class="contrib-icon">🏛️</span>
+        <h4>Real-Data Training</h4>
+        <p>Trained on Replica RGBD geometry (7 scenes, 4200 pairs) — closes the 89° synthetic-to-real gap to 9.4° on Chess.</p>
+      </div>
+      <div class="contrib-card">
+        <span class="contrib-icon">🎨</span>
+        <h4>9D Color Extension</h4>
+        <p>Appends per-line RGB to 6D Plücker coordinates; 30% color dropout enables a single model to handle RGBD, RGB-only, and mixed inputs.</p>
+      </div>
+    </div>
   </div>
 </section>
 
-<!-- ─── PIPELINE ──────────────────────────────────────────────────── -->
-<section>
+<!-- ── METHOD ───────────────────────────────────────────────────────── -->
+<section id="method">
   <div class="container">
-    <h2>Method Overview</h2>
-    <p>The PluckerNetKnn architecture is reused <em>without modification</em> — only the RANSAC back-end is extended from SE(3) to Sim(3).</p>
-    <div class="pipeline-box">  Cloud 1 [m,d]   ─────┐                    ┌─────  Cloud 2 [m,d]
-  (N₁ × 6)             │                    │              (N₂ × 6)
-                        ▼                    ▼
-              ┌─── PluckerNetKnn (unchanged) ───┐
-              │  KNN graph conv (moments)       │
-              │  KNN graph conv (directions)    │
-              │  Spatial GNN (self + cross ×6)  │
-              │  Sinkhorn OT (30 iterations)    │
-              └──────────────┬──────────────────┘
-                             │ prob_matrix ∈ ℝᴺ¹ˣᴺ²
-                             ▼
-                        Top-K select
-                             │ K matched Plücker pairs
-                             ▼
-              ┌──── Sim(3) RANSAC (NEW) ─────────┐
-              │  Stage 1: R  ← SVD on d-pairs     │
-              │  Stage 2: [s, t] ← lstsq 6×4      │
-              │  Score: ‖L₂ − M_sim3·L₁‖₂ &lt; τ    │
-              └──────────────┬───────────────────┘
-                             │
-                         s,  R,  t</div>
+    <h2>Method</h2>
+    <p>The <strong>PluckerNetKnn architecture is unchanged</strong> — only the RANSAC back-end is extended from SE(3) to Sim(3).</p>
 
-    <h3>Sim(3) minimal solver — 2 line pairs</h3>
-    <p>Given R from direction SVD (scale-invariant), per-line moment equation:</p>
-    <div class="pipeline-box">s · Rm₁ᵢ  −  [d₂ᵢ×] · t  =  m₂ᵢ
+    <div class="code-block reveal"><span class="cm">// input: two Plücker line clouds [m, d] (moment-first)</span>
+<span class="kw">Cloud 1</span> [m,d] (N₁×6) ──────┐                    ┌────── <span class="kw">Cloud 2</span> [m,d] (N₂×6)
+                             │                    │
+                             ▼                    ▼
+                   ┌─── <span class="fn">PluckerNetKnn</span> (unchanged) ───┐
+                   │  KNN graph conv (moments)        │
+                   │  KNN graph conv (directions)     │
+                   │  Spatial Attentional GNN (×6)    │
+                   │  Sinkhorn OT (30 iters)          │
+                   └──────────────┬───────────────────┘
+                                  │ prob_matrix ∈ ℝᴺ¹ˣᴺ²
+                                  ▼
+                             Top-K select
+                                  │ K matched Plücker pairs
+                                  ▼
+                   ┌──── <span class="fn">Sim(3) RANSAC</span> (new) ────────┐
+                   │  Stage 1:  R  ← SVD on d-pairs    │
+                   │  Stage 2: [s,t] ← lstsq 6×4       │
+                   │  Score: ‖L₂ − M_sim3·L₁‖ &lt; τ     │
+                   └──────────────┬───────────────────┘
+                                  ▼
+                              s,  R,  t</div>
 
-Stack 2 pairs → 6 equations, 4 unknowns:
+    <h3>Minimal Solver — 2 line pairs</h3>
+    <p>Given R (from direction SVD, scale-invariant), each line contributes one moment equation:</p>
+    <div class="code-block reveal">s·Rm₁ᵢ  −  [d₂ᵢ×]·t  =  m₂ᵢ
+
+Stack 2 pairs → 6 equations, 4 unknowns [s, t]:
 ⎡ Rm₁₁  −skew(d₂₁) ⎤ ⎡ s ⎤   ⎡ m₂₁ ⎤
-⎢                   ⎥ ⎢   ⎥ = ⎢     ⎥     → x = lstsq(A, b)
+⎢                   ⎥ ⎢   ⎥ = ⎢     ⎥   →  x = lstsq(A, b)
 ⎣ Rm₁₂  −skew(d₂₂) ⎦ ⎣ t ⎦   ⎣ m₂₂ ⎦
 
 Hypotheses with s ≤ 0 are rejected.</div>
-  </div>
-</section>
 
-<!-- ─── PART 1: FAILURE ANALYSIS ──────────────────────────────────── -->
-<section>
-  <div class="container">
-    <h2>Part 1 — Why SE(3) PlueckerNet Fails on Sim(3)</h2>
-    <p>When scale s ≠ 1, the SE(3) solver's residual becomes <strong>e = (s−1)·R·m₁</strong> for every line.
-       This is non-zero for any choice of t — the solver absorbs the scale mismatch into a wrong translation estimate.</p>
-    <div class="fig-grid">
-      <div class="fig-item">
-        <figure>
-          <img src="images/fig1_voxel_overview.png" alt="Point cloud from 30 RGBD frames" />
-          <figcaption>Point cloud stitched from 30 Chess RGBD frames</figcaption>
-        </figure>
-      </div>
-      <div class="fig-item">
-        <figure>
-          <img src="images/fig4_why_sim3_fails.png" alt="Analytical residual vs scale" />
-          <figcaption>Analytical residual grows linearly with |s − 1|</figcaption>
-        </figure>
-      </div>
-      <div class="fig-item">
+    <div class="fig-grid reveal">
+      <div class="fig-card">
         <figure>
           <img src="images/fig5_pluecker_lines_3d.png" alt="3D Plücker lines" />
-          <figcaption>Extracted 3D Plücker lines visualised in scene</figcaption>
+          <figcaption>Extracted 3D Plücker lines in scene</figcaption>
         </figure>
       </div>
-      <div class="fig-item">
+      <div class="fig-card">
         <figure>
           <img src="images/fig6_probability_matrices.png" alt="Probability matrices" />
           <figcaption>Network output: soft correspondence probability matrices</figcaption>
         </figure>
       </div>
     </div>
-    <div class="tbl-wrap">
-      <table>
-        <thead><tr><th>Scenario</th><th>Rot error</th><th>Trans error (m)</th><th>Plücker residual</th></tr></thead>
-        <tbody>
-          <tr><td>SE(3) solver on SE(3) data (s=1)</td><td class="best">0.000°</td><td class="best">0.000</td><td class="best">0.000 ✓</td></tr>
-          <tr><td>SE(3) solver on Sim(3) data (s=1.45)</td><td>0.000°</td><td class="fail">0.858</td><td class="fail">0.630 ✗</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p style="font-size:0.85rem;color:var(--muted)">Ground-truth transform: R = 27°, t = [0.35, −0.20, 0.15] m, s = 1.45.
-       Rotation is unaffected because directions are scale-invariant (d′ = R d).</p>
   </div>
 </section>
 
-<!-- ─── PART 2: BENCHMARK ─────────────────────────────────────────── -->
-<section>
+<!-- ── RESULTS ───────────────────────────────────────────────────────── -->
+<section id="results">
   <div class="container">
-    <h2>Part 2 — 4-Method Benchmark</h2>
-    <p>Four experiments comparing SE3-Net (Semantic3D pretrained), Sim3-Net (synthetic), Sim3-Net (Replica),
-       and pure Sim(3) RANSAC.</p>
-    <div class="fig-grid">
-      <div class="fig-item">
+    <h2>Results</h2>
+    <p>Four experiments across synthetic and real scenes, comparing SE3-PlueckerNet, Sim3-Net (synthetic), ScalePluckerNet (Replica-trained), and pure Sim(3) RANSAC.</p>
+
+    <div class="fig-grid reveal">
+      <div class="fig-card">
         <figure>
-          <img src="images/fig_eval_r02_cube_se3.png" alt="Cube SE3 experiment" />
-          <figcaption><strong>A1</strong> Cube SE(3): Replica model perfect (0.03°), SE3-Net domain mismatch (160°)</figcaption>
+          <img src="images/fig_eval_r02_cube_se3.png" alt="Cube SE3" />
+          <figcaption><span class="tag">A1</span> Cube SE(3) — ScalePluckerNet: <strong class="best">0.03°</strong>, SE3-Net domain mismatch: 160°</figcaption>
         </figure>
       </div>
-      <div class="fig-item">
+      <div class="fig-card">
         <figure>
-          <img src="images/fig_eval_r03_cube_sim3.png" alt="Cube Sim3 experiment" />
-          <figcaption><strong>A2</strong> Cube Sim(3): Replica model best (0.09°), SE3-Net fails on scale</figcaption>
+          <img src="images/fig_eval_r03_cube_sim3.png" alt="Cube Sim3" />
+          <figcaption><span class="tag">A2</span> Cube Sim(3), s=1.8 — ScalePluckerNet: <strong class="best">0.09°</strong></figcaption>
         </figure>
       </div>
-      <div class="fig-item">
+      <div class="fig-card">
         <figure>
-          <img src="images/fig_eval_r04_chess_rgbd.png" alt="Chess RGBD experiment" />
-          <figcaption><strong>B1</strong> Chess RGBD: SE3-Net best (6.7°), synthetic gap 169°→9.4° after Replica training</figcaption>
+          <img src="images/fig_eval_r04_chess_rgbd.png" alt="Chess RGBD" />
+          <figcaption><span class="tag">B1</span> Chess RGBD — SE3-Net best (6.7°); 169° → 9.4° gap after Replica training</figcaption>
         </figure>
       </div>
-      <div class="fig-item">
+      <div class="fig-card">
         <figure>
-          <img src="images/fig_eval_r05_chess_rgb_scale.png" alt="Chess RGB scale experiment" />
-          <figcaption><strong>B2</strong> Chess RGB-only (s=1.8): Replica model best — 5.75°, scale err 0.149</figcaption>
+          <img src="images/fig_eval_r05_chess_rgb_scale.png" alt="Chess RGB" />
+          <figcaption><span class="tag">B2</span> Chess RGB-only (s=1.8) — ScalePluckerNet: <strong class="best">5.75°</strong>, scale err 0.149</figcaption>
         </figure>
       </div>
     </div>
 
-    <div class="tbl-wrap" style="margin-top:1.5rem;">
+    <div class="tbl-wrap reveal">
       <table>
         <thead>
           <tr>
-            <th>Experiment</th>
-            <th>Method</th>
-            <th>Rot (°) ↓</th>
-            <th>Scale err ↓</th>
-            <th>Inliers</th>
+            <th>Experiment</th><th>Method</th><th>Rot (°) ↓</th><th>Scale err ↓</th><th>Inliers</th>
           </tr>
         </thead>
         <tbody>
-          <tr class="row-header"><td colspan="5">A1 — Synthetic cube, SE(3) transform (s=1)</td></tr>
+          <tr class="row-header"><td colspan="5">A1 — Synthetic cube, SE(3) (s = 1)</td></tr>
           <tr><td></td><td>SE3-PlueckerNet</td><td class="fail">159.60</td><td>0.000</td><td>46</td></tr>
           <tr><td></td><td>Sim3-Net (synthetic)</td><td>0.23</td><td>0.001</td><td>20</td></tr>
-          <tr><td></td><td><strong>Sim3-Net (Replica)</strong></td><td class="best">0.03</td><td class="best">0.000</td><td class="best">49</td></tr>
-          <tr><td></td><td>Pure-Sim3-RANSAC</td><td>48.78</td><td>5.722</td><td>36</td></tr>
+          <tr><td></td><td><strong>ScalePluckerNet</strong></td><td class="best">0.03</td><td class="best">0.000</td><td class="best">49</td></tr>
+          <tr><td></td><td>Pure Sim(3) RANSAC</td><td>48.78</td><td>5.722</td><td>36</td></tr>
 
-          <tr class="row-header"><td colspan="5">A2 — Synthetic cube, Sim(3) transform (s=1.8)</td></tr>
+          <tr class="row-header"><td colspan="5">A2 — Synthetic cube, Sim(3) (s = 1.8)</td></tr>
           <tr><td></td><td>SE3-PlueckerNet</td><td class="fail">45.00</td><td class="fail">0.588</td><td>0</td></tr>
           <tr><td></td><td>Sim3-Net (synthetic)</td><td>0.16</td><td>0.000</td><td>13</td></tr>
-          <tr><td></td><td><strong>Sim3-Net (Replica)</strong></td><td class="best">0.09</td><td class="best">0.000</td><td class="best">44</td></tr>
-          <tr><td></td><td>Pure-Sim3-RANSAC</td><td>4.97</td><td>5.817</td><td>29</td></tr>
+          <tr><td></td><td><strong>ScalePluckerNet</strong></td><td class="best">0.09</td><td class="best">0.000</td><td class="best">44</td></tr>
+          <tr><td></td><td>Pure Sim(3) RANSAC</td><td>4.97</td><td>5.817</td><td>29</td></tr>
 
-          <tr class="row-header"><td colspan="5">B1 — Chess 7-Scenes RGBD (metric scale, s=1)</td></tr>
+          <tr class="row-header"><td colspan="5">B1 — Chess 7-Scenes RGBD (s = 1)</td></tr>
           <tr><td></td><td><strong>SE3-PlueckerNet</strong></td><td class="best">6.65</td><td class="best">0.000</td><td class="best">65</td></tr>
           <tr><td></td><td>Sim3-Net (synthetic)</td><td class="fail">168.99</td><td>1.513</td><td>3</td></tr>
-          <tr><td></td><td>Sim3-Net (Replica)</td><td>9.41</td><td>0.203</td><td>5</td></tr>
-          <tr><td></td><td>Pure-Sim3-RANSAC</td><td>0.98</td><td>0.570</td><td>8</td></tr>
+          <tr><td></td><td>ScalePluckerNet</td><td>9.41</td><td>0.203</td><td>5</td></tr>
+          <tr><td></td><td>Pure Sim(3) RANSAC</td><td>0.98</td><td>0.570</td><td>8</td></tr>
 
-          <tr class="row-header"><td colspan="5">B2 — Chess 7-Scenes RGB-only (simulated monocular scale, s=1.8)</td></tr>
+          <tr class="row-header"><td colspan="5">B2 — Chess 7-Scenes RGB-only (simulated monocular, s = 1.8)</td></tr>
           <tr><td></td><td>SE3-PlueckerNet</td><td class="fail">19.02</td><td class="fail">0.588</td><td>18</td></tr>
           <tr><td></td><td>Sim3-Net (synthetic)</td><td>12.10</td><td>3.503</td><td>6</td></tr>
-          <tr><td></td><td><strong>Sim3-Net (Replica)</strong></td><td class="best">5.75</td><td class="best">0.149</td><td>3</td></tr>
-          <tr><td></td><td>Pure-Sim3-RANSAC</td><td>0.81</td><td>4.096</td><td>10</td></tr>
+          <tr><td></td><td><strong>ScalePluckerNet</strong></td><td class="best">5.75</td><td class="best">0.149</td><td>3</td></tr>
+          <tr><td></td><td>Pure Sim(3) RANSAC</td><td>0.81</td><td>4.096</td><td>10</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Line Correspondences — Chess Dataset</h3>
+    <div class="fig-grid reveal">
+      <div class="fig-card">
+        <figure>
+          <img src="images/chess_correspondence_viz.png" alt="Chess RGBD correspondences" />
+          <figcaption><span class="tag">B1</span> RGBD (s = 1) — point cloud + line correspondences after registration</figcaption>
+        </figure>
+      </div>
+      <div class="fig-card">
+        <figure>
+          <img src="images/chess_correspondence_viz_rgb.png" alt="Chess RGB scale correspondences" />
+          <figcaption><span class="tag">B2</span> RGB-only (s = 1.8) — ScalePluckerNet recovers scale 1.70 ≈ 1.8; 6.78°</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <h3>9D Color Extension</h3>
+    <p>Appending per-line RGB — <span class="eq">[m₀ m₁ m₂ d₀ d₁ d₂ r g b]</span> — with 30% color dropout for robustness to colorless inputs.</p>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>Val set</th><th>Inlier ratio</th><th>Recall<sub>rot</sub></th><th>Med. rot</th></tr></thead>
+        <tbody>
+          <tr><td>ScalePluckerNet (6D)</td><td>replica_valid (room2)</td><td>99.185%</td><td>1.000</td><td>0.00°</td></tr>
+          <tr><td><strong>ScalePluckerNet (9D color)</strong></td><td>replica_valid (room2)</td><td class="best"><strong>99.355%</strong></td><td>1.000</td><td>0.00°</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 </section>
 
-<!-- ─── CORRESPONDENCES ───────────────────────────────────────────── -->
-<section>
+<!-- ── SLAM ──────────────────────────────────────────────────────────── -->
+<section id="slam">
   <div class="container">
-    <h2>Line Correspondences — Chess Dataset</h2>
-    <div class="fig-grid">
-      <div class="fig-item">
+    <h2>Semantic Object SLAM</h2>
+    <p>ScalePluckerNet used as a SLAM front-end: persistent object tracks create Sim(3) frame-to-frame edges.
+       Evaluated on Replica room2 (150 frames, 3 tracks) against ground-truth trajectories.</p>
+    <div class="fig-grid reveal">
+      <div class="fig-card">
         <figure>
-          <img src="images/chess_correspondence_viz.png" alt="Chess RGBD correspondences" />
-          <figcaption><strong>B1</strong> RGBD (s=1) — SE3-Net finds 67 inlier correspondences; RANSAC: 0.28°</figcaption>
-        </figure>
-      </div>
-      <div class="fig-item">
-        <figure>
-          <img src="images/chess_correspondence_viz_rgb.png" alt="Chess RGB scale correspondences" />
-          <figcaption><strong>B2</strong> RGB-only (s=1.8) — Sim3-Net recovers scale 1.70 ≈ 1.8; rotation 6.78°</figcaption>
-        </figure>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ─── SLAM ──────────────────────────────────────────────────────── -->
-<section>
-  <div class="container">
-    <h2>Semantic Object-Centric SLAM</h2>
-    <p>The Sim(3) matcher is wrapped as a SLAM front-end: persistent object tracks across frames
-       create Sim(3) frame-to-frame edges. Evaluated on Replica room2 (150 frames, 3 object tracks)
-       against ground-truth trajectories.</p>
-    <div class="fig-grid">
-      <div class="fig-item">
-        <figure>
-          <img src="images/replica_object_slam_viz.png" alt="SLAM object track visualization" />
+          <img src="images/replica_object_slam_viz.png" alt="SLAM object tracks" />
           <figcaption>Object track visualization — Replica room2 sequence</figcaption>
         </figure>
       </div>
-      <div class="fig-item">
+      <div class="fig-card">
         <figure>
-          <img src="images/replica_gt_compare_replica_trained.png" alt="SLAM trajectory vs GT" />
-          <figcaption>Estimated trajectory vs ground truth — Replica-trained model (RMSE 0.702 m)</figcaption>
+          <img src="images/replica_gt_compare_replica_trained.png" alt="Trajectory vs GT" />
+          <figcaption>Estimated trajectory vs ground truth (RMSE 0.702 m)</figcaption>
         </figure>
       </div>
     </div>
-    <div class="tbl-wrap">
+    <div class="tbl-wrap reveal">
       <table>
         <thead><tr><th>Model</th><th>ATE RMSE (m) ↓</th><th>Median (m) ↓</th><th>P90 (m) ↓</th></tr></thead>
         <tbody>
           <tr><td>Sim3-Net (synthetic)</td><td>0.694</td><td>0.685</td><td>0.873</td></tr>
-          <tr><td>Sim3-Net (Replica)</td><td>0.702</td><td>0.686</td><td>0.875</td></tr>
+          <tr><td>ScalePluckerNet</td><td>0.702</td><td>0.686</td><td>0.875</td></tr>
         </tbody>
       </table>
     </div>
-    <p style="font-size:0.85rem;color:var(--muted);margin-top:0.6rem">Both models achieve &gt;99% inlier ratio — the ATE bottleneck is
-       sparse object track coverage (3 tracks / 150 frames), not matcher quality.</p>
+    <p class="note">Both models exceed 99% inlier ratio — the ATE bottleneck is sparse object track coverage (3 tracks / 150 frames), not matcher quality.</p>
   </div>
 </section>
 
-<!-- ─── 9D COLOR ──────────────────────────────────────────────────── -->
-<section>
-  <div class="container">
-    <h2>9D Color Extension</h2>
-    <p>Appending per-line RGB to the 6D Plücker descriptor:
-       <code>[m₀ m₁ m₂  d₀ d₁ d₂  r  g  b]</code>. Colors are sampled from the
-       k=20 nearest-neighbor point cloud, with 30% random dropout to handle partially
-       or fully colorless inputs with a single model.</p>
-    <div class="tbl-wrap">
-      <table>
-        <thead><tr><th>Model</th><th>Val set</th><th>avg_inlier_ratio</th><th>recall_rot</th><th>med_rot</th></tr></thead>
-        <tbody>
-          <tr><td>Sim3-Net 6D (Replica)</td><td>replica_valid (room2)</td><td>99.185%</td><td>1.000</td><td>0.00°</td></tr>
-          <tr><td><strong>Sim3-Net 9D color (Replica)</strong></td><td>replica_valid (room2)</td><td class="best"><strong>99.355%</strong></td><td>1.000</td><td>0.00°</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p>The 9D model also converges faster: 50% inlier ratio at epoch 2 vs. epoch 17 for the 6D synthetic model, due to the additional color disambiguation signal.</p>
-  </div>
-</section>
-
-<!-- ─── CITATION ──────────────────────────────────────────────────── -->
-<section>
+<!-- ── CITE ──────────────────────────────────────────────────────────── -->
+<section id="cite">
   <div class="container">
     <h2>Citation</h2>
-    <p>If you use this code, please cite the original PlueckerNet:</p>
-    <div class="cite-box">@inproceedings{liu2021plueckernet,
+    <p>If you use this work, please also cite the original PlueckerNet:</p>
+    <div class="cite-box reveal">@inproceedings{liu2021plueckernet,
   title     = {PlueckerNet: Learn to Register 3D Line Reconstructions},
   author    = {Liu, Mouyu and Chen, Yiming and Nie, Yiming and Zhu, Yao
                and Song, Shaojie and Luo, Siyu},
@@ -466,9 +542,8 @@ Hypotheses with s ≤ 0 are rejected.</div>
   year      = {2021}
 }
 
-@misc{day2026scaleawareplueckernet,
-  title  = {Scale-Aware PlueckerNet: Extending Plücker Line Registration
-            from SE(3) to Sim(3) with RGB Color Features},
+@misc{day2026scaleplueckernet,
+  title  = {ScalePluckerNet: Extending Plücker Line Registration from SE(3) to Sim(3)},
   author = {Day, Ruey},
   year   = {2026},
   url    = {https://github.com/rueyday/scale-aware-PlueckerNet}
@@ -476,19 +551,21 @@ Hypotheses with s ≤ 0 are rejected.</div>
   </div>
 </section>
 
-<!-- ─── FOOTER ────────────────────────────────────────────────────── -->
+<!-- ── FOOTER ────────────────────────────────────────────────────────── -->
 <footer>
-  <p>Scale-Aware PlueckerNet · Ruey Day · University of Michigan Robotics · 2026</p>
-  <p style="margin-top:0.3rem">Built on <a href="https://github.com/Liumouliu/PlueckerNet" style="color:#60a5fa">PlueckerNet</a> (Liu et al., CVPR 2021)</p>
+  <p>ScalePluckerNet &middot; Ruey Day &middot; University of Michigan Robotics &middot; 2026</p>
+  <p style="margin-top:0.4rem">Built on <a href="https://github.com/Liumouliu/PlueckerNet">PlueckerNet</a> (Liu et al., CVPR 2021)</p>
 </footer>
 
-<!-- ─── LIGHTBOX ──────────────────────────────────────────────────── -->
+<!-- ── LIGHTBOX ──────────────────────────────────────────────────────── -->
 <div id="lb">
   <button id="lb-close" onclick="document.getElementById('lb').classList.remove('open')">&times;</button>
   <img id="lb-img" src="" alt="" />
 </div>
+
 <script>
-  document.querySelectorAll('.fig-item img, .teaser img').forEach(img => {
+  // lightbox
+  document.querySelectorAll('.fig-card img, .teaser img').forEach(img => {
     img.addEventListener('click', () => {
       document.getElementById('lb-img').src = img.src;
       document.getElementById('lb').classList.add('open');
@@ -500,6 +577,12 @@ Hypotheses with s ≤ 0 are rejected.</div>
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') document.getElementById('lb').classList.remove('open');
   });
+
+  // scroll reveal
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); observer.unobserve(e.target); } });
+  }, { threshold: 0.08 });
+  document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 </script>
 </body>
 </html>

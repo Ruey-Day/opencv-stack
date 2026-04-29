@@ -11,4 +11,5 @@ __pycache__/
 results/
 output/
 dataset/
+report/
 CLAUDE.md
