@@ -7,8 +7,6 @@
 | **1 — Failure analysis** | Proves analytically and verifies experimentally on real RGBD data that the SE(3) Plücker solver structurally fails when scale is unknown. |
 | **2 — Sim(3) training** | Extends PlueckerNet with a new closed-form Sim(3) solver, synthetic data generator, and modified trainer that jointly recovers scale, rotation, and translation. |
 
----
-
 ## Research context
 
 PlueckerNet learns to match 3D line correspondences between two scenes using Plücker coordinates. Its RANSAC back-end then recovers the relative SE(3) pose. A natural extension is **Sim(3)** — the similarity group that adds uniform scale — which arises in monocular SLAM, scale-ambiguous reconstruction, and multi-session mapping.
@@ -18,8 +16,6 @@ To our knowledge no prior work explicitly extends a Plücker-coordinate matching
 **Key design insight:** the correspondence network does not need to change. The Sinkhorn matching learns scale-agnostic features (directions `d` are unit vectors under Sim(3); relative moment structure within each point set is preserved up to a global scale). Only the RANSAC back-end needs to be extended to Sim(3). The scale is then recovered analytically from the matched line correspondences.
 
 **Critical implementation note:** moment vectors `m` must **not** be normalized before feeding to the network. Their magnitude encodes scene scale; normalizing them destroys the only signal that makes scale estimation possible.
-
----
 
 ## Model Architecture
 
