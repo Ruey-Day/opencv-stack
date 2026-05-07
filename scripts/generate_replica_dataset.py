@@ -281,7 +281,8 @@ def generate_split(scene_names, out_dir, n_scenes_per_scene,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--out_dir',              default='./dataset')
+    parser.add_argument('--out_dir',
+                        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'dataset'))
     parser.add_argument('--n_train_per_scene',    type=int, default=600)
     parser.add_argument('--n_valid_per_scene',    type=int, default=200)
     parser.add_argument('--n_inliers',            type=int, default=100)

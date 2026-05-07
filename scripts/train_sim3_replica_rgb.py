@@ -26,8 +26,10 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 
-PLUECKERNET_DIR = os.path.join(os.path.dirname(__file__), '..', 'PlueckerNet')
+_PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PLUECKERNET_DIR = os.path.join(_PROJECT_ROOT, '..', 'PlueckerNet')
 sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
+sys.path.insert(0, _PROJECT_ROOT)
 
 from config import get_config
 from sim3.dataloader import Sim3PluckerData
@@ -56,7 +58,7 @@ if __name__ == '__main__':
     configs = get_config()
 
     configs.dataset          = 'replica_color'
-    configs.data_dir         = './dataset'
+    configs.data_dir         = os.path.join(_PROJECT_ROOT, 'dataset')
     configs.gpu_inds         = 0
     configs.model_nb         = str(date.today())
     configs.train_batch_size = 12

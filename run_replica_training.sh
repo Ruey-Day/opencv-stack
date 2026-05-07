@@ -10,7 +10,7 @@ source /home/rueyday/miniconda3/etc/profile.d/conda.sh
 conda activate torch5090
 
 echo "=== GENERATION START $(date) ==="
-python generate_replica_dataset.py \
+python scripts/generate_replica_dataset.py \
     --n_train_per_scene 600 \
     --n_valid_per_scene 200 \
     --n_candidate_lines 400

@@ -31,7 +31,6 @@ from config import get_config
 from sim3.dataloader import Sim3PluckerData
 from sim3.trainer import Sim3Trainer
 
-import logging, sys
 ch = logging.StreamHandler(sys.stdout)
 logging.getLogger().setLevel(logging.INFO)
 logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d %H:%M:%S', handlers=[ch])
@@ -65,7 +64,7 @@ if __name__ == '__main__':
     configs.resume_dir       = None
 
     dconfig = vars(configs)
-    dconfig['resume'] = './output/replica/2026-04-22/checkpoint.pth'
+    dconfig['resume'] = None
 
     logging.info('===> Configurations')
     for k in sorted(dconfig):

@@ -243,7 +243,8 @@ def generate_split(n_scenes, out_dir, n_inliers=100, n_outliers=30, n_dir_cluste
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--out_dir',    type=str, default='./dataset')
+    parser.add_argument('--out_dir',    type=str,
+                        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'dataset'))
     parser.add_argument('--dataset',    type=str, default='sim3_synthetic')
     parser.add_argument('--n_train',    type=int, default=5000)
     parser.add_argument('--n_valid',    type=int, default=500)

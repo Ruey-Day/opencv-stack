@@ -18,6 +18,11 @@ Rewritten as a 3n × 4 linear system (per inlier pair i):
 import numpy as np
 
 
+def _p6(plucker):
+    """Return the first 6 rows of a Plücker array (strips RGB if 9D)."""
+    return plucker[:6] if plucker.shape[0] > 6 else plucker
+
+
 def skew(x):
     x = x.flatten()
     return np.array([[ 0,    -x[2],  x[1]],
@@ -75,12 +80,8 @@ def model_estimate_sim3(plucker1, plucker2):
     Returns:
         (s, R, t) or None if degenerate (s ≤ 0)
     """
-    # Extract only 6D Plücker coords (ignore RGB colors if present)
-    if plucker1.shape[0] > 6:
-        plucker1 = plucker1[:6, :]
-    if plucker2.shape[0] > 6:
-        plucker2 = plucker2[:6, :]
-    
+    plucker1, plucker2 = _p6(plucker1), _p6(plucker2)
+
     d1 = plucker1[3:, :]   # (3, 2)
     d2 = plucker2[3:, :]   # (3, 2)
     R = estimate_rotation(d1, d2)
@@ -117,11 +118,8 @@ def score_sim3(plucker1, plucker2, s, R, t, threshold):
         plucker1, plucker2: (6+, n) arrays (9D if colors present)
         threshold: L2 residual cutoff on the 6D Plücker vector (ignores color)
     """
-    # Extract only 6D Plücker coords (ignore RGB colors if present)
-    p1_6d = plucker1[:6] if plucker1.shape[0] > 6 else plucker1
-    p2_6d = plucker2[:6] if plucker2.shape[0] > 6 else plucker2
-    
     M = sim3_motion_matrix(s, R, t)
+    p1_6d, p2_6d = _p6(plucker1), _p6(plucker2)
     residual = np.linalg.norm(p2_6d - M @ p1_6d, axis=0)
     return residual < threshold
 
@@ -134,12 +132,8 @@ def best_fit_sim3(plucker1, plucker2):
     Returns:
         (s, R, t)
     """
-    # Extract only 6D Plücker coords (ignore RGB colors if present)
-    if plucker1.shape[0] > 6:
-        plucker1 = plucker1[:6, :]
-    if plucker2.shape[0] > 6:
-        plucker2 = plucker2[:6, :]
-    
+    plucker1, plucker2 = _p6(plucker1), _p6(plucker2)
+
     R = estimate_rotation(plucker1[3:, :], plucker2[3:, :])
     m1p = (R @ plucker1[:3, :]).T
     m2  = plucker2[:3, :].T

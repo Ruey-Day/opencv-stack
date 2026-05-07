@@ -34,7 +34,7 @@ import torch
 warnings.filterwarnings("ignore")
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-_REPO_ROOT      = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUECKERNET_DIR = os.path.join(os.path.dirname(_REPO_ROOT), "PlueckerNet")
 sys.path.insert(0, PLUECKERNET_DIR)
 
