@@ -2,6 +2,7 @@
 *.pkl
 *.log
 *.tex
+*.zip
 events.out.*
 __pycache__/
 *.pth 
