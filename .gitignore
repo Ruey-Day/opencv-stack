@@ -9,7 +9,6 @@ __pycache__/
 .claude/
 .claude_cache/
 .claude_cache_*
-results/
 output/
 dataset/
 report/

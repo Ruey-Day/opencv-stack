@@ -51,16 +51,43 @@ class Sim3PluckerData(Dataset):
 
     def __init__(self, phase, config):
         super().__init__()
-        self.data = load_sim3_data(config, phase)
-        self.len  = len(self.data['t_gt'])
+        self.data        = load_sim3_data(config, phase)
+        self.len         = len(self.data['t_gt'])
+        self.normalize_n    = getattr(config, 'normalize_n_lines',   None)
+        self.normalize_n_in = getattr(config, 'normalize_n_inliers', None)
 
     def __getitem__(self, index):
-        matches_ind = self.data['matches'][index]
-        plucker1    = self.data['plucker1'][index]
+        matches_ind = self.data['matches'][index]     # (2, n_inliers)
+        plucker1    = self.data['plucker1'][index]    # (n_lines, 6)
         plucker2    = self.data['plucker2'][index]
         R_gt        = self.data['R_gt'][index]
         t_gt        = self.data['t_gt'][index]
         s_gt        = np.float32(self.data['s_gt'][index])
+
+        # Subsample to a fixed size when mixing datasets of different sizes.
+        if self.normalize_n is not None and plucker1.shape[0] > self.normalize_n:
+            n_in_want  = self.normalize_n_in or (self.normalize_n * 100 // 130)
+            n_out_want = self.normalize_n - n_in_want
+            n_in_have  = matches_ind.shape[1]
+
+            in_sel  = np.random.choice(n_in_have, min(n_in_want, n_in_have), replace=False)
+            in_idx1 = matches_ind[0, in_sel]
+            in_idx2 = matches_ind[1, in_sel]
+
+            out_pool1 = np.setdiff1d(np.arange(plucker1.shape[0]), in_idx1)
+            out_pool2 = np.setdiff1d(np.arange(plucker2.shape[0]), in_idx2)
+            out_sel1  = np.random.choice(out_pool1, min(n_out_want, len(out_pool1)), replace=False)
+            out_sel2  = np.random.choice(out_pool2, min(n_out_want, len(out_pool2)), replace=False)
+
+            n_in_actual = len(in_sel)
+            new1  = np.concatenate([plucker1[in_idx1], plucker1[out_sel1]])
+            new2  = np.concatenate([plucker2[in_idx2], plucker2[out_sel2]])
+            perm1 = np.random.permutation(len(new1))
+            perm2 = np.random.permutation(len(new2))
+            new1  = new1[perm1];  new2  = new2[perm2]
+            inv1  = np.argsort(perm1); inv2 = np.argsort(perm2)
+            matches_ind = np.stack([inv1[:n_in_actual], inv2[:n_in_actual]], axis=0)
+            plucker1, plucker2 = new1, new2
 
         n1, n2 = plucker1.shape[0], plucker2.shape[0]
         matches = np.zeros([n1, n2], dtype=np.float32)
