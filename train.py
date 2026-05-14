@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
 """
-train.py — ScalePlueckerNet unified training entry point.
+train.py — ScalePlueckerNet training entry point.
 
-Extensions over the original PlueckerNet are opt-in via flags:
-  --color      9D input (Plücker + LAB color); needs a *_color dataset
-  --dustbin    Dustbin token for partial-overlap robustness (Phase 4)
-  --cosine_lr  CosineAnnealingWarmRestarts instead of ExponentialLR
+Extensions over the original PlueckerNet (all opt-in via flags):
 
-With no flags and --dataset se3real_sim3 --n_lines 130, training closely
-matches the original PlueckerNet setup (same data distribution, same
-architecture, SE(3) data — only difference is Sim(3) scale labels).
+  CORE (always active)
+    Sim(3) scale recovery: network learns R, t, AND scale s jointly.
+    The Sim(3) RANSAC solver is used for validation instead of SE(3).
+
+  --dataset         Controls the training data source.
+                      semantic3D / structured3D  — original PlueckerNet indoor data (SE3, s=1)
+                      replica_gs                 — Replica RGBD, world-space GlueStick lines
+                      7scenes_gs                 — 7-Scenes RGBD, world-space GlueStick lines
+                      joint (default)            — all four sources combined
+
+  --dustbin         Adds a learnable dustbin token (SuperGlue-style) so unmatched
+                    lines are assigned to the dustbin rather than forced onto wrong
+                    correspondences.  Intended for fine-tuning from a joint checkpoint.
+
+  --cosine_lr       Switches from ExponentialLR to CosineAnnealingWarmRestarts
+                    (T_0=50, T_mult=2, eta_min=1e-6).
 
 Examples
 --------
-# se3real baseline (≈ original PlueckerNet with Sim(3) scale labels):
-python train.py --dataset se3real_sim3 --batch 12 --lr 1e-3 --n_lines 130 --n_inliers 100
+# Original PlueckerNet data only, Sim(3) scale:
+python train.py --dataset semantic3D --batch 12 --lr 1e-3
 
-# joint 6D — all 4 indoor datasets, 700 lines (best geometry model):
+# All sources, geometry-only 6D (default):
 python train.py --dataset joint
 
-# joint 9D color — warm-start from 6D joint checkpoint:
-python train.py --dataset joint_color --color --cosine_lr \\
-    --pretrain output/joint/2026-05-12/best_val_checkpoint.pth
-
-# Phase 4 dustbin fine-tuning — partial-overlap robustness:
-python train.py --dataset partial_overlap --dustbin \\
-    --pretrain output/joint/2026-05-12/best_val_checkpoint.pth \\
-    --lr 2e-4
+# Dustbin fine-tuning from pre-trained joint checkpoint:
+python train.py --dataset joint --dustbin \\
+    --pretrain output/joint/2026-05-12/best_val_checkpoint.pth --lr 2e-4
 
 # Resume any run:
 python train.py --dataset joint --resume output/joint/2026-05-12/checkpoint.pth
@@ -64,33 +69,33 @@ def parse_args():
     p = argparse.ArgumentParser(description='ScalePlueckerNet training')
 
     # Data
-    p.add_argument('--dataset',   default='joint',
-                   help='Dataset name under data_dir (default: joint)')
-    p.add_argument('--data_dir',  default='./dataset')
-    p.add_argument('--n_lines',   type=int, default=700,
-                   help='Max lines per scene (700 = full distribution)')
-    p.add_argument('--n_inliers', type=int, default=490,
-                   help='Max GT inliers per scene (must match dataset generation)')
+    p.add_argument('--dataset',    default='joint',
+                   help='Training data: semantic3D | structured3D | replica_gs | 7scenes_gs | joint')
+    p.add_argument('--data_dir',   default='./dataset')
+    p.add_argument('--n_lines',    type=int, default=700,
+                   help='Lines per scene after subsampling (must match dataset)')
+    p.add_argument('--n_inliers',  type=int, default=490,
+                   help='GT inliers per scene (must match dataset)')
 
     # Training
-    p.add_argument('--epochs',    type=int,   default=400)
-    p.add_argument('--batch',     type=int,   default=32)
-    p.add_argument('--lr',        type=float, default=5e-4)
-    p.add_argument('--gpu',       type=int,   default=0)
-    p.add_argument('--workers',   type=int,   default=8)
+    p.add_argument('--epochs',     type=int,   default=400)
+    p.add_argument('--batch',      type=int,   default=32)
+    p.add_argument('--lr',         type=float, default=5e-4)
+    p.add_argument('--gpu',        type=int,   default=0)
+    p.add_argument('--workers',    type=int,   default=8)
 
-    # Model
-    p.add_argument('--in_channel', type=int, default=9,
-                   help='Input channels: 9=Plücker+LAB (default), 6=geometry only')
-    p.add_argument('--no_dustbin', action='store_true',
-                   help='Disable dustbin token (use plain Sim3Trainer instead)')
+    # Extensions (all off by default)
+    p.add_argument('--in_channel', type=int, default=6,
+                   help='6=geometry only (default)  9=Plücker+LAB color')
+    p.add_argument('--dustbin',    action='store_true',
+                   help='Enable learnable dustbin token for partial-overlap robustness')
     p.add_argument('--cosine_lr',  action='store_true',
-                   help='CosineAnnealingWarmRestarts(T_0=50, T_mult=2, eta_min=1e-6)')
+                   help='CosineAnnealingWarmRestarts instead of ExponentialLR')
 
     # Checkpointing
-    p.add_argument('--pretrain',  default=None,
-                   help='Load weights strict=False (warm-start; e.g. 6D→9D or dustbin init)')
-    p.add_argument('--resume',    default=None,
+    p.add_argument('--pretrain',   default=None,
+                   help='Warm-start from checkpoint (strict=False, e.g. for dustbin init)')
+    p.add_argument('--resume',     default=None,
                    help='Resume training from checkpoint')
 
     return p.parse_args()
@@ -124,55 +129,46 @@ def main():
         cudnn.deterministic = True
 
     logging.info('===> ScalePlueckerNet Training')
-    for k in sorted(dconfig):
-        logging.info(f'    {k}: {dconfig[k]}')
+    logging.info(f'  dataset    : {args.dataset}')
+    logging.info(f'  in_channel : {args.in_channel}')
+    logging.info(f'  dustbin    : {args.dustbin}')
+    logging.info(f'  cosine_lr  : {args.cosine_lr}')
 
-    if not args.no_dustbin:
-        from sim3.dataloader_phase4 import PartialOverlapData
+    train_loader = DataLoader(
+        Sim3PluckerData(phase='train', config=configs),
+        batch_size=configs.train_batch_size,
+        shuffle=True, drop_last=True,
+        num_workers=args.workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        Sim3PluckerData(phase='valid', config=configs),
+        batch_size=1, shuffle=False, drop_last=False,
+        num_workers=2,
+    )
+
+    if args.dustbin:
         from sim3.trainer_dustbin import DustbinTrainer
-        train_loader = DataLoader(
-            PartialOverlapData(phase='train', config=configs),
-            batch_size=configs.train_batch_size,
-            shuffle=True, drop_last=True,
-            num_workers=args.workers, pin_memory=True,
-        )
-        val_loader = DataLoader(
-            PartialOverlapData(phase='valid', config=configs),
-            batch_size=1, shuffle=False, drop_last=False,
-            num_workers=2,
-        )
         trainer = DustbinTrainer(configs, train_loader, val_loader)
     else:
-        train_loader = DataLoader(
-            Sim3PluckerData(phase='train', config=configs),
-            batch_size=configs.train_batch_size,
-            shuffle=True, drop_last=True,
-            num_workers=args.workers, pin_memory=True,
-        )
-        val_loader = DataLoader(
-            Sim3PluckerData(phase='valid', config=configs),
-            batch_size=1, shuffle=False, drop_last=False,
-            num_workers=2,
-        )
         trainer = Sim3Trainer(configs, train_loader, val_loader)
 
     if args.pretrain and os.path.exists(args.pretrain):
         ckpt = torch.load(args.pretrain, map_location='cpu', weights_only=False)
         state = ckpt.get('model', ckpt.get('state_dict', ckpt))
         missing, unexpected = trainer.model.load_state_dict(state, strict=False)
-        logging.info(f'Loaded pretrain weights: {args.pretrain}')
+        logging.info(f'Loaded pretrain: {args.pretrain}')
         if missing:
-            logging.info(f'  Missing keys (re-init): {missing}')
+            logging.info(f'  Missing (re-init): {missing}')
         if unexpected:
-            logging.info(f'  Unexpected keys (skipped): {unexpected}')
+            logging.info(f'  Unexpected (skipped): {unexpected}')
     elif args.pretrain:
-        logging.warning(f'Pretrain weights not found: {args.pretrain}')
+        logging.warning(f'Pretrain not found: {args.pretrain}')
 
     if args.cosine_lr:
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
             trainer.optimizer, T_0=50, T_mult=2, eta_min=1e-6,
         )
-        logging.info('Scheduler: CosineAnnealingWarmRestarts(T_0=50, T_mult=2, eta_min=1e-6)')
+        logging.info('Scheduler: CosineAnnealingWarmRestarts(T_0=50, T_mult=2)')
 
     trainer.train()
 

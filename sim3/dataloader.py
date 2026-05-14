@@ -55,6 +55,7 @@ class Sim3PluckerData(Dataset):
         self.len         = len(self.data['t_gt'])
         self.normalize_n    = getattr(config, 'normalize_n_lines',   None)
         self.normalize_n_in = getattr(config, 'normalize_n_inliers', None)
+        self.in_channel     = getattr(config, 'in_channel', None)
 
     def __getitem__(self, index):
         matches_ind = self.data['matches'][index]     # (2, n_inliers)
@@ -88,6 +89,10 @@ class Sim3PluckerData(Dataset):
             inv1  = np.argsort(perm1); inv2 = np.argsort(perm2)
             matches_ind = np.stack([inv1[:n_in_actual], inv2[:n_in_actual]], axis=0)
             plucker1, plucker2 = new1, new2
+
+        if self.in_channel is not None:
+            plucker1 = plucker1[:, :self.in_channel]
+            plucker2 = plucker2[:, :self.in_channel]
 
         n1, n2 = plucker1.shape[0], plucker2.shape[0]
         matches = np.zeros([n1, n2], dtype=np.float32)

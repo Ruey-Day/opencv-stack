@@ -35,7 +35,7 @@ DEPTH_SCALE = 1000.0
 DEPTH_MAX   = 4.5
 
 TRAIN_SCENES = ['chess', 'fire', 'heads', 'office', 'pumpkin', 'redkitchen', 'stairs']
-VALID_SCENES = ['chess']   # chess seq-05 used as held-out val
+VALID_SCENES = ['chess']   # chess seq-06 (last seq) held out for validation
 
 
 def _load_seqs(scene_dir):
@@ -51,7 +51,7 @@ def _worker(scene_name, seven_root, out_dir, n_per_scene,
     sys.path.insert(0, SCRIPT_DIR)
     from gluestick import numpy_image_to_torch
     from gluestick.models.wireframe import SPWireframeDescriptor
-    from _pair_gen import generate_pair, sample_line_lab
+    from _pair_gen import generate_pair, sample_line_lab, dedup_pool
 
     np.random.seed(seed)
 
@@ -61,7 +61,9 @@ def _worker(scene_name, seven_root, out_dir, n_per_scene,
     scene_dir = os.path.join(seven_root, scene_name)
     seqs      = _load_seqs(scene_dir)
     if val_mode:
-        seqs = seqs[-1:]   # hold out last sequence for validation
+        seqs = seqs[-1:]   # only the held-out last sequence
+    else:
+        seqs = seqs[:-1]   # exclude the held-out last sequence from training
 
     pool = []
     for seq_dir in seqs:
@@ -116,7 +118,8 @@ def _worker(scene_name, seven_root, out_dir, n_per_scene,
         return
 
     pool = np.array(pool, np.float32)
-    print(f'    [{scene_name}] pool: {len(pool):,} lines → generating {n_per_scene} pairs', flush=True)
+    pool = dedup_pool(pool)
+    print(f'    [{scene_name}] pool: {len(pool):,} lines (deduped) → generating {n_per_scene} pairs', flush=True)
 
     pairs = {k: [] for k in ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']}
     n_ok  = 0

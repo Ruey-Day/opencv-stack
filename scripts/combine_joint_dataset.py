@@ -2,11 +2,12 @@
 """
 combine_joint_dataset.py
 
-Merges replica_gs, 7scenes_gs, and tum_rgbd_gs splits into a single
-joint_train / joint_valid dataset.
+Merges replica_gs, 7scenes_gs, semantic3D, and structured3D splits into a
+single joint_train / joint_valid dataset.
 
-All sources are 9D (Plücker+LAB) with embedded overlap distribution —
-no padding or conversion needed, just shuffle and concatenate.
+semantic3D and structured3D must first be converted to [m,d] format with
+s_gt=1.0 via:
+    python scripts/convert_se3_datasets.py
 
 Usage
 -----
@@ -28,8 +29,9 @@ def load_split(split_dir):
             raise FileNotFoundError(f'Missing: {path}')
         with open(path, 'rb') as f:
             data[k] = pickle.load(f, encoding='latin1')
-    n = len(data['plucker1'])
-    print(f'  Loaded {n:,} scenes from {split_dir}')
+    n  = len(data['plucker1'])
+    ch = data['plucker1'][0].shape[1]
+    print(f'  Loaded {n:,} scenes from {split_dir}  ({ch}D)')
     return data, n
 
 
@@ -74,12 +76,14 @@ def main():
     train_sources = [
         os.path.join(args.data_dir, 'replica_gs_train'),
         os.path.join(args.data_dir, '7scenes_gs_train'),
-        os.path.join(args.data_dir, 'tum_rgbd_gs_train'),
+        os.path.join(args.data_dir, 'semantic3D_train'),
+        os.path.join(args.data_dir, 'structured3D_train'),
     ]
     valid_sources = [
         os.path.join(args.data_dir, 'replica_gs_valid'),
         os.path.join(args.data_dir, '7scenes_gs_valid'),
-        os.path.join(args.data_dir, 'tum_rgbd_gs_valid'),
+        os.path.join(args.data_dir, 'semantic3D_valid'),
+        os.path.join(args.data_dir, 'structured3D_valid'),
     ]
 
     print('Combining TRAIN splits:')
@@ -89,7 +93,7 @@ def main():
     n_valid = combine_and_save(valid_sources, os.path.join(args.out_dir, 'joint_valid'), args.seed + 1)
 
     print(f'\nDone — {n_train:,} train / {n_valid:,} valid scenes.')
-    print('Train with: python train.py --dataset joint --dustbin')
+    print('Train with: python train.py --dataset joint')
 
 
 if __name__ == '__main__':

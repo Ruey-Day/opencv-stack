@@ -36,10 +36,6 @@ class Sim3Trainer:
         Model = load_model('PluckerNetKnn')
         self.model = Model(config)
 
-        if config.weights:
-            checkpoint = torch.load(config.weights)
-            self.model.load_state_dict(checkpoint['state_dict'])
-
         logging.info(self.model)
 
         self.config          = config
@@ -98,30 +94,6 @@ class Sim3Trainer:
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_moments(plucker, ref_scale=None):
-        """Normalize moment part of Plücker lines by a shared scale factor.
-
-        Plücker format: [..., :3] = moment m, [..., 3:] = direction d.
-        Under Sim(3), m₂ = s·R·m₁ + t×d₂ — the global scale s shifts the
-        moment magnitudes between the two clouds by factor s.  Both clouds must
-        be normalized by the *same* factor (computed from cloud 1) so the ratio
-        of moment magnitudes ≈ s remains visible to the network.
-
-        Args:
-            plucker:   (B, N, 6) Plücker tensor
-            ref_scale: precomputed scale to reuse (for cloud 2).  If None,
-                       the scale is computed from this cloud and returned.
-
-        Returns:
-            normalized (B, N, 6) tensor, scale (B, 1, 1) tensor
-        """
-        m = plucker[..., :3]                                    # (B, N, 3)
-        d = plucker[..., 3:]                                    # (B, N, 3)
-        if ref_scale is None:
-            ref_scale = m.norm(dim=-1).mean(dim=-1, keepdim=True).unsqueeze(-1).clamp(min=1e-6)
-        return torch.cat([m / ref_scale, d], dim=-1), ref_scale
 
     def train(self):
         if self.test_valid:

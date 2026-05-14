@@ -50,7 +50,7 @@ def _worker(scene_name, replica_root, out_dir, n_per_scene,
     sys.path.insert(0, SCRIPT_DIR)
     from gluestick import numpy_image_to_torch
     from gluestick.models.wireframe import SPWireframeDescriptor
-    from _pair_gen import generate_pair, sample_line_lab
+    from _pair_gen import generate_pair, sample_line_lab, dedup_pool
 
     np.random.seed(seed)
 
@@ -116,7 +116,8 @@ def _worker(scene_name, replica_root, out_dir, n_per_scene,
         return
 
     pool = np.array(pool, np.float32)
-    print(f'    [{scene_name}] pool: {len(pool):,} lines → generating {n_per_scene} pairs', flush=True)
+    pool = dedup_pool(pool)
+    print(f'    [{scene_name}] pool: {len(pool):,} lines (deduped) → generating {n_per_scene} pairs', flush=True)
 
     pairs = {k: [] for k in ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']}
     n_ok  = 0

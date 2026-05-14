@@ -172,18 +172,23 @@ def cross_dataset_eval(weights_path, datasets, data_dir, out_dir, label=None):
         with torch.no_grad():
             metrics = trainer._valid_epoch()
 
-        print(f"\n── Results: {run_label} ──")
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
-
         os.makedirs(out_dir, exist_ok=True)
         safe = run_label.replace(' ', '_').replace('/', '-').replace('→', 'on')
         out_path = os.path.join(out_dir, f'{safe}.json')
         with open(out_path, 'w') as f:
             json.dump({'label': run_label, 'weights': weights_path,
                        'dataset': dataset, 'metrics': metrics}, f, indent=2)
-        print(f"Saved → {out_path}")
         results[dataset] = metrics
+
+    # Summary table
+    if results:
+        print(f"\n{'='*75}")
+        print(f"{'Dataset':<20} {'recall_rot':>10} {'med_rot (°)':>12} {'med_trans (m)':>14} {'inlier_ratio':>13}")
+        print(f"{'-'*75}")
+        for ds, m in results.items():
+            print(f"{ds:<20} {m['recall_rot']:>10.3f} {m['med_rot']:>12.2f} "
+                  f"{m['med_trans']:>14.3f} {m['avg_inlier_ratio']:>12.1f}%")
+        print(f"{'='*75}")
 
     return results
 
@@ -547,8 +552,8 @@ def main():
     p = argparse.ArgumentParser(description='ScalePlueckerNet evaluation')
     p.add_argument('--weights',      default=None,
                    help='Checkpoint path (required for cross-dataset and chess modes)')
-    p.add_argument('--dataset',      default=None,
-                   help='Comma-separated val split names, e.g. replica_gs,7scenes_gs')
+    p.add_argument('--dataset',      default='semantic3D,structured3D,replica_gs,7scenes_gs',
+                   help='Comma-separated val split names (default: all four datasets)')
     p.add_argument('--data_dir',     default=os.path.join(ROOT, 'dataset'))
     p.add_argument('--label',        default=None,  help='Human-readable label')
     p.add_argument('--out_dir',      default=os.path.join(ROOT, 'results', 'eval_cross_dataset'))
@@ -589,8 +594,6 @@ def main():
         # default: cross-dataset eval
         if not args.weights:
             p.error('cross-dataset eval requires --weights')
-        if not args.dataset:
-            p.error('cross-dataset eval requires --dataset')
         datasets = [d.strip() for d in args.dataset.split(',')]
         cross_dataset_eval(args.weights, datasets, args.data_dir,
                            args.out_dir, args.label)
