@@ -83,6 +83,8 @@ def parse_args():
     p.add_argument('--lr',         type=float, default=5e-4)
     p.add_argument('--gpu',        type=int,   default=0)
     p.add_argument('--workers',    type=int,   default=8)
+    p.add_argument('--name',       default=None,
+                   help='Override run name (default: today\'s date). Use to avoid checkpoint clashes when running multiple jobs on the same dataset.')
 
     # Extensions (all off by default)
     p.add_argument('--in_channel', type=int, default=6,
@@ -104,11 +106,16 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # get_config() re-parses sys.argv via PlueckerNet's argparse — strip our
+    # custom flags so it doesn't choke on unknown arguments.
+    import sys as _sys
+    _sys.argv = _sys.argv[:1]
+
     configs = get_config()
     configs.dataset             = args.dataset
     configs.data_dir            = args.data_dir
     configs.gpu_inds            = args.gpu
-    configs.model_nb            = str(date.today())
+    configs.model_nb            = args.name if args.name else str(date.today())
     configs.train_batch_size    = args.batch
     configs.train_lr            = args.lr
     configs.train_epoches       = args.epochs

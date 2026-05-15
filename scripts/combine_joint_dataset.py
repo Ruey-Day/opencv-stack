@@ -2,12 +2,11 @@
 """
 combine_joint_dataset.py
 
-Merges replica_gs, 7scenes_gs, semantic3D, and structured3D splits into a
-single joint_train / joint_valid dataset.
+Merges replica_gs, 7scenes_gs, and se3real_sim3 (semantic3D + structured3D
+with random Sim(3) scale augmentation) into joint_train / joint_valid.
 
-semantic3D and structured3D must first be converted to [m,d] format with
-s_gt=1.0 via:
-    python scripts/convert_se3_datasets.py
+se3real_sim3 must first be generated via:
+    python scripts/generate_se3real_sim3_dataset.py
 
 Usage
 -----
@@ -76,14 +75,12 @@ def main():
     train_sources = [
         os.path.join(args.data_dir, 'replica_gs_train'),
         os.path.join(args.data_dir, '7scenes_gs_train'),
-        os.path.join(args.data_dir, 'semantic3D_train'),
-        os.path.join(args.data_dir, 'structured3D_train'),
+        os.path.join(args.data_dir, 'se3real_sim3_train'),
     ]
     valid_sources = [
         os.path.join(args.data_dir, 'replica_gs_valid'),
         os.path.join(args.data_dir, '7scenes_gs_valid'),
-        os.path.join(args.data_dir, 'semantic3D_valid'),
-        os.path.join(args.data_dir, 'structured3D_valid'),
+        os.path.join(args.data_dir, 'se3real_sim3_valid'),
     ]
 
     print('Combining TRAIN splits:')
