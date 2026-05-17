@@ -1,0 +1,3 @@
+[submodule "PlueckerNet"]
+    path = PlueckerNet
+    url = https://github.com/username/PlueckerNet.git
