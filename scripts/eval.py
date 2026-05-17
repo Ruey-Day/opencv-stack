@@ -135,7 +135,7 @@ def _print_bucket_table(bucket_data):
     w = 20
     print(f"\n  {'Overlap':<{w}} {'N':>5} {'recall_rot':>10} {'med_rot°':>9} "
           f"{'med_trans':>10} {'med_s_err':>10} {'inlier%':>8}")
-    print(f"  {'-'*{w+5+10+9+10+10+8+6}}")
+    print(f"  {'-'*(w+5+10+9+10+10+8+6)}")
     for b in buckets:
         d = bucket_data.get(b)
         if d is None or d['n'] == 0:

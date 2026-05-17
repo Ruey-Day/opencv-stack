@@ -94,6 +94,10 @@ def parse_args():
     p.add_argument('--cosine_lr',  action='store_true',
                    help='CosineAnnealingWarmRestarts instead of ExponentialLR')
 
+    # Validation RANSAC backend
+    p.add_argument('--ransac',     default='grassmannian', choices=['sim3', 'grassmannian'],
+                   help='RANSAC solver for validation metrics (default: grassmannian)')
+
     # Checkpointing
     p.add_argument('--pretrain',   default=None,
                    help='Warm-start from checkpoint (strict=False, e.g. for dustbin init)')
@@ -120,6 +124,7 @@ def main():
     configs.train_lr            = args.lr
     configs.train_epoches       = args.epochs
     configs.best_val_metric     = 'avg_inlier_ratio'
+    configs.ransac_type         = args.ransac
     configs.resume_dir          = None
     configs.normalize_n_lines   = args.n_lines
     configs.normalize_n_inliers = args.n_inliers

@@ -27,6 +27,7 @@ from lib.file import ensure_dir
 from lib.timer import AverageMeter, Timer
 from lib.loss import TotalLoss
 from sim3.ransac import run_ransac_sim3
+from sim3.ransac_grassmannian import ransac_sim3 as _ransac_g
 
 
 class Sim3Trainer:
@@ -265,10 +266,18 @@ class Sim3Trainer:
                 plucker1_topK = plucker1_raw[0, plucker1_indices[0, :k], :].cpu().numpy()
                 plucker2_topK = plucker2_raw[0, plucker2_indices[0, :k], :].cpu().numpy()
 
-                best_s, best_rot, best_trans, best_ic, best_ic_mask = run_ransac_sim3(
-                    plucker1_topK.T, plucker2_topK.T,
-                    inlier_threshold=0.1,
-                )
+                use_g = getattr(self.config, 'ransac_type', 'sim3') == 'grassmannian'
+                if use_g:
+                    best_rot, best_trans, best_s, best_ic_mask, best_ic = _ransac_g(
+                        plucker1_topK.T, plucker2_topK.T,
+                        n_iter=500, inlier_angle_rad=0.15,
+                    )
+                    best_trans = best_trans.reshape(3, 1) if best_rot is not None else None
+                else:
+                    best_s, best_rot, best_trans, best_ic, best_ic_mask = run_ransac_sim3(
+                        plucker1_topK.T, plucker2_topK.T,
+                        inlier_threshold=0.1,
+                    )
 
                 if best_rot is not None and best_trans is not None and best_s is not None:
                     err_q, err_t = self._evaluate_R_t(

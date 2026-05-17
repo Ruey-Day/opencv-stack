@@ -506,24 +506,71 @@ python scripts/eval.py --hypothesis \
 
 ## Results
 
-### Chess + Cube benchmark (4-method comparison)
+All Sim(3) models evaluated with Grassmannian RANSAC (`--ransac grassmannian`) unless noted.
+`recall_rot` = fraction of scenes with rotation error < 20°. `med_s_err` = median |log(s_est/s_gt)|.
 
-| Experiment | SE3-Net | Sim3-Net (synth) | Sim3-Net (Replica) | Pure-RANSAC |
-|---|---|---|---|---|
-| A1 Cube SE3 rot | 159.60° | 0.23° | **0.03°** | 48.78° |
-| A2 Cube Sim3 rot | 45.00° | 0.16° | **0.09°** | 4.97° |
-| B1 Chess RGBD rot | **6.65°** | 168.99° | 9.41° | 0.98° |
-| B2 Chess RGB rot | 19.02° | 12.10° | **5.75°** | 0.81° |
-| B2 Chess RGB s_err | 0.588 | 3.503 | **0.149** | 4.096 |
+### se3real_sim3_valid — 823 scenes, random Sim(3) scale (s ∈ [0.1, 10])
 
-### Cross-dataset generalization
+This is the primary Sim(3) benchmark. Scale error is only meaningful here since s ≠ 1.
+Original PlueckerNet is evaluated here too — it was trained on the same structured3D/semantic3D data, so it can find correspondences. Scale error is marked `—` because it does not estimate scale.
 
-| Model | se3real_sim3_valid | replica_gs_valid | 7scenes_gs_valid |
-|-------|-------------------|-----------------|-----------------|
-| se3real specialist | **80.59%** inlier / recall 0.996 | 2.85% ❌ | 1.17% ❌ |
-| joint model (v1, 2026-05-09) | 80.09% / recall 0.994 | **99.86%** ✅ | **99.89%** ✅ |
+| Model | RANSAC | recall_rot | med_rot° | med_trans | med_s_err | inlier% |
+|-------|--------|-----------|----------|-----------|-----------|---------|
+| Original PlueckerNet (SE3) | L2 (original) | 0.175 | 180.0° | — | — | 58.6% |
+| Original PlueckerNet (SE3) | Grassmannian | 0.877 | 8.15° | 2.04 | — | 58.6% |
+| se3real, no cosine (ep 91) | L2 | 0.247 | 85.4° | — | 0.232 | 68.4% |
+| se3real, no cosine (ep 91) | **Grassmannian** | 0.909 | 7.6° | 2.04 | 0.027 | 68.4% |
+| se3real, cosine (ep 208) | Grassmannian | 0.883 | 7.81° | 2.02 | 0.026 | 69.0% |
+| Joint, cosine (ep 297) | Grassmannian | 0.898 | 7.98° | 2.045 | 0.024 | 67.2% |
+| Joint + dustbin (ep 82) | Grassmannian | 0.875 | 7.85° | 2.037 | 0.030 | 67.5% |
 
-The joint model fully generalizes: it matches the se3real specialist on indoor SE(3) data while achieving near-perfect inlier ratio on the world-space GlueStick datasets. The se3real specialist fails completely outside its training distribution.
+> The L2 → Grassmannian jump (0.247 → 0.909 recall, 85° → 7.6° med_rot) is purely a RANSAC solver change — same network weights. The 2-line L2 solver fails on structured3D/semantic3D parallel lines (rank-1 cross-covariance → 180° degenerate rotation). Grassmannian samples 3 lines stratified by dominant axis, eliminating this.
+
+### replica_gs_valid — 400 real RGBD scenes, s ≈ 1
+
+| Model | Overlap | N | recall_rot | med_rot° | med_trans | inlier% |
+|-------|---------|---|-----------|----------|-----------|---------|
+| Original PlueckerNet (SE3) | overall | 400 | 0.005 | 135.5° | 2.25 | 0.2% ❌ |
+| se3real, no cosine (ep 91) | overall | 400 | 0.007 | 137.0° | 2.14 | 0.2% ❌ |
+| se3real, no cosine (ep 91) | no overlap | 39 | 0.000 | 180.0° | — | 0.0% ❌ |
+| se3real, no cosine (ep 91) | sparse (~30%) | 142 | 0.007 | 132.2° | 2.00 | 0.0% ❌ |
+| se3real, no cosine (ep 91) | dense (~70%) | 219 | 0.009 | 131.2° | 2.24 | 0.4% ❌ |
+| se3real, cosine (ep 208) | overall | 400 | 0.007 | 135.7° | 2.20 | 0.2% ❌ |
+| se3real, cosine (ep 208) | no overlap | 39 | 0.000 | 180.0° | — | 0.0% ❌ |
+| se3real, cosine (ep 208) | sparse (~30%) | 142 | 0.007 | 130.1° | 2.17 | 0.0% ❌ |
+| se3real, cosine (ep 208) | dense (~70%) | 219 | 0.009 | 130.6° | 2.20 | 0.4% ❌ |
+| Joint, cosine (ep 297) | overall | 400 | 0.682 | 0.01° | 0.000 | 79.7% |
+| Joint, cosine (ep 297) | no overlap | 39 | 0.000 | 180.0° | — | 0.0% |
+| Joint, cosine (ep 297) | sparse (~30%) | 142 | 0.690 | 0.01° | 0.000 | 70.2% |
+| Joint, cosine (ep 297) | dense (~70%) | 219 | 0.799 | 0.01° | 0.000 | 100.0% |
+| Joint + dustbin (ep 82) | overall | 400 | 0.720 | 0.01° | 0.000 | 79.5% |
+| Joint + dustbin (ep 82) | no overlap | 39 | 0.000 | 180.0° | — | 0.0% |
+| Joint + dustbin (ep 82) | sparse (~30%) | 142 | 0.676 | 0.01° | 0.000 | 69.8% |
+| Joint + dustbin (ep 82) | dense (~70%) | 219 | 0.877 | 0.00° | 0.000 | 99.9% |
+
+### 7scenes_gs_valid — 300 real RGBD scenes, s ≈ 1
+
+| Model | Overlap | N | recall_rot | med_rot° | med_trans | inlier% |
+|-------|---------|---|-----------|----------|-----------|---------|
+| Original PlueckerNet (SE3) | overall | 300 | 0.007 | 141.0° | 2.18 | 0.0% ❌ |
+| se3real, no cosine (ep 91) | overall | 300 | 0.000 | 139.9° | — | 0.1% ❌ |
+| se3real, no cosine (ep 91) | no overlap | 37 | 0.000 | 180.0° | — | 0.0% ❌ |
+| se3real, no cosine (ep 91) | sparse (~30%) | 114 | 0.000 | 131.5° | 2.14 | 0.0% ❌ |
+| se3real, no cosine (ep 91) | dense (~70%) | 149 | 0.000 | 134.7° | 2.17 | 0.1% ❌ |
+| se3real, cosine (ep 208) | overall | 300 | 0.003 | 144.6° | 2.04 | 0.1% ❌ |
+| se3real, cosine (ep 208) | no overlap | 37 | 0.000 | 180.0° | — | 0.0% ❌ |
+| se3real, cosine (ep 208) | sparse (~30%) | 114 | 0.000 | 127.4° | 1.93 | 0.0% ❌ |
+| se3real, cosine (ep 208) | dense (~70%) | 149 | 0.007 | 142.8° | 2.11 | 0.1% ❌ |
+| Joint, cosine (ep 297) | overall | 300 | 0.647 | 0.01° | 0.000 | 76.0% |
+| Joint, cosine (ep 297) | no overlap | 37 | 0.000 | 180.0° | — | 0.0% |
+| Joint, cosine (ep 297) | sparse (~30%) | 114 | 0.728 | 0.01° | 0.000 | 69.3% |
+| Joint, cosine (ep 297) | dense (~70%) | 149 | 0.745 | 0.01° | 0.000 | 100.0% |
+| Joint + dustbin (ep 82) | overall | 300 | 0.657 | 0.01° | 0.000 | 75.7% |
+| Joint + dustbin (ep 82) | no overlap | 37 | 0.000 | 180.0° | — | 0.0% |
+| Joint + dustbin (ep 82) | sparse (~30%) | 114 | 0.702 | 0.01° | 0.000 | 68.6% |
+| Joint + dustbin (ep 82) | dense (~70%) | 149 | 0.785 | 0.01° | 0.000 | 100.0% |
+
+> Both the original PlueckerNet and the se3real specialist fail completely on replica_gs and 7scenes_gs — same ~135–141° rotation and <0.2% inlier ratio regardless of overlap level. Both were trained exclusively on structured3D/semantic3D data and do not generalize to GlueStick world-space line parameterization. Only the joint model (trained on all three domains) is expected to fill these rows.
 
 ---
 
