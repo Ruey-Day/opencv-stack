@@ -237,13 +237,15 @@ def solve_translation_fixed_scale(
 def ransac_sim3(
     L1: np.ndarray,
     L2: np.ndarray,
-    n_iter: int = 1000,
-    inlier_angle_rad: float = 0.15,    # ≈ 8.6°
+    n_iter: int = 2000,
+    inlier_angle_rad: float = 0.10,    # ≈ 5.7°
     min_inliers: int = 6,
     min_sample: int = 3,
     seed: int = 42,
     s_prior: float = -1.0,
     lambda_s: float = 5.0,
+    early_exit_iters: int = 50,
+    lo_iters: int = 4,
 ) -> tuple:
     """
     RANSAC SIM(3) solver using Grassmannian distance as the inlier metric.
@@ -256,16 +258,23 @@ def ransac_sim3(
       4. Keep the hypothesis with the most inliers.
       5. Re-estimate the SIM(3) on all inliers (final refinement).
 
+    Early exit: if after ``early_exit_iters`` iterations the best inlier count
+    is still zero, the correspondences are almost certainly all wrong (no-overlap
+    scene) and the remaining iterations would be wasted.  Returns failure immediately.
+
     Args:
         L1:  (6, N)  Plücker coords of source lines  (SLAM, arb. scale)
         L2:  (6, N)  Plücker coords of target lines  (DA3, metric)
         n_iter: RANSAC iterations
-        inlier_angle_rad: Grassmannian distance threshold (radians)
+        inlier_angle_rad: Grassmannian distance threshold (radians, default 0.10 ≈ 5.7°)
         min_inliers: minimum inliers to declare a valid hypothesis
         min_sample:  minimal sample size (≥ 3 for numerical stability)
         seed: RNG seed for reproducibility
         s_prior: if > 0, regularise scale toward this value (use rough estimate)
         lambda_s: strength of scale regularisation
+        early_exit_iters: abort after this many iterations if best_ic is still 0
+        lo_iters: local-optimization passes — each pass re-fits (R, s, t) on the
+            current inlier set and expands inliers; stops early if count stops growing
 
     Returns:
         R_best: (3, 3),  t_best: (3,),  s_best: float,
@@ -312,7 +321,9 @@ def ransac_sim3(
             best_R, best_t, best_s = R_seed, t_seed, s_prior
 
     # ── RANSAC iterations ─────────────────────────────────────────────────
-    for _ in range(n_iter):
+    for it in range(n_iter):
+        if it == early_exit_iters and best_ic == 0:
+            break
         # Stratified sampling: pick at least one line from each direction bin
         # to prevent degenerate all-parallel minimal samples.
         if len(bins) >= min_sample:
@@ -350,27 +361,29 @@ def ransac_sim3(
             best_t    = t_cand
             best_s    = s_cand
 
-    # ── Final refinement on all inliers ───────────────────────────────────
+    # ── Local optimization: iteratively re-fit on expanding inlier set ────
     if best_ic >= min_inliers:
-        try:
-            R_ref  = solve_rotation(L1[3:, best_mask], L2[3:, best_mask])
-            # Refine scale from moment-magnitude median (robust to translation)
-            s_ref  = float(np.median(
-                np.linalg.norm(L2[:3, best_mask], axis=0) /
-                (np.linalg.norm((R_ref @ L1[3:, best_mask]) * 0 +
-                                R_ref @ L1[:3, best_mask], axis=0) + 1e-12)
-            ))
-            if s_ref <= 0 or not np.isfinite(s_ref):
-                s_ref = best_s
-            t_ref  = solve_translation_fixed_scale(
-                L1[:, best_mask], L2[:, best_mask], R_ref, s_ref
-            )
-            mask_ref, ic_ref, _ = _evaluate(R_ref, t_ref, s_ref)
-            if ic_ref >= best_ic:
-                best_R, best_t, best_s = R_ref, t_ref, s_ref
-                best_mask, best_ic = mask_ref, ic_ref
-        except (np.linalg.LinAlgError, ValueError):
-            pass
+        for _ in range(lo_iters):
+            try:
+                R_ref = solve_rotation(L1[3:, best_mask], L2[3:, best_mask])
+                # Robust scale from median of per-line moment-magnitude ratios.
+                s_ref = float(np.median(
+                    np.linalg.norm(L2[:3, best_mask], axis=0) /
+                    (np.linalg.norm(R_ref @ L1[:3, best_mask], axis=0) + 1e-12)
+                ))
+                if s_ref <= 0 or not np.isfinite(s_ref):
+                    s_ref = best_s
+                t_ref = solve_translation_fixed_scale(
+                    L1[:, best_mask], L2[:, best_mask], R_ref, s_ref
+                )
+                mask_ref, ic_ref, _ = _evaluate(R_ref, t_ref, s_ref)
+                if ic_ref >= best_ic:
+                    best_R, best_t, best_s = R_ref, t_ref, s_ref
+                    best_mask, best_ic = mask_ref, ic_ref
+                else:
+                    break  # inlier set stopped growing — converged
+            except (np.linalg.LinAlgError, ValueError):
+                break
 
     return best_R, best_t, best_s, best_mask, best_ic
 

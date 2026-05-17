@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
 """
-generate_replica_gs_dataset.py
-
 Builds 9D Plücker+LAB training pairs from Replica RGBD using GlueStick
 world-space line detection.  Each pair includes a sampled overlap ratio
 (0–100%) and scale drawn from (0.1, 10.0) — see scripts/_pair_gen.py.

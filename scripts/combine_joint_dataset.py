@@ -21,7 +21,21 @@ def load_split(split_dir):
     print(f'  Loaded {n:,} scenes from {split_dir}  ({ch}D)')
     return data, n
 
-def combine_and_save(source_dirs, out_dir, seed=42):
+def filter_scenes(data, min_scale=0.1, min_inliers=5):
+    """Remove degenerate scenes: near-zero scale or too few ground-truth inliers."""
+    n_before = len(data['plucker1'])
+    keep = []
+    for i in range(n_before):
+        s = float(data['s_gt'][i])
+        n_inliers = data['matches'][i].shape[1]
+        if s >= min_scale and n_inliers >= min_inliers:
+            keep.append(i)
+    n_after = len(keep)
+    print(f'  Filtered {n_before - n_after} degenerate scenes '
+          f'(scale < {min_scale} or inliers < {min_inliers}) → {n_after} remain')
+    return {k: [data[k][i] for i in keep] for k in KEYS}, n_after
+
+def combine_and_save(source_dirs, out_dir, seed=42, min_scale=0.1, min_inliers=5):
     os.makedirs(out_dir, exist_ok=True)
     combined = {k: [] for k in KEYS}
     total    = 0
@@ -31,6 +45,7 @@ def combine_and_save(source_dirs, out_dir, seed=42):
             print(f'  [SKIP] {sd} — not found yet')
             continue
         data, n = load_split(sd)
+        data, n = filter_scenes(data, min_scale=min_scale, min_inliers=min_inliers)
         for k in KEYS:
             combined[k].extend(data[k])
         total += n
@@ -54,9 +69,13 @@ def combine_and_save(source_dirs, out_dir, seed=42):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', default='./dataset')
-    p.add_argument('--out_dir',  default='./dataset')
-    p.add_argument('--seed',     type=int, default=42)
+    p.add_argument('--data_dir',    default='./dataset')
+    p.add_argument('--out_dir',     default='./dataset')
+    p.add_argument('--seed',        type=int,   default=42)
+    p.add_argument('--min_scale',   type=float, default=0.1,
+                   help='Drop scenes with GT scale below this value (default: 0.1)')
+    p.add_argument('--min_inliers', type=int,   default=5,
+                   help='Drop scenes with fewer GT inliers than this (default: 5)')
     args = p.parse_args()
 
     train_sources = [
@@ -71,10 +90,12 @@ def main():
     ]
 
     print('Combining TRAIN splits:')
-    n_train = combine_and_save(train_sources, os.path.join(args.out_dir, 'joint_train'), args.seed)
+    n_train = combine_and_save(train_sources, os.path.join(args.out_dir, 'joint_train'),
+                               args.seed, args.min_scale, args.min_inliers)
 
     print('\nCombining VALID splits:')
-    n_valid = combine_and_save(valid_sources, os.path.join(args.out_dir, 'joint_valid'), args.seed + 1)
+    n_valid = combine_and_save(valid_sources, os.path.join(args.out_dir, 'joint_valid'),
+                               args.seed + 1, args.min_scale, args.min_inliers)
 
     print(f'\nDone — {n_train:,} train / {n_valid:,} valid scenes.')
 

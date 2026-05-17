@@ -639,6 +639,21 @@ Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
       </table>
     </div>
     <p class="note">Both the original PlueckerNet and the se3real specialist fail completely on replica_gs and 7scenes_gs — same ~135–141° rotation and &lt;0.2% inlier ratio regardless of overlap level. Both were trained exclusively on structured3D/semantic3D data and do not generalize to GlueStick world-space line parameterization. Only the joint model (trained on all three domains) generalizes.</p>
+
+    <h3>joint checkpoint (2026-05-17) — cross-dataset, Grassmannian RANSAC</h3>
+    <p>This is the latest joint model evaluated with Grassmannian RANSAC. The switch from the default L2 solver eliminates the 180° degeneracies on semantic3D/structured3D and keeps strong performance on the RGBD benchmarks.</p>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Dataset</th><th>recall_rot ↑</th><th>med_rot° ↓</th><th>med_trans ↓</th><th>med_s_err ↓</th><th>inlier%</th></tr></thead>
+        <tbody>
+          <tr><td>semantic3D</td><td class="best">0.785</td><td class="best">11.44°</td><td>1.980</td><td class="best">0.035</td><td>43.0%</td></tr>
+          <tr><td>structured3D</td><td class="best">0.914</td><td class="best">8.53°</td><td>1.947</td><td class="best">0.022</td><td>78.3%</td></tr>
+          <tr><td>replica_gs</td><td>0.735</td><td>0.01°</td><td class="best">0.000</td><td class="best">0.000</td><td>79.6%</td></tr>
+          <tr><td>7scenes_gs</td><td>0.737</td><td>0.01°</td><td class="best">0.000</td><td class="best">0.000</td><td>75.9%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Checkpoint: <span class="eq">output/joint/2026-05-17/best_val_checkpoint.pth</span>. The semantic3D and structured3D rows are the key improvement over the earlier L2 evaluation, where the same weights frequently collapsed to 180° / Infinity.</p>
 </section>
 
 <section id="extensions">

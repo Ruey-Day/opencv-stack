@@ -14,7 +14,7 @@ def _trim():
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR    = os.path.dirname(SCRIPT_DIR)
-GLUESTICK   = '/home/rueyday/GlueStick'
+GLUESTICK   = '../GlueStick'
 SEVEN_ROOT  = '/mnt/crucial/rueyday/data/7scenes'
 
 FX, FY = 585.0, 585.0
@@ -24,7 +24,6 @@ DEPTH_MAX   = 4.5
 
 TRAIN_SCENES = ['chess', 'fire', 'heads', 'office', 'pumpkin', 'redkitchen', 'stairs']
 VALID_SCENES = ['chess']   # chess seq-06 (last seq) held out for validation
-
 
 def _load_seqs(scene_dir):
     return sorted(glob.glob(os.path.join(scene_dir, 'seq-*')))
@@ -126,9 +125,6 @@ def _worker(scene_name, seven_root, out_dir, n_per_scene,
         pickle.dump(pairs, f, protocol=4)
     print(f'    [{scene_name}] saved {n_ok} pairs → {out_file}', flush=True)
 
-
-# ── Orchestrator ───────────────────────────────────────────────────────────────
-
 def generate_split(scene_names, seven_root, out_dir, n_per_scene,
                    every_n, max_lines, seed, val_mode=False):
     os.makedirs(out_dir, exist_ok=True)
@@ -193,9 +189,6 @@ def generate_split(scene_names, seven_root, out_dir, n_per_scene,
     print(f'  → {out_dir}  ({total:,} pairs)', flush=True)
     return total
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--seven_root',        default=SEVEN_ROOT)
@@ -236,7 +229,6 @@ def main():
                    args.seed + 99999, val_mode=True)
 
     print('\nAll done.')
-
 
 if __name__ == '__main__':
     main()

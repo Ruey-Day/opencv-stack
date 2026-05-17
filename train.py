@@ -97,6 +97,9 @@ def parse_args():
     # Validation RANSAC backend
     p.add_argument('--ransac',     default='grassmannian', choices=['sim3', 'grassmannian'],
                    help='RANSAC solver for validation metrics (default: grassmannian)')
+    p.add_argument('--metric',     default='recall_rot',
+                   choices=['recall_rot', 'avg_inlier_ratio'],
+                   help='Metric used to pick the best checkpoint (default: recall_rot)')
 
     # Checkpointing
     p.add_argument('--pretrain',   default=None,
@@ -123,7 +126,7 @@ def main():
     configs.train_batch_size    = args.batch
     configs.train_lr            = args.lr
     configs.train_epoches       = args.epochs
-    configs.best_val_metric     = 'avg_inlier_ratio'
+    configs.best_val_metric     = args.metric
     configs.ransac_type         = args.ransac
     configs.resume_dir          = None
     configs.normalize_n_lines   = args.n_lines
@@ -145,6 +148,8 @@ def main():
     logging.info(f'  in_channel : {args.in_channel}')
     logging.info(f'  dustbin    : {args.dustbin}')
     logging.info(f'  cosine_lr  : {args.cosine_lr}')
+    logging.info(f'  ransac     : {args.ransac}')
+    logging.info(f'  metric     : {args.metric}')
 
     train_loader = DataLoader(
         Sim3PluckerData(phase='train', config=configs),

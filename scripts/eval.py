@@ -119,7 +119,7 @@ def cross_dataset_eval(weights_path, datasets, data_dir, out_dir, label=None, ra
     if ransac == 'grassmannian':
         from sim3.ransac_grassmannian import ransac_sim3 as _ransac_g
         def _run_ransac(p1k, p2k):
-            R, t, s, mask, ic = _ransac_g(p1k, p2k, n_iter=500, inlier_angle_rad=0.15)
+            R, t, s, mask, ic = _ransac_g(p1k, p2k, n_iter=1000, inlier_angle_rad=0.10)
             return s, R, t, ic, mask
         print(f"  RANSAC: Grassmannian")
     else:

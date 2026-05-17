@@ -270,7 +270,7 @@ class Sim3Trainer:
                 if use_g:
                     best_rot, best_trans, best_s, best_ic_mask, best_ic = _ransac_g(
                         plucker1_topK.T, plucker2_topK.T,
-                        n_iter=500, inlier_angle_rad=0.15,
+                        n_iter=750, inlier_angle_rad=0.10,
                     )
                     best_trans = best_trans.reshape(3, 1) if best_rot is not None else None
                 else:

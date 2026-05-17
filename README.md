@@ -128,6 +128,8 @@ python train.py --dataset joint --name run_a
 | `--in_channel` | 6 | `6` = geometry only, `9` = Plücker + LAB color |
 | `--dustbin` | off | Learnable dustbin token (SuperGlue-style) |
 | `--cosine_lr` | off | CosineAnnealingWarmRestarts instead of ExponentialLR |
+| `--ransac` | `grassmannian` | Validation RANSAC backend: `sim3` \| `grassmannian` |
+| `--metric` | `recall_rot` | Checkpoint criterion: `recall_rot` \| `avg_inlier_ratio` |
 | `--pretrain` | — | Warm-start from checkpoint (`strict=False`) |
 | `--resume` | — | Resume from checkpoint |
 | `--name` | today's date | Prevents checkpoint clashes when running multiple jobs |
@@ -165,4 +167,50 @@ Results saved to `results/eval_cross_dataset/<label>.json`.
 --ransac               sim3 | grassmannian                      [default: sim3]
 --out_dir              Output directory for JSON                [default: results/eval_cross_dataset]
 --label                Human-readable run label
+```
+
+---
+
+## Training Run History
+
+### 2026-05-12 — Joint 6D v1 (data leakage, do not use)
+- Dataset: `joint_train` (35,658 scenes = Replica GS + 7-Scenes GS + TUM RGB-D GS + se3real)
+- **TUM RGB-D data leaked validation scenes into training.** Inflated metrics.
+- Apparent best: recall_rot=0.999, avg_inlier_ratio=92.1% — not trustworthy.
+- Checkpoint archived at `output/joint/2026-05-12/` but should not be used for evaluation.
+
+### 2026-05-14 — Joint 6D v2 (clean baseline, current best)
+- Dataset: `joint_train` (27,658 scenes) — TUM RGB-D removed to fix leakage.
+- `ExponentialLR`, `avg_inlier_ratio` checkpoint criterion, standard Sim(3) RANSAC for validation.
+- Best checkpoint: `output/joint/2026-05-14/best_val_checkpoint.pth` (epoch 297)
+- recall_rot=0.481, avg_inlier_ratio=72.246% on `joint_valid` (1,523 scenes)
+
+### 2026-05-17 — Dataset cleaning + training improvements
+Three changes applied before the next training run:
+
+**1. Degenerate scene filter** (`scripts/combine_joint_dataset.py`)
+- Removed scenes with GT scale < 0.1 (near-zero scale makes Sim(3) moment equations degenerate)
+  and scenes with fewer than 5 GT inliers (too few correspondences for reliable RANSAC).
+- Filtered 2,659 / 27,658 training scenes → **24,999 train scenes**
+- Filtered 76 / 1,523 validation scenes → **1,447 valid scenes**
+- The 76 zero-scale validation scenes were definitionally unsolvable and held recall_rot below its true ceiling.
+
+**2. Checkpoint criterion → `recall_rot`** (`train.py --metric recall_rot`)
+- Previously saving on `avg_inlier_ratio` (the correspondence loss target).
+- Now saving the epoch where Grassmannian RANSAC succeeds most often, which is the actual goal.
+- Loss function unchanged; only the model-selection criterion differs.
+
+**3. Grassmannian RANSAC for validation** (`train.py --ransac grassmannian`)
+- Previous runs used the standard L2 Sim(3) RANSAC (`sim3/ransac.py`) for validation metrics.
+- Now using `sim3/ransac_grassmannian.py`: principal-angle inlier test on G(1,5), stratified
+  direction-bin sampling to avoid degenerate all-parallel minimal sets, Tikhonov scale regularisation.
+- The `--ransac grassmannian` flag is now the default in `train.py`.
+
+**Resume command (from 2026-05-14 checkpoint with cosine LR):**
+```bash
+nohup bash -c "source ~/miniconda3/etc/profile.d/conda.sh && conda activate torch5090 && \
+  cd /home/rueyday/scale-aware-PlueckerNet && \
+  python train.py --dataset joint --cosine_lr --metric recall_rot --ransac grassmannian \
+    --pretrain output/joint/2026-05-14/best_val_checkpoint.pth \
+    --name 2026-05-17" >> output/train_joint_v3.log 2>&1 &
 ```
