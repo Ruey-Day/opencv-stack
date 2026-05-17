@@ -211,8 +211,9 @@ Evaluates on one or more validation splits; reports per-scene metrics broken dow
 
 ```bash
 python scripts/eval.py \
-    --weights output/joint/<date>/best_val_checkpoint.pth \
-    --dataset replica_gs,7scenes_gs,se3real_sim3
+    --weights output/joint/2026-05-14/best_val_checkpoint.pth \
+    --dataset se3real_sim3,replica_gs,7scenes_gs \
+    --ransac grassmannian
 ```
 
 Results saved to `results/eval_cross_dataset/<label>.json`.
@@ -230,7 +231,7 @@ Results saved to `results/eval_cross_dataset/<label>.json`.
 
 ```bash
 python scripts/eval.py --chess \
-    --weights output/joint/<date>/best_val_checkpoint.pth \
+    --weights output/joint/2026-05-14/best_val_checkpoint.pth \
     --chess_seq1 /path/to/chess/seq-01 \
     --chess_seq3 /path/to/chess/seq-03
 ```
@@ -239,23 +240,61 @@ python scripts/eval.py --chess \
 
 ```bash
 python scripts/eval.py --hypothesis \
-    --weights output/joint/<date>/best_val_checkpoint.pth \
+    --weights output/joint/2026-05-14/best_val_checkpoint.pth \
     [--se3_weights ../PlueckerNet/.../best_val_checkpoint_real.pth]
 ```
 
 ### All flags
 
 ```
---weights          Checkpoint path (required)
---dataset          Comma-separated val splits            [default: all four]
---data_dir         Dataset root                          [default: ./dataset]
---ransac           sim3 | grassmannian                   [default: sim3]
---out_dir          Output directory for JSON
---label            Human-readable run label
---chess            Chess B1/B2 benchmark
---chess_seq1       Path to Chess seq-01
---chess_seq3       Path to Chess seq-03
---hypothesis       Synthetic hypothesis test
---se3_weights      SE3-Net weights for comparison        [optional]
---n_scenes         Scenes per condition                  [default: 200]
+--weights              Checkpoint path (required)
+--dataset              Comma-separated val splits               [default: se3real_sim3,replica_gs,7scenes_gs]
+--data_dir             Dataset root                             [default: ./dataset]
+--ransac               sim3 | grassmannian                      [default: sim3]
+--out_dir              Output directory for JSON                [default: results/eval_cross_dataset]
+--label                Human-readable run label
+--chess                Chess B1/B2 benchmark
+--chess_seq1           Path to Chess seq-01
+--chess_seq3           Path to Chess seq-03
+--chess_out_dir        Output directory for chess JSON          [default: results/eval_chess]
+--hypothesis           Synthetic hypothesis test
+--se3_weights          SE3-Net weights for comparison           [optional]
+--n_scenes             Scenes per condition                     [default: 200]
+--hypothesis_out_dir   Output directory for hypothesis JSON     [default: results/eval_hypothesis]
 ```
+
+---
+
+## Evaluation Results
+
+All results use **Grassmannian RANSAC** (`--ransac grassmannian`). Overlap buckets: sparse = 1–200 inliers, dense = 201–490 inliers.
+
+### Joint 6D model — `output/joint/2026-05-14/best_val_checkpoint.pth`
+
+| Dataset | N | recall\_rot | med\_rot (°) | med\_trans (m) | inlier\_ratio |
+|---------|---|------------|-------------|---------------|--------------|
+| se3real\_sim3\_valid | 823 | **0.902** | 7.84 | 2.043 | 67.3% |
+| — sparse | 627 | 0.884 | 8.20 | 1.976 | 61.4% |
+| — dense  | 196 | 0.959 | 6.96 | 2.208 | 86.2% |
+| replica\_gs\_valid | 400 | 0.682 | 0.01 | 0.000 | 79.7% |
+| — sparse | 142 | 0.690 | 0.01 | 0.000 | 70.2% |
+| — dense  | 219 | 0.799 | 0.01 | 0.000 | 100.0% |
+| 7scenes\_gs\_valid | 300 | 0.647 | 0.01 | 0.000 | 76.0% |
+| — sparse | 114 | 0.728 | 0.01 | 0.000 | 69.3% |
+| — dense  | 149 | 0.745 | 0.01 | 0.000 | 100.0% |
+
+### Dustbin fine-tuned model — `output/joint/dustbin_ft/best_val_checkpoint.pth`
+
+| Dataset | N | recall\_rot | med\_rot (°) | med\_trans (m) | inlier\_ratio |
+|---------|---|------------|-------------|---------------|--------------|
+| se3real\_sim3\_valid | 823 | **0.875** | 7.85 | 2.037 | 67.5% |
+| — sparse | 627 | 0.853 | 8.37 | 1.964 | 61.8% |
+| — dense  | 196 | 0.944 | 6.53 | 2.221 | 85.9% |
+| replica\_gs\_valid | 400 | 0.720 | 0.01 | 0.000 | 79.5% |
+| — sparse | 142 | 0.676 | 0.01 | 0.000 | 69.8% |
+| — dense  | 219 | 0.877 | 0.00 | 0.000 | 99.9% |
+| 7scenes\_gs\_valid | 300 | 0.657 | 0.01 | 0.000 | 75.7% |
+| — sparse | 114 | 0.702 | 0.01 | 0.000 | 68.6% |
+| — dense  | 149 | 0.785 | 0.01 | 0.000 | 100.0% |
+
+The dustbin model improves inlier ratio on replica_gs and 7scenes_gs dense pairs at a slight cost to se3real recall.

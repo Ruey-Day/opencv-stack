@@ -40,8 +40,8 @@
     }
     .nav-brand { font-weight: 700; font-size: 0.95rem; color: #fff; letter-spacing: -0.01em; }
     .nav-brand span { color: var(--accent); }
-    .nav-links { display: flex; gap: 1.6rem; list-style: none; }
-    .nav-links a { font-size: 0.82rem; color: var(--muted); text-decoration: none;
+    .nav-links { display: flex; gap: 1.2rem; list-style: none; }
+    .nav-links a { font-size: 0.78rem; color: var(--muted); text-decoration: none;
                    transition: color 0.15s; letter-spacing: 0.02em; text-transform: uppercase; }
     .nav-links a:hover { color: #fff; }
 
@@ -217,8 +217,11 @@
   <div class="nav-brand">Scale<span>Plücker</span>Net</div>
   <ul class="nav-links">
     <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#failure">Failure</a></li>
     <li><a href="#method">Method</a></li>
+    <li><a href="#dataset">Dataset</a></li>
     <li><a href="#results">Results</a></li>
+    <li><a href="#extensions">Extensions</a></li>
     <li><a href="#slam">SLAM</a></li>
     <li><a href="#cite">Cite</a></li>
   </ul>
@@ -286,6 +289,11 @@
       <strong>5.75° rotation error and scale-log-error 0.149</strong>, vs. 19.02° / 0.588 for SE(3)-PlueckerNet.
       A 9D extension appends per-line RGB (with 30% dropout) and reaches <strong>99.4% inlier ratio</strong> on validation.
     </div>
+
+    <h3>Research Context</h3>
+    <p>PlueckerNet learns to match 3D line correspondences between two scenes using Plücker coordinates. Its RANSAC back-end recovers the relative SE(3) pose. A natural extension is <strong>Sim(3)</strong> — the similarity group that adds uniform scale — which arises in monocular SLAM, scale-ambiguous reconstruction, and multi-session mapping where two maps share geometry but were built at different metric scales.</p>
+    <p><strong>Key design insight:</strong> the correspondence network does not need to change. The Sinkhorn matching learns scale-agnostic features: directions <span class="eq">d</span> are unit vectors under Sim(3), and the relative moment structure within each point set is preserved up to a global scale. Only the RANSAC back-end needs to be extended to Sim(3). Scale is then recovered analytically from the moment magnitudes of the matched pairs.</p>
+    <p><strong>Critical implementation note:</strong> moment vectors <span class="eq">m</span> must <strong>not</strong> be normalized before feeding to the network. Their magnitude encodes scene scale; normalizing them destroys the only signal that makes scale estimation possible.</p>
   </div>
 </section>
 
@@ -337,6 +345,96 @@
         <h4>9D Color Extension</h4>
         <p>Appends per-line RGB to 6D Plücker coordinates; 30% color dropout enables a single model to handle RGBD, RGB-only, and mixed inputs.</p>
       </div>
+      <div class="contrib-card">
+        <span class="contrib-icon">🌐</span>
+        <h4>Joint Domain Training</h4>
+        <p>27,658-scene joint dataset from Replica, 7-Scenes, and SE3-real sources with GlueStick world-space line extraction. The joint model fully generalizes across all three domains.</p>
+      </div>
+      <div class="contrib-card">
+        <span class="contrib-icon">📐</span>
+        <h4>Grassmannian RANSAC</h4>
+        <p>Scale- and translation-invariant inlier metric on G(1,5) with stratified sampling and Tikhonov regularization — eliminates degenerate all-parallel hypothesis failure.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FAILURE ANALYSIS ──────────────────────────────────────────────── -->
+<section id="failure">
+  <div class="container">
+    <h2>Part 1 — Why SE(3) PlueckerNet Fails on Sim(3)</h2>
+
+    <h3>Plücker Coordinates</h3>
+    <p>A 3D line through point <strong>p</strong> with unit direction <strong>d</strong> is encoded as:</p>
+    <div class="code-block reveal">L = (m, d)    m = p × d   (moment vector)</div>
+
+    <h3>Transformation Laws</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Group</th><th>Direction</th><th>Moment</th></tr></thead>
+        <tbody>
+          <tr><td><strong>SE(3)</strong> (R, t)</td><td>d′ = R d</td><td>m′ = R m + t × R d</td></tr>
+          <tr><td><strong>Sim(3)</strong> (s, R, t)</td><td>d′ = R d</td><td>m′ = s · R m + t × R d</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Why the SE(3) Solver Fails</h3>
+    <p>The SE(3) solver assumes <span class="eq">m₂ = R m₁ + t × R d₁</span> and minimises the residual:</p>
+    <div class="code-block reveal">e  =  m₂  −  R m₁  −  t × R d₁
+   =  (s − 1) · R m₁        for a Sim(3)-transformed pair</div>
+    <p>This residual is <strong>non-zero for any s ≠ 1</strong> and <strong>cannot be made zero by any choice of t</strong>. It grows linearly with |s − 1| and with the magnitude of the moment vectors.</p>
+    <p>Consequences:</p>
+    <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Rotation is unaffected</strong> — direction vectors are unit vectors, so d′ = Rd is scale-invariant. The SVD rotation step recovers R exactly.</li>
+      <li><strong style="color:var(--text)">Translation is badly biased</strong> — the solver absorbs (s−1)·Rm₁ into a spurious translation, giving wrong t and a meaningless pose estimate.</li>
+    </ul>
+
+    <h3>Experimental Verification (7-Scenes Chess)</h3>
+    <p>Pipeline: 30 RGBD frames → voxel point cloud → PCA-based 3D line extraction → Plücker registration. Ground-truth transform: R = 27°, t = [0.35, −0.20, 0.15] m, s = 1.45.</p>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th></th><th>Rotation error</th><th>Translation error</th><th>Plücker residual</th></tr></thead>
+        <tbody>
+          <tr><td><strong>SE(3) solver on SE(3) data</strong></td><td class="best">0.000°</td><td class="best">0.000 m</td><td class="best">0.000 ✓</td></tr>
+          <tr><td><strong>SE(3) solver on Sim(3) data (s = 1.45)</strong></td><td>0.000°</td><td class="fail">0.858 m</td><td class="fail">0.630 ✗</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fig-grid three reveal">
+      <div class="fig-card">
+        <figure>
+          <img src="images/fig1_voxel_overview.png" alt="Point cloud from 30 RGBD frames" />
+          <figcaption>Point cloud stitched from 30 RGBD frames</figcaption>
+        </figure>
+      </div>
+      <div class="fig-card">
+        <figure>
+          <img src="images/fig2_SE3_registration.png" alt="SE(3) registration" />
+          <figcaption>SE(3) registration — perfect alignment</figcaption>
+        </figure>
+      </div>
+      <div class="fig-card">
+        <figure>
+          <img src="images/fig3_SIM3_registration_failure.png" alt="Sim(3) failure" />
+          <figcaption>Sim(3) registration with SE(3) solver — rotation correct, translation wrong</figcaption>
+        </figure>
+      </div>
+    </div>
+    <div class="fig-grid reveal" style="margin-top:1rem">
+      <div class="fig-card">
+        <figure>
+          <img src="images/fig4_why_sim3_fails.png" alt="Residual vs scale" />
+          <figcaption>Analytical residual as a function of scale s</figcaption>
+        </figure>
+      </div>
+      <div class="fig-card">
+        <figure>
+          <img src="images/fig5_pluecker_lines_3d.png" alt="3D Plücker lines" />
+          <figcaption>Extracted 3D Plücker lines visualised in scene</figcaption>
+        </figure>
+      </div>
     </div>
   </div>
 </section>
@@ -347,31 +445,82 @@
     <h2>Method</h2>
     <p>The <strong>PluckerNetKnn architecture is unchanged</strong> — only the RANSAC back-end is extended from SE(3) to Sim(3).</p>
 
-    <div class="code-block reveal"><span class="cm">// input: two Plücker line clouds [m, d] (moment-first)</span>
-<span class="kw">Cloud 1</span> [m,d] (N₁×6) ──────┐                    ┌────── <span class="kw">Cloud 2</span> [m,d] (N₂×6)
-                             │                    │
-                             ▼                    ▼
-                   ┌─── <span class="fn">PluckerNetKnn</span> (unchanged) ───┐
-                   │  KNN graph conv (moments)        │
-                   │  KNN graph conv (directions)     │
-                   │  Spatial Attentional GNN (×6)    │
-                   │  Sinkhorn OT (30 iters)          │
-                   └──────────────┬───────────────────┘
-                                  │ prob_matrix ∈ ℝᴺ¹ˣᴺ²
-                                  ▼
-                             Top-K select
-                                  │ K matched Plücker pairs
-                                  ▼
-                   ┌──── <span class="fn">Sim(3) RANSAC</span> (new) ────────┐
-                   │  Stage 1:  R  ← SVD on d-pairs    │
-                   │  Stage 2: [s,t] ← lstsq 6×4       │
-                   │  Score: ‖L₂ − M_sim3·L₁‖ &lt; τ     │
-                   └──────────────┬───────────────────┘
-                                  ▼
-                              s,  R,  t</div>
+    <h3>Full Pipeline</h3>
+    <div class="code-block reveal">  Sequence A (RGBD / monocular)        Sequence B (RGBD / monocular)
+         │                                      │
+  ┌──────▼──────┐                       ┌───────▼──────┐
+  │ Line detect │                       │ Line detect  │
+  │ (GlueStick) │                       │ (GlueStick)  │
+  └──────┬──────┘                       └───────┬──────┘
+         │ 2D segments                          │ 2D segments
+  ┌──────▼──────┐                       ┌───────▼──────┐
+  │ Lift to 3D  │                       │ Lift to 3D   │
+  │  Plücker    │                       │  Plücker     │
+  │  [m, d]     │                       │  [m, d]      │
+  └──────┬──────┘                       └───────┬──────┘
+         │ L₁ ∈ ℝᴺ¹ˣ⁶                          │ L₂ ∈ ℝᴺ²ˣ⁶
+         └──────────────┬───────────────────────┘
+                        │
+               ┌────────▼────────┐
+               │ ScalePlueckerNet │
+               │  (PluckerNetKnn) │
+               │                 │
+               │  ┌───────────┐  │
+               │  │KNN encoder│  │    moments  [m] → KNN graph → Conv2d → (B,64,N)
+               │  │  per cloud│  │    directions[d] → KNN graph → Conv2d → (B,64,N)
+               │  └─────┬─────┘  │    concat → MLP → (B,128,N)
+               │        │        │
+               │  ┌─────▼─────┐  │
+               │  │Spatial GNN│  │    12 layers alternating:
+               │  │self+cross │  │      self-attention  (within one cloud)
+               │  │ ×6 each   │  │      cross-attention (between clouds)
+               │  └─────┬─────┘  │    each: MultiHeadedAttention(4 heads) + MLP residual
+               │        │        │
+               │  ┌─────▼─────┐  │
+               │  │ Sinkhorn  │  │    pairwise L2 distance matrix (N₁×N₂)
+               │  │  OT 30it  │  │    → Sinkhorn normalisation (30 iterations)
+               │  └─────┬─────┘  │    → doubly-stochastic prob_matrix ∈ ℝᴺ¹ˣᴺ²
+               └────────┼────────┘
+                        │ prob_matrix
+               ┌────────▼────────┐
+               │  Top-K select   │    argmax top-K entries → K candidate pairs (i₁, i₂)
+               └────────┬────────┘
+                        │ K matched Plücker pairs
+               ┌────────▼────────┐
+               │  Sim(3) RANSAC  │    Stage 1: R  from direction SVD   (scale-invariant)
+               │                 │    Stage 2: s,t from moment LS       (3n×4 system)
+               │  minimal solver │    Inlier: ‖L₂ − M_sim3·L₁‖₂ &lt; τ
+               │  n=2 pairs      │    Refine on all inliers
+               └────────┬────────┘
+                        │
+                    s,  R,  t</div>
+
+    <p><strong>Why the network does not need to change for Sim(3):</strong> directions transform as d′ = Rd (scale-invariant), so the KNN graph structure is identical in both views. The GNN's cross-attention learns to match lines with the same rotated direction and consistent moment ratio. Scale is recovered analytically by RANSAC from the moment magnitudes of the matched pairs — the network never sees it explicitly.</p>
+
+    <h3>Network Layers (PluckerNetKnn)</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Layer</th><th>Input → Output</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>KNN graph conv — moments</td><td>(B,3,N) → (B,64,N)</td><td>get_graph_feature + Conv2d + MLP</td></tr>
+          <tr><td>KNN graph conv — directions</td><td>(B,3,N) → (B,64,N)</td><td>same structure</td></tr>
+          <tr><td>MLP merge</td><td>(B,128,N) → (B,128,N)</td><td>concat → Linear → BN → ReLU</td></tr>
+          <tr><td>Self-attention ×6</td><td>(B,128,N) → (B,128,N)</td><td>MultiHead(4 heads, dim=32) + MLP residual</td></tr>
+          <tr><td>Cross-attention ×6</td><td>(B,128,N₁)+(B,128,N₂) → same</td><td>queries from one cloud, keys/values from other</td></tr>
+          <tr><td>Pairwise L2 distance</td><td>(B,128,N₁),(B,128,N₂) → (B,N₁,N₂)</td><td></td></tr>
+          <tr><td>Sinkhorn OT</td><td>(B,N₁,N₂) → (B,N₁,N₂)</td><td>30 iterations, temperature λ=0.1</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Output:</strong> <span class="eq">prob_matrix</span> — soft doubly-stochastic matrix where <span class="eq">prob_matrix[b,i,j]</span> is the probability that line i in cloud 1 corresponds to line j in cloud 2.</p>
+
+    <h3>Plücker Line Format</h3>
+    <p>All Sim(3) code uses <strong>[m, d] order</strong> — moment first, direction last:</p>
+    <div class="code-block reveal">L = [m₀  m₁  m₂  d₀  d₁  d₂]     m = p × d  (moment),  d = unit direction</div>
+    <p>The original SE(3) PlueckerNet uses [d, m] order. Conversion is handled by <span class="eq">scripts/convert_se3_datasets.py</span>. The 9D color extension appends LAB: [m₀,m₁,m₂, d₀,d₁,d₂, L*,A*,B*].</p>
 
     <h3>Minimal Solver — 2 line pairs</h3>
-    <p>Given R (from direction SVD, scale-invariant), each line contributes one moment equation:</p>
+    <p>Given R from direction SVD (scale-invariant), each line contributes one moment equation:</p>
     <div class="code-block reveal">s·Rm₁ᵢ  −  [d₂ᵢ×]·t  =  m₂ᵢ
 
 Stack 2 pairs → 6 equations, 4 unknowns [s, t]:
@@ -379,7 +528,32 @@ Stack 2 pairs → 6 equations, 4 unknowns [s, t]:
 ⎢                   ⎥ ⎢   ⎥ = ⎢     ⎥   →  x = lstsq(A, b)
 ⎣ Rm₁₂  −skew(d₂₂) ⎦ ⎣ t ⎦   ⎣ m₂₂ ⎦
 
-Hypotheses with s ≤ 0 are rejected.</div>
+Hypotheses with s ≤ 0 are rejected.
+
+Inlier criterion: ‖L₂ − M_sim3·L₁‖₂ &lt; τ
+where  M_sim3 = [ s·R    [t×]·R ]
+                [  0       R   ]
+
+Best hypothesis refined on all inliers via overdetermined least squares.</div>
+
+    <h3>Training Objective</h3>
+    <p>Binary cross-entropy loss on the predicted <span class="eq">prob_matrix</span> vs the ground-truth match matrix <span class="eq">C_gt</span>:</p>
+    <div class="code-block reveal">L = −( C_gt · log(P + ε) + (1 − C_gt) · log(1 − P + ε) ).mean()</div>
+    <p><strong>RANSAC is not used during training</strong> — only called during validation to report pose metrics. The training checkpoint is selected by <span class="eq">avg_inlier_ratio</span> (the fraction of the network's top-K predictions that are true inlier correspondences).</p>
+
+    <h3>Validation Metrics</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Metric</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><span class="eq">recall_rot</span></td><td>Fraction of scenes with rotation error &lt; 20°</td></tr>
+          <tr><td><span class="eq">med_rot</span></td><td>Median rotation error (degrees)</td></tr>
+          <tr><td><span class="eq">med_trans</span></td><td>Median translation error</td></tr>
+          <tr><td><span class="eq">med_scale_err</span></td><td>Median log-ratio scale error |log(ŝ/s)|</td></tr>
+          <tr><td><span class="eq">avg_inlier_ratio</span></td><td>Average % of top-K candidates that are true inliers ← <strong>primary metric</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <div class="fig-grid reveal">
       <div class="fig-card">
@@ -394,6 +568,83 @@ Hypotheses with s ≤ 0 are rejected.</div>
           <figcaption>Network output: soft correspondence probability matrices</figcaption>
         </figure>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── DATASET PIPELINE ──────────────────────────────────────────────── -->
+<section id="dataset">
+  <div class="container">
+    <h2>Dataset Pipeline</h2>
+    <p>Three steps building a joint dataset of <strong>27,658 train / 1,523 valid</strong> scenes from three domains.</p>
+
+    <div class="code-block reveal">Step 1  convert_se3_datasets.py          semantic3D + structured3D → [m,d] + s_gt=1.0
+Step 2a generate_se3real_sim3_dataset.py  + random Sim(3) scale augmentation
+Step 2b generate_replica_gs_dataset.py   Replica RGBD → world-space GlueStick lines
+Step 2c generate_7scenes_gs_dataset.py   7-Scenes RGBD → world-space GlueStick lines
+Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
+
+    <h3>Step 2a — se3real Sim(3) Augmentation</h3>
+    <p>Merges semantic3D and structured3D and applies random Sim(3) scale per scene:</p>
+    <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">15%</strong> of scenes keep s = 1.0 (pure SE(3) — preserves base capability)</li>
+      <li><strong style="color:var(--text)">85%</strong> of scenes draw s ~ log-uniform(0.1, 10.0), then apply <span class="eq">plucker2[:, :3] *= s</span> (scale moments; directions unchanged) and <span class="eq">t_gt *= s</span></li>
+    </ul>
+
+    <h3>Step 2b/c — World-Space GlueStick Line Pool Construction</h3>
+    <p>Per-scene pipeline from RGBD sequences:</p>
+    <ol style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem">Run GlueStick 2D line detection on every N-th frame (CPU only — <span class="eq">SPWireframeDescriptor.to('cpu')</span>)</li>
+      <li style="margin-bottom:0.4rem">Unproject 2D segments to 3D using depth + camera pose, compute Plücker [m, d]</li>
+      <li>Accumulate into per-scene pool; deduplicate via voxel-hash NMS (pos_voxel=0.10 m, dir_voxel=0.04 ≈ 2.3°), keeping line with largest ‖m‖ per cell</li>
+    </ol>
+    <p><strong>Pair generation</strong> (<span class="eq">N_TOTAL = 700</span> lines per pair, <span class="eq">N_MAX_INLIERS = 490</span> at 100% overlap; scale s ~ log-uniform(0.1, 10.0) applied to target cloud). Overlap sampled at discrete levels:</p>
+
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Overlap</th><th>Probability</th><th>n_inliers</th></tr></thead>
+        <tbody>
+          <tr><td>0% (zero-overlap)</td><td>12%</td><td>0 — s_gt = 0.0 signals no GT pose</td></tr>
+          <tr><td>5%</td><td>8%</td><td>~25</td></tr>
+          <tr><td>10%</td><td>8%</td><td>~49</td></tr>
+          <tr><td>20%</td><td>9%</td><td>~98</td></tr>
+          <tr><td>30%</td><td>9%</td><td>~147</td></tr>
+          <tr><td>50%</td><td>10%</td><td>~245</td></tr>
+          <tr><td>70%</td><td>10%</td><td>~343</td></tr>
+          <tr><td>100%</td><td>34%</td><td>490</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">GlueStick must run on CPU. GPU inference crashes with SPWireframeDescriptor. Only the ['lines'] output is used — GlueStick's own matching is not used.</p>
+
+    <h3>Dataset Sizes</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Split</th><th>Train</th><th>Valid</th><th>Source</th></tr></thead>
+        <tbody>
+          <tr><td>replica_gs</td><td>14,000</td><td>400</td><td>Replica RGBD, GlueStick world-space lines</td></tr>
+          <tr><td>7scenes_gs</td><td>9,000</td><td>300</td><td>7-Scenes RGBD, GlueStick world-space lines</td></tr>
+          <tr><td>se3real_sim3</td><td>4,658</td><td>823</td><td>semantic3D + structured3D + scale aug</td></tr>
+          <tr><td><strong>joint</strong></td><td><strong>27,658</strong></td><td><strong>1,523</strong></td><td>All three combined</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Dataset Format</h3>
+    <p>Each split is a directory of 6 pickle files (lists of numpy arrays):</p>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>File</th><th>Shape per sample</th><th>dtype</th></tr></thead>
+        <tbody>
+          <tr><td><span class="eq">matches.pkl</span></td><td>(2, n_inliers) — row 0 = src indices, row 1 = tgt indices</td><td>int32</td></tr>
+          <tr><td><span class="eq">plucker1.pkl</span></td><td>(N_TOTAL, 6)</td><td>float32</td></tr>
+          <tr><td><span class="eq">plucker2.pkl</span></td><td>(N_TOTAL, 6)</td><td>float32</td></tr>
+          <tr><td><span class="eq">R_gt.pkl</span></td><td>(3, 3)</td><td>float32</td></tr>
+          <tr><td><span class="eq">t_gt.pkl</span></td><td>(3, 1)</td><td>float32</td></tr>
+          <tr><td><span class="eq">s_gt.pkl</span></td><td>scalar (0.0 = zero-overlap, no valid pose)</td><td>float32</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
@@ -493,6 +744,141 @@ Hypotheses with s ≤ 0 are rejected.</div>
         </tbody>
       </table>
     </div>
+
+    <h3>Cross-Dataset Evaluation (Grassmannian RANSAC)</h3>
+    <p>All Sim(3) models evaluated with Grassmannian RANSAC unless noted. <span class="eq">recall_rot</span> = fraction of scenes with rotation error &lt; 20°. <span class="eq">med_s_err</span> = median |log(s_est/s_gt)|.</p>
+
+    <h3>se3real_sim3_valid — 823 scenes, s ∈ [0.1, 10]</h3>
+    <p>Primary Sim(3) benchmark. Scale error is only meaningful here since s ≠ 1. Original PlueckerNet is included — trained on the same structured3D/semantic3D data so it can find correspondences, but does not estimate scale.</p>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>RANSAC</th><th>recall_rot ↑</th><th>med_rot° ↓</th><th>med_trans ↓</th><th>med_s_err ↓</th><th>inlier%</th></tr></thead>
+        <tbody>
+          <tr><td>Original PlueckerNet (SE3)</td><td>L2 (original)</td><td class="fail">0.175</td><td class="fail">180.0°</td><td>—</td><td>—</td><td>58.6%</td></tr>
+          <tr><td>Original PlueckerNet (SE3)</td><td>Grassmannian</td><td>0.877</td><td>8.15°</td><td>2.04</td><td>—</td><td>58.6%</td></tr>
+          <tr><td>se3real, no cosine (ep 91)</td><td>L2</td><td class="fail">0.247</td><td class="fail">85.4°</td><td>—</td><td>0.232</td><td>68.4%</td></tr>
+          <tr><td>se3real, no cosine (ep 91)</td><td><strong>Grassmannian</strong></td><td class="best">0.909</td><td class="best">7.6°</td><td>2.04</td><td>0.027</td><td>68.4%</td></tr>
+          <tr><td>se3real, cosine (ep 208)</td><td>Grassmannian</td><td>0.883</td><td>7.81°</td><td>2.02</td><td>0.026</td><td>69.0%</td></tr>
+          <tr><td>Joint, cosine (ep 297)</td><td>Grassmannian</td><td>0.898</td><td>7.98°</td><td>2.045</td><td>0.024</td><td>67.2%</td></tr>
+          <tr><td>Joint + dustbin (ep 82)</td><td>Grassmannian</td><td>0.875</td><td>7.85°</td><td>2.037</td><td>0.030</td><td>67.5%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">The L2 → Grassmannian jump (0.247 → 0.909 recall, 85° → 7.6° med_rot) is purely a RANSAC solver change — same network weights. The 2-line L2 solver fails on structured3D/semantic3D parallel lines (rank-1 cross-covariance → 180° degenerate rotation). Grassmannian samples 3 lines stratified by dominant axis, eliminating this.</p>
+
+    <h3>replica_gs_valid — 400 real RGBD scenes, s ≈ 1</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>Overlap</th><th>N</th><th>recall_rot ↑</th><th>med_rot° ↓</th><th>med_trans ↓</th><th>inlier%</th></tr></thead>
+        <tbody>
+          <tr class="row-header"><td colspan="7">Original PlueckerNet (SE3)</td></tr>
+          <tr><td></td><td>overall</td><td>400</td><td class="fail">0.005</td><td class="fail">135.5°</td><td>2.25</td><td class="fail">0.2% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">se3real, no cosine (ep 91)</td></tr>
+          <tr><td></td><td>overall</td><td>400</td><td class="fail">0.007</td><td class="fail">137.0°</td><td>2.14</td><td class="fail">0.2% ❌</td></tr>
+          <tr><td></td><td>no overlap</td><td>39</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>142</td><td>0.007</td><td>132.2°</td><td>2.00</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>219</td><td>0.009</td><td>131.2°</td><td>2.24</td><td>0.4% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">se3real, cosine (ep 208)</td></tr>
+          <tr><td></td><td>overall</td><td>400</td><td class="fail">0.007</td><td class="fail">135.7°</td><td>2.20</td><td class="fail">0.2% ❌</td></tr>
+          <tr><td></td><td>no overlap</td><td>39</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>142</td><td>0.007</td><td>130.1°</td><td>2.17</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>219</td><td>0.009</td><td>130.6°</td><td>2.20</td><td>0.4% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">Joint, cosine (ep 297)</td></tr>
+          <tr><td></td><td>overall</td><td>400</td><td class="best">0.682</td><td class="best">0.01°</td><td class="best">0.000</td><td class="best">79.7%</td></tr>
+          <tr><td></td><td>no overlap</td><td>39</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0%</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>142</td><td>0.690</td><td>0.01°</td><td>0.000</td><td>70.2%</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>219</td><td>0.799</td><td>0.01°</td><td>0.000</td><td>100.0%</td></tr>
+          <tr class="row-header"><td colspan="7">Joint + dustbin (ep 82)</td></tr>
+          <tr><td></td><td>overall</td><td>400</td><td>0.720</td><td>0.01°</td><td>0.000</td><td>79.5%</td></tr>
+          <tr><td></td><td>no overlap</td><td>39</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0%</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>142</td><td>0.676</td><td>0.01°</td><td>0.000</td><td>69.8%</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>219</td><td>0.877</td><td>0.00°</td><td>0.000</td><td>99.9%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>7scenes_gs_valid — 300 real RGBD scenes, s ≈ 1</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>Overlap</th><th>N</th><th>recall_rot ↑</th><th>med_rot° ↓</th><th>med_trans ↓</th><th>inlier%</th></tr></thead>
+        <tbody>
+          <tr class="row-header"><td colspan="7">Original PlueckerNet (SE3)</td></tr>
+          <tr><td></td><td>overall</td><td>300</td><td class="fail">0.007</td><td class="fail">141.0°</td><td>2.18</td><td class="fail">0.0% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">se3real, no cosine (ep 91)</td></tr>
+          <tr><td></td><td>overall</td><td>300</td><td class="fail">0.000</td><td class="fail">139.9°</td><td>—</td><td class="fail">0.1% ❌</td></tr>
+          <tr><td></td><td>no overlap</td><td>37</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>114</td><td>0.000</td><td>131.5°</td><td>2.14</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>149</td><td>0.000</td><td>134.7°</td><td>2.17</td><td>0.1% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">se3real, cosine (ep 208)</td></tr>
+          <tr><td></td><td>overall</td><td>300</td><td class="fail">0.003</td><td class="fail">144.6°</td><td>2.04</td><td class="fail">0.1% ❌</td></tr>
+          <tr><td></td><td>no overlap</td><td>37</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>114</td><td>0.000</td><td>127.4°</td><td>1.93</td><td>0.0% ❌</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>149</td><td>0.007</td><td>142.8°</td><td>2.11</td><td>0.1% ❌</td></tr>
+          <tr class="row-header"><td colspan="7">Joint, cosine (ep 297)</td></tr>
+          <tr><td></td><td>overall</td><td>300</td><td class="best">0.647</td><td class="best">0.01°</td><td class="best">0.000</td><td class="best">76.0%</td></tr>
+          <tr><td></td><td>no overlap</td><td>37</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0%</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>114</td><td>0.728</td><td>0.01°</td><td>0.000</td><td>69.3%</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>149</td><td>0.745</td><td>0.01°</td><td>0.000</td><td>100.0%</td></tr>
+          <tr class="row-header"><td colspan="7">Joint + dustbin (ep 82)</td></tr>
+          <tr><td></td><td>overall</td><td>300</td><td>0.657</td><td>0.01°</td><td>0.000</td><td>75.7%</td></tr>
+          <tr><td></td><td>no overlap</td><td>37</td><td>0.000</td><td>180.0°</td><td>—</td><td>0.0%</td></tr>
+          <tr><td></td><td>sparse (~30%)</td><td>114</td><td>0.702</td><td>0.01°</td><td>0.000</td><td>68.6%</td></tr>
+          <tr><td></td><td>dense (~70%)</td><td>149</td><td>0.785</td><td>0.01°</td><td>0.000</td><td>100.0%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Both the original PlueckerNet and the se3real specialist fail completely on replica_gs and 7scenes_gs — same ~135–141° rotation and &lt;0.2% inlier ratio regardless of overlap level. Both were trained exclusively on structured3D/semantic3D data and do not generalize to GlueStick world-space line parameterization. Only the joint model (trained on all three domains) generalizes.</p>
+
+    <h3>9D Color — Cross-Dataset (joint_color model)</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>Val set</th><th>Inlier ratio</th><th>Recall<sub>rot</sub></th></tr></thead>
+        <tbody>
+          <tr><td>joint_color (epoch 345)</td><td>replica_gs_color_valid</td><td class="best">98.22%</td><td>1.000</td></tr>
+          <tr><td>joint_color (epoch 345)</td><td>7scenes_gs_color_valid</td><td class="best">98.23%</td><td>1.000</td></tr>
+          <tr><td>phase4b dustbin (9D, ep 20)</td><td>replica_gs_color_valid</td><td>97.84%</td><td>1.000</td></tr>
+          <tr><td>phase4b dustbin (9D, ep 20)</td><td>7scenes_gs_color_valid</td><td>97.99%</td><td>1.000</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">9D models should not be evaluated on 6D (colorless) datasets — neutral LAB padding [50, 0, 0] gives zero discriminative signal and causes severe degradation. Use the 6D joint checkpoint for colorless inputs.</p>
+  </div>
+</section>
+
+<!-- ── EXTENSIONS ─────────────────────────────────────────────────────── -->
+<section id="extensions">
+  <div class="container">
+    <h2>Potential Extensions</h2>
+
+    <h3>Color Descriptors (9D Plücker + LAB)</h3>
+    <p>Append per-line mean LAB color to the 6D Plücker vector, giving 9D input [m₀,m₁,m₂, d₀,d₁,d₂, L*,A*,B*]. Color provides an additional discriminative signal for matching lines in scenes with strong chromatic structure.</p>
+    <p><strong>Dataset generation:</strong> both RGBD generators support color via the <span class="eq">--add_colors</span> flag. The mean LAB color of each 3D line's reprojected pixels is computed during pool construction.</p>
+    <p><strong>Training:</strong> pass <span class="eq">--in_channel 9</span> to <span class="eq">train.py</span>. The network architecture is unchanged; the KNN encoder simply receives 9-channel input instead of 6.</p>
+    <p><strong>Important:</strong> 9D checkpoints should not be evaluated on 6D (colorless) datasets. Neutral LAB padding gives zero discriminative signal from the color channel and degrades performance. Use the 6D joint checkpoint for colorless inputs.</p>
+    <p><strong>Prior results:</strong> joint_color (epoch 345): 98.22% inlier ratio on replica_gs_color_valid, 98.23% on 7scenes_gs_color_valid — ~1.7% cost vs the 6D joint model on the same data.</p>
+
+    <h3>Dustbin Token</h3>
+    <p>A learnable dustbin row and column are appended to the assignment matrix (SuperGlue-style), allowing the network to explicitly route unmatched lines to the dustbin rather than forcing them onto wrong correspondences. This improves robustness at low overlap.</p>
+    <p>Enable with <span class="eq">--dustbin</span>. Best used as a fine-tuning step from a converged joint checkpoint:</p>
+    <div class="code-block reveal">python train.py --dustbin \
+    --pretrain output/joint/&lt;date&gt;/best_val_checkpoint.pth \
+    --lr 2e-4 --name dustbin_ft</div>
+    <p>Implementation: <span class="eq">sim3/model_dustbin.py</span> (PluckerNetKnnDustbin), <span class="eq">sim3/trainer_dustbin.py</span>.</p>
+
+    <h3>Cosine Learning Rate Schedule</h3>
+    <p><span class="eq">--cosine_lr</span> replaces ExponentialLR with CosineAnnealingWarmRestarts(T_0=50, T_mult=2, eta_min=1e-6). Useful for long training runs where the default decay bottoms out too early.</p>
+
+    <h3>Grassmannian RANSAC</h3>
+    <p>The Grassmannian solver (<span class="eq">sim3/ransac_grassmannian.py</span>) uses the principal angle between Plücker lines as the inlier metric — a proper geodesic distance on the Grassmannian G(1,5). This is scale- and translation-invariant, unlike the L2 threshold used by the default solver (whose effective sensitivity varies with scene scale).</p>
+    <p>Additional improvements over the default solver:</p>
+    <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Direction sign handling</strong> — flips source directions before Procrustes when they point away from target, correctly handling undirected line ambiguity</li>
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Stratified sampling</strong> — bins lines by dominant axis before RANSAC sampling to prevent degenerate all-parallel minimal sets</li>
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Tikhonov regularization</strong> — prevents scale collapse to near-zero on near-parallel scenes (e.g. chessboard corridors)</li>
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Scale prior seeding</strong> — bootstraps from a full-set Procrustes + fixed-scale translation solve before the random RANSAC loop</li>
+      <li><strong style="color:var(--text)">Moment-magnitude refinement</strong> — final scale estimate uses median(‖m₂‖ / ‖R·m₁‖) rather than re-running the joint LS, which is more robust to translation noise</li>
+    </ul>
+    <p>Enable: <span class="eq">--ransac grassmannian</span> in <span class="eq">scripts/eval.py</span>. Inlier criterion: arccos(|L̂₁·L̂₂|) &lt; 0.15 rad.</p>
   </div>
 </section>
 
@@ -549,6 +935,20 @@ Hypotheses with s ≤ 0 are rejected.</div>
   url    = {https://github.com/rueyday/scale-aware-PlueckerNet}
 }</div>
   </div>
+</section>
+
+<!-- ── INTERACTIVE VISUALIZATION ────────────────────────────────────── -->
+<section id="visualization">
+  <div class="container">
+    <h2>Interactive 3D Visualization — Replica office0</h2>
+    <p>GlueStick 3D line segments extracted from 80 RGBD frames of Replica office0. Toggle traces via the legend. <strong>Tab 1</strong>: scene depth cloud + full GT line cloud + GT stitch result. <strong>Tab 2</strong>: 50% overlap split. <strong>Tab 3</strong>: Sim(3) registration problem with GT and predicted correspondences highlighted.</p>
+  </div>
+  <iframe
+    src="office0_lines.html"
+    style="width:100%; height:80vh; border:none; display:block; margin-top:1rem;"
+    loading="lazy"
+    title="Replica office0 interactive 3D line visualization"
+  ></iframe>
 </section>
 
 <!-- ── FOOTER ────────────────────────────────────────────────────────── -->

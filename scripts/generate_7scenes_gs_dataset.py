@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-generate_7scenes_gs_dataset.py
-
-Builds 9D Plücker+LAB training pairs from 7-Scenes RGBD using GlueStick
-world-space line detection.  See scripts/_pair_gen.py for diversity policy.
-
-GlueStick runs on CPU only.  Subprocess-per-scene for memory safety.
-
-Output: dataset/7scenes_gs_train/, dataset/7scenes_gs_valid/
-"""
-
 import os, sys, glob, pickle, argparse, gc, ctypes, subprocess
 import numpy as np
 import cv2
@@ -26,7 +14,7 @@ def _trim():
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR    = os.path.dirname(SCRIPT_DIR)
-GLUESTICK   = '/home/rueyday/scale-aware-cross-modal-registration/GlueStick'
+GLUESTICK   = '/home/rueyday/GlueStick'
 SEVEN_ROOT  = '/mnt/crucial/rueyday/data/7scenes'
 
 FX, FY = 585.0, 585.0
@@ -39,16 +27,13 @@ VALID_SCENES = ['chess']   # chess seq-06 (last seq) held out for validation
 
 
 def _load_seqs(scene_dir):
-    """Return sorted list of sequence directories under scene_dir."""
     return sorted(glob.glob(os.path.join(scene_dir, 'seq-*')))
-
-
-# ── Worker ─────────────────────────────────────────────────────────────────────
 
 def _worker(scene_name, seven_root, out_dir, n_per_scene,
             every_n, max_lines, seed, val_mode=False):
     sys.path.insert(0, GLUESTICK)
     sys.path.insert(0, SCRIPT_DIR)
+
     from gluestick import numpy_image_to_torch
     from gluestick.models.wireframe import SPWireframeDescriptor
     from _pair_gen import generate_pair, sample_line_lab, dedup_pool
@@ -60,6 +45,7 @@ def _worker(scene_name, seven_root, out_dir, n_per_scene,
 
     scene_dir = os.path.join(seven_root, scene_name)
     seqs      = _load_seqs(scene_dir)
+    
     if val_mode:
         seqs = seqs[-1:]   # only the held-out last sequence
     else:

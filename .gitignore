@@ -1,15 +1,6 @@
-*.pyc
-*.pkl
-*.log
-*.tex
-*.zip
-events.out.*
 __pycache__/
-*.pth 
 .claude/
-.claude_cache_*
 results/
 output/
 dataset/
-report/
 CLAUDE.md
