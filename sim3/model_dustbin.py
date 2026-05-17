@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # PluckerNet lives one directory up
-_PLUECKERNET = os.path.join(os.path.dirname(__file__), '..', '..', 'PlueckerNet')
+_PLUECKERNET = os.path.join(os.path.dirname(__file__), '..', 'PlueckerNet')
 sys.path.insert(0, os.path.abspath(_PLUECKERNET))
 
 from model.model_plucker import FeatureExtractorGraph, pairwiseL2Dist, prob_mat_sinkhorn

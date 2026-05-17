@@ -766,6 +766,23 @@ Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
     </div>
     <p class="note">The L2 → Grassmannian jump (0.247 → 0.909 recall, 85° → 7.6° med_rot) is purely a RANSAC solver change — same network weights. The 2-line L2 solver fails on structured3D/semantic3D parallel lines (rank-1 cross-covariance → 180° degenerate rotation). Grassmannian samples 3 lines stratified by dominant axis, eliminating this.</p>
 
+    <h4 style="margin-top:1.5rem;font-size:0.95rem;color:var(--muted)">Joint 6D vs. Dustbin — overlap breakdown (se3real_sim3_valid, Grassmannian RANSAC)</h4>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Model</th><th>Overlap</th><th>N</th><th>recall_rot ↑</th><th>med_rot° ↓</th><th>med_trans ↓</th><th>inlier%</th></tr></thead>
+        <tbody>
+          <tr class="row-header"><td colspan="7">Joint 6D — output/joint/2026-05-14/best_val_checkpoint.pth</td></tr>
+          <tr><td></td><td>overall</td><td>823</td><td class="best">0.902</td><td class="best">7.84°</td><td>2.043</td><td>67.3%</td></tr>
+          <tr><td></td><td>sparse (1–200 inliers)</td><td>627</td><td>0.884</td><td>8.20°</td><td>1.976</td><td>61.4%</td></tr>
+          <tr><td></td><td>dense (201–490 inliers)</td><td>196</td><td>0.959</td><td>6.96°</td><td>2.208</td><td>86.2%</td></tr>
+          <tr class="row-header"><td colspan="7">Joint + dustbin (ep 82) — output/joint/dustbin_ft/best_val_checkpoint.pth</td></tr>
+          <tr><td></td><td>overall</td><td>823</td><td>0.875</td><td>7.85°</td><td>2.037</td><td>67.5%</td></tr>
+          <tr><td></td><td>sparse (1–200 inliers)</td><td>627</td><td>0.853</td><td>8.37°</td><td>1.964</td><td>61.8%</td></tr>
+          <tr><td></td><td>dense (201–490 inliers)</td><td>196</td><td>0.944</td><td>6.53°</td><td>2.221</td><td>85.9%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <h3>replica_gs_valid — 400 real RGBD scenes, s ≈ 1</h3>
     <div class="tbl-wrap reveal">
       <table>
@@ -828,6 +845,7 @@ Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
       </table>
     </div>
     <p class="note">Both the original PlueckerNet and the se3real specialist fail completely on replica_gs and 7scenes_gs — same ~135–141° rotation and &lt;0.2% inlier ratio regardless of overlap level. Both were trained exclusively on structured3D/semantic3D data and do not generalize to GlueStick world-space line parameterization. Only the joint model (trained on all three domains) generalizes.</p>
+    <p class="note"><strong>Zero-overlap false-positive check (7scenes_gs, N=37):</strong> RANSAC was run on all zero-overlap scenes to test whether either model produces a false-positive confident pose estimate. Neither model produces a false positive (&lt;20° error): joint 6D gives med_rot 64°, dustbin gives med_rot 92° — both garbage fits from random predictions. The dustbin drives its top-match probability to ≈ 0.0000 vs ≈ 0.0025 for the base model, but both lead to identically untrustworthy outputs with no false positives. The base joint model handles zero-overlap correctly because 12% of training scenes are zero-overlap.</p>
 
     <h3>9D Color — Cross-Dataset (joint_color model)</h3>
     <div class="tbl-wrap reveal">
@@ -858,8 +876,8 @@ Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
     <p><strong>Prior results:</strong> joint_color (epoch 345): 98.22% inlier ratio on replica_gs_color_valid, 98.23% on 7scenes_gs_color_valid — ~1.7% cost vs the 6D joint model on the same data.</p>
 
     <h3>Dustbin Token</h3>
-    <p>A learnable dustbin row and column are appended to the assignment matrix (SuperGlue-style), allowing the network to explicitly route unmatched lines to the dustbin rather than forcing them onto wrong correspondences. This improves robustness at low overlap.</p>
-    <p>Enable with <span class="eq">--dustbin</span>. Best used as a fine-tuning step from a converged joint checkpoint:</p>
+    <p>A learnable dustbin row and column are appended to the assignment matrix (SuperGlue-style), allowing the network to explicitly route unmatched lines to the dustbin. In practice, the dustbin provides <strong>no meaningful advantage</strong> over the base joint model. Evaluation shows a −0.027 recall regression on se3real with only marginal gains elsewhere, and zero-overlap scenes are already handled correctly by the base model (which was trained on 12% zero-overlap data). The dustbin does drive match probabilities to ≈ 0 for zero-overlap inputs, but neither model produces false positives in evaluation.</p>
+    <p>Enable with <span class="eq">--dustbin</span>. Fine-tune from a converged joint checkpoint:</p>
     <div class="code-block reveal">python train.py --dustbin \
     --pretrain output/joint/&lt;date&gt;/best_val_checkpoint.pth \
     --lr 2e-4 --name dustbin_ft</div>

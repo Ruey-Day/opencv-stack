@@ -1,15 +1,9 @@
-#!/usr/bin/env python3
 """
-convert_se3_datasets.py
-
 Converts the original PlueckerNet SE(3) datasets (semantic3D, structured3D)
 from [d, m] Plücker format to our [m, d] format and adds s_gt=1.0.
 
 Input:  ../PlueckerNet/dataset/{semantic3D,structured3D}_{train,valid}/
 Output: ./dataset/{semantic3D,structured3D}_{train,valid}/
-
-Run once before including these in joint training:
-    python scripts/convert_se3_datasets.py
 """
 
 import os
@@ -19,26 +13,21 @@ import argparse
 import numpy as np
 
 ROOT         = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PLUECKERNET  = os.path.abspath(os.path.join(ROOT, '..', 'PlueckerNet'))
+PLUECKERNET  = os.path.abspath(os.path.join(ROOT, 'PlueckerNet'))
 SE3_DATASETS = ['semantic3D', 'structured3D']
 SPLITS       = ['train', 'valid']
 SE3_KEYS     = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt']
-
 
 def _load(path):
     with open(path, 'rb') as f:
         return pickle.load(f, encoding='latin1')
 
-
 def _save(path, obj):
     with open(path, 'wb') as f:
         pickle.dump(obj, f)
 
-
 def dm_to_md(arr):
-    """[d, m] (6D) → [m, d] (6D): swap the two halves."""
     return np.concatenate([arr[:, 3:], arr[:, :3]], axis=1).astype(np.float32)
-
 
 def convert_split(src_dir, dst_dir):
     os.makedirs(dst_dir, exist_ok=True)
@@ -68,7 +57,6 @@ def convert_split(src_dir, dst_dir):
     print(f'  → {dst_dir}  ({n} scenes, s_gt=1.0, 6D [m,d])')
     return n
 
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--plueckernet_dir', default=PLUECKERNET,
@@ -91,7 +79,6 @@ def main():
             total += convert_split(src, dst)
 
     print(f'\nDone — {total} scenes converted.')
-
 
 if __name__ == '__main__':
     main()

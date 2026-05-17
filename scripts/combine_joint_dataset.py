@@ -1,15 +1,4 @@
-#!/usr/bin/env python3
 """
-combine_joint_dataset.py
-
-Merges replica_gs, 7scenes_gs, and se3real_sim3 (semantic3D + structured3D
-with random Sim(3) scale augmentation) into joint_train / joint_valid.
-
-se3real_sim3 must first be generated via:
-    python scripts/generate_se3real_sim3_dataset.py
-
-Usage
------
     python scripts/combine_joint_dataset.py
     python scripts/combine_joint_dataset.py --data_dir ./dataset --seed 42
 """
@@ -18,7 +7,6 @@ import os, pickle, argparse
 import numpy as np
 
 KEYS = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']
-
 
 def load_split(split_dir):
     data = {}
@@ -32,7 +20,6 @@ def load_split(split_dir):
     ch = data['plucker1'][0].shape[1]
     print(f'  Loaded {n:,} scenes from {split_dir}  ({ch}D)')
     return data, n
-
 
 def combine_and_save(source_dirs, out_dir, seed=42):
     os.makedirs(out_dir, exist_ok=True)
@@ -90,8 +77,6 @@ def main():
     n_valid = combine_and_save(valid_sources, os.path.join(args.out_dir, 'joint_valid'), args.seed + 1)
 
     print(f'\nDone — {n_train:,} train / {n_valid:,} valid scenes.')
-    print('Train with: python train.py --dataset joint')
-
 
 if __name__ == '__main__':
     main()

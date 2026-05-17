@@ -23,7 +23,7 @@ import torch
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 
-_PLUECKERNET = os.path.join(os.path.dirname(__file__), '..', '..', 'PlueckerNet')
+_PLUECKERNET = os.path.join(os.path.dirname(__file__), '..', 'PlueckerNet')
 sys.path.insert(0, os.path.abspath(_PLUECKERNET))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 

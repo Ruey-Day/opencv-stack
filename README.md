@@ -4,12 +4,10 @@
 
 [Website](https://rueyday.github.io/ScalePluckerNet/) &nbsp;·&nbsp; [Dataset (Dropbox)](https://www.dropbox.com/scl/fo/34o03nsdztz3fpxrwzhty/ALP0MX8KOvdEDx8fg_Wfd9I?rlkey=qzo08vwuqo4jwt5nrrsffb6t3&st=9xaxvt1b&dl=0) &nbsp;·&nbsp; [Model weights (Dropbox)](https://www.dropbox.com/scl/fo/1knswbb20t9pjug00vim7/ALfsafw208mQSmSyzAvnjIU?rlkey=spq78nh6ofobjsk1abuhy86ry&st=06gqdibi&dl=0) &nbsp;·&nbsp; [Google Colab](https://colab.research.google.com/drive/1_AWdfnJjmsteVT_lM4dakYTecn1gpRc_?usp=sharing)
 
----
-
 ## Repository Layout
 
 ```
-scale-aware-PlueckerNet/
+ScalePlueckerNet/
 ├── sim3/
 │   ├── dataloader.py          # Sim3PluckerData — loads [m,d] format + s_gt
 │   ├── trainer.py             # Sim3Trainer — validation uses Sim(3) RANSAC
@@ -26,11 +24,9 @@ scale-aware-PlueckerNet/
 │   ├── generate_7scenes_gs_dataset.py   # Step 2c: 7-Scenes RGBD world-space lines
 │   ├── _pair_gen.py                     # Shared pair generation utilities
 │   ├── combine_joint_dataset.py         # Step 3: merge all sources into joint split
-│   ├── eval.py                          # Evaluation entry point
-│   └── visualize_lines.py               # 3D line visualisation helper
+│   └── eval.py                          # Evaluation entry point
 │
 ├── train.py                   # Training entry point
-├── chess_plueckernet_demo.py  # Failure analysis demo
 │
 ├── dataset/
 │   ├── replica_gs_train/      # 14,000 scenes
@@ -48,33 +44,17 @@ scale-aware-PlueckerNet/
 
 Parent repo `../PlueckerNet/` must exist on `sys.path` — all entry points add it automatically.
 
----
-
 ## Dependencies
 
-### Python environment
+### Conda environment
 
 ```bash
-conda activate torch5090
-# Python 3.11, PyTorch 2.6, CUDA, numpy 2.x
-pip install tensorboardX easydict scipy
+conda env create -f environment.yml # Conda env I used to run with ubuntu 24.04 and RTX 5090
 ```
 
-### PlueckerNet (required)
+### PlueckerNet
 
-`../PlueckerNet/` must exist alongside this repo:
-
-```
-../PlueckerNet/
-├── model/model_plucker.py   # PluckerNetKnn
-├── config.py
-└── lib/
-    ├── loss.py
-    ├── timer.py
-    ├── file.py
-    ├── utils.py
-    └── transformations.py
-```
+`../PlueckerNet/` must exist alongside this repo.
 
 ### GlueStick (dataset generation only)
 
@@ -84,44 +64,21 @@ pip install tensorboardX easydict scipy
 
 Run on **CPU only** (`SPWireframeDescriptor.to('cpu')`). Only `['lines']` output is used.
 
----
-
 ## Dataset Pipeline
-
-Three steps. Total: **27,658 train / 1,523 valid** scenes.
-
-### Step 1 — Convert SE3 datasets
 
 ```bash
 python scripts/convert_se3_datasets.py
 # reads  ../PlueckerNet/dataset/{semantic3D,structured3D}_{train,valid}/
 # writes ./dataset/{semantic3D,structured3D}_{train,valid}/
-```
 
-### Step 2a — se3real Sim(3) augmentation
-
-```bash
 python scripts/generate_se3real_sim3_dataset.py
 # output: dataset/se3real_sim3_{train,valid}/
-# sizes:  4,658 train / 823 valid
-```
 
-### Step 2b/c — World-space GlueStick datasets
-
-```bash
 python scripts/generate_replica_gs_dataset.py &
 python scripts/generate_7scenes_gs_dataset.py &
-wait
-# sizes: replica_gs: 14,000 train / 400 valid
-#        7scenes_gs:  9,000 train / 300 valid
-```
 
-### Step 3 — Combine
-
-```bash
 python scripts/combine_joint_dataset.py
 # output: dataset/joint_{train,valid}/
-# sizes:  27,658 train / 1,523 valid
 ```
 
 ### Dataset format
@@ -137,26 +94,9 @@ Each split is a directory of 6 pickle files:
 | `t_gt.pkl` | `(3, 1)` | float32 |
 | `s_gt.pkl` | scalar (`0.0` = zero-overlap, no valid pose) | float32 |
 
----
-
-## Failure Analysis Demo
-
-```bash
-conda activate depth_anything
-export CHESS_DATA_DIR=/path/to/7-Scenes/chess/seq-01
-python chess_plueckernet_demo.py
-# figures written to results/
-```
-
----
-
 ## Training
 
-Entry point: `train.py`
-
 ```bash
-conda activate torch5090
-
 # Train on all datasets (default):
 python train.py
 
@@ -166,16 +106,15 @@ python train.py --dataset se3real_sim3
 # Resume:
 python train.py --resume output/joint/<date>/checkpoint.pth
 
-# Fine-tune with dustbin from a joint checkpoint:
+# With dustbin from a joint checkpoint:
 python train.py --dustbin \
     --pretrain output/joint/<date>/best_val_checkpoint.pth --lr 2e-4
 
 # Multiple simultaneous runs (use --name to avoid checkpoint clashes):
-python train.py --dataset joint --name run_a &
-python train.py --dataset joint --dustbin --name run_b &
+python train.py --dataset joint --name run_a
 ```
 
-### Flags
+### Training Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -195,17 +134,7 @@ python train.py --dataset joint --dustbin --name run_b &
 
 Checkpoints: `output/<dataset>/<name>/`
 
-### GPU memory
-
-`--batch 32` uses ~11–13 GB VRAM. On a 32 GB GPU, 2 jobs fit comfortably; 3 will OOM — reduce to `--batch 16` for secondary jobs. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
-
----
-
 ## Evaluation
-
-Entry point: `scripts/eval.py`
-
-### Mode 1 — Cross-dataset eval (default)
 
 Evaluates on one or more validation splits; reports per-scene metrics broken down by overlap level.
 
@@ -227,24 +156,7 @@ Results saved to `results/eval_cross_dataset/<label>.json`.
 | L2 Sim(3) | `--ransac sim3` (default) | Fast; threshold is scale-dependent |
 | Grassmannian | `--ransac grassmannian` | Scale/translation-invariant; stratified sampling + Tikhonov regularization |
 
-### Mode 2 — Chess B1/B2 benchmark
-
-```bash
-python scripts/eval.py --chess \
-    --weights output/joint/2026-05-14/best_val_checkpoint.pth \
-    --chess_seq1 /path/to/chess/seq-01 \
-    --chess_seq3 /path/to/chess/seq-03
-```
-
-### Mode 3 — Synthetic hypothesis test
-
-```bash
-python scripts/eval.py --hypothesis \
-    --weights output/joint/2026-05-14/best_val_checkpoint.pth \
-    [--se3_weights ../PlueckerNet/.../best_val_checkpoint_real.pth]
-```
-
-### All flags
+### Eval Flags
 
 ```
 --weights              Checkpoint path (required)
@@ -253,48 +165,4 @@ python scripts/eval.py --hypothesis \
 --ransac               sim3 | grassmannian                      [default: sim3]
 --out_dir              Output directory for JSON                [default: results/eval_cross_dataset]
 --label                Human-readable run label
---chess                Chess B1/B2 benchmark
---chess_seq1           Path to Chess seq-01
---chess_seq3           Path to Chess seq-03
---chess_out_dir        Output directory for chess JSON          [default: results/eval_chess]
---hypothesis           Synthetic hypothesis test
---se3_weights          SE3-Net weights for comparison           [optional]
---n_scenes             Scenes per condition                     [default: 200]
---hypothesis_out_dir   Output directory for hypothesis JSON     [default: results/eval_hypothesis]
 ```
-
----
-
-## Evaluation Results
-
-All results use **Grassmannian RANSAC** (`--ransac grassmannian`). Overlap buckets: sparse = 1–200 inliers, dense = 201–490 inliers.
-
-### Joint 6D model — `output/joint/2026-05-14/best_val_checkpoint.pth`
-
-| Dataset | N | recall\_rot | med\_rot (°) | med\_trans (m) | inlier\_ratio |
-|---------|---|------------|-------------|---------------|--------------|
-| se3real\_sim3\_valid | 823 | **0.902** | 7.84 | 2.043 | 67.3% |
-| — sparse | 627 | 0.884 | 8.20 | 1.976 | 61.4% |
-| — dense  | 196 | 0.959 | 6.96 | 2.208 | 86.2% |
-| replica\_gs\_valid | 400 | 0.682 | 0.01 | 0.000 | 79.7% |
-| — sparse | 142 | 0.690 | 0.01 | 0.000 | 70.2% |
-| — dense  | 219 | 0.799 | 0.01 | 0.000 | 100.0% |
-| 7scenes\_gs\_valid | 300 | 0.647 | 0.01 | 0.000 | 76.0% |
-| — sparse | 114 | 0.728 | 0.01 | 0.000 | 69.3% |
-| — dense  | 149 | 0.745 | 0.01 | 0.000 | 100.0% |
-
-### Dustbin fine-tuned model — `output/joint/dustbin_ft/best_val_checkpoint.pth`
-
-| Dataset | N | recall\_rot | med\_rot (°) | med\_trans (m) | inlier\_ratio |
-|---------|---|------------|-------------|---------------|--------------|
-| se3real\_sim3\_valid | 823 | **0.875** | 7.85 | 2.037 | 67.5% |
-| — sparse | 627 | 0.853 | 8.37 | 1.964 | 61.8% |
-| — dense  | 196 | 0.944 | 6.53 | 2.221 | 85.9% |
-| replica\_gs\_valid | 400 | 0.720 | 0.01 | 0.000 | 79.5% |
-| — sparse | 142 | 0.676 | 0.01 | 0.000 | 69.8% |
-| — dense  | 219 | 0.877 | 0.00 | 0.000 | 99.9% |
-| 7scenes\_gs\_valid | 300 | 0.657 | 0.01 | 0.000 | 75.7% |
-| — sparse | 114 | 0.702 | 0.01 | 0.000 | 68.6% |
-| — dense  | 149 | 0.785 | 0.01 | 0.000 | 100.0% |
-
-The dustbin model improves inlier ratio on replica_gs and 7scenes_gs dense pairs at a slight cost to se3real recall.

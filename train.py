@@ -48,7 +48,7 @@ import torch.optim.lr_scheduler as lr_sched
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 
-PLUECKERNET_DIR = os.path.join(os.path.dirname(__file__), '..', 'PlueckerNet')
+PLUECKERNET_DIR = os.path.join(os.path.dirname(__file__), 'PlueckerNet')
 sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
 sys.path.insert(0, os.path.dirname(__file__))
 

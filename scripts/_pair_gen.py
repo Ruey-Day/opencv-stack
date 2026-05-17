@@ -1,8 +1,5 @@
 """
-_pair_gen.py — shared pair-generation utilities for all dataset generators.
-
-Every generator imports this module in its subprocess worker to produce
-9D Plücker+LAB pairs with the same diversity policy.
+Shared pair-generation utilities for all dataset generators.
 
 Data format per pair:
   plucker1/2 : (N_TOTAL, 9) float32  — [m0,m1,m2, d0,d1,d2, L*,A*,B*]
@@ -10,25 +7,10 @@ Data format per pair:
   R_gt       : (3, 3) float32
   t_gt       : (3, 1) float32
   s_gt       : float32  — 0.0 signals zero-overlap (no GT pose)
-
-Diversity policy
-----------------
-Scale range  : (0.1, 10.0) — 2 orders of magnitude, log-uniform
-Overlap dist : discrete levels covering the full spectrum:
-    0%  → 12%  (zero overlap — s_gt = 0, empty matches)
-    5%  →  8%
-   10%  →  8%
-   20%  →  9%
-   30%  →  9%
-   50%  → 10%
-   70%  → 10%
-  100%  → 34%  (full overlap)
 """
 
 import numpy as np
 import cv2
-
-# ── Constants ──────────────────────────────────────────────────────────────────
 
 SCALE_RANGE   = (0.1, 10.0)
 N_TOTAL       = 700   # lines per pair
@@ -36,9 +18,6 @@ N_MAX_INLIERS = 490   # inliers when overlap = 100%
 
 OVERLAP_LEVELS = np.array([0.00, 0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.00])
 OVERLAP_PROBS  = np.array([0.12, 0.08, 0.08, 0.09, 0.09, 0.10, 0.10, 0.34])
-
-
-# ── Geometry ───────────────────────────────────────────────────────────────────
 
 def random_rotation():
     A = np.random.randn(3, 3).astype(np.float64)
@@ -48,7 +27,6 @@ def random_rotation():
         Q[:, 0] *= -1
     return Q.astype(np.float32)
 
-
 def apply_sim3(lines9, s, R, t):
     """Transform 9D lines by Sim(3); add illumination noise to LAB channel."""
     m, d, lab = lines9[:, :3], lines9[:, 3:6], lines9[:, 6:9]
@@ -56,7 +34,6 @@ def apply_sim3(lines9, s, R, t):
     m_new = s * (R @ m.T).T + np.cross(t.flatten()[None], d_new)
     noise = np.random.randn(*lab.shape).astype(np.float32) * np.array([3., 4., 4.])
     return np.concatenate([m_new, d_new, lab + noise], axis=1).astype(np.float32)
-
 
 def make_outliers(n, n_clusters=6, spread=0.15, pos_range=3.0):
     """Synthetic outlier 9D Plücker lines with random LAB."""
@@ -80,9 +57,6 @@ def make_outliers(n, n_clusters=6, spread=0.15, pos_range=3.0):
     lines = np.concatenate(parts, 0)
     return lines[np.random.permutation(len(lines))]
 
-
-# ── Color sampling ─────────────────────────────────────────────────────────────
-
 def sample_line_lab(bgr, ep, n_pts=15):
     """Average LAB color sampled along a 2D line segment.
 
@@ -98,22 +72,13 @@ def sample_line_lab(bgr, ep, n_pts=15):
     lab = cv2.cvtColor(pixels, cv2.COLOR_BGR2Lab).reshape(n_pts, 3)
     return lab.mean(axis=0).astype(np.float32)
 
-
-# ── Pool deduplication ────────────────────────────────────────────────────────
-
 def dedup_pool(pool, pos_voxel=0.10, dir_voxel=0.04):
     """NMS-style deduplication of world-space Plücker lines.
 
-    Lines stitched from multiple frames often detect the same 3D edge
-    repeatedly.  This removes near-duplicates using a voxel hash on
-    (closest-to-origin anchor, canonical direction).  Within each voxel cell
-    the line with the largest moment norm is kept — it is furthest from the
-    origin and therefore most geometrically discriminative.
+    The largest moment norm is kept because it is most geometrically discriminative.
 
-    - pos_voxel: spatial bin size in metres  (0.10 m ≈ 10 cm)
-    - dir_voxel: direction bin on unit sphere (0.04 ≈ 2.3°)
-
-    Typically reduces a 50k pool by 50–70%.
+    - pos_voxel: spatial bin size in metres
+    - dir_voxel: direction bin on unit sphere
     """
     if len(pool) == 0:
         return pool
@@ -129,8 +94,7 @@ def dedup_pool(pool, pos_voxel=0.10, dir_voxel=0.04):
 
     p0 = np.cross(d, m)          # (N, 3) closest-to-origin anchor
     m_norm = np.linalg.norm(m, axis=1)  # quality: larger = further off-axis
-
-    # Voxel keys
+    
     pk = np.floor(p0    / pos_voxel).astype(np.int32)  # (N, 3)
     dk = np.floor(d_can / dir_voxel).astype(np.int32)  # (N, 3)
 
@@ -144,9 +108,6 @@ def dedup_pool(pool, pos_voxel=0.10, dir_voxel=0.04):
     keep = np.array([v[1] for v in best.values()], dtype=np.int32)
     return pool[keep]
 
-
-# ── Pair generation ────────────────────────────────────────────────────────────
-
 def generate_pair(pool):
     """Generate one 9D training pair from a world-space line pool (N, 9).
 
@@ -159,7 +120,7 @@ def generate_pair(pool):
     overlap = float(np.random.choice(OVERLAP_LEVELS, p=OVERLAP_PROBS))
 
     if overlap == 0.0:
-        # Zero overlap: two independent random batches, no GT pose
+        # Two independent random batches, no GT pose
         l1 = make_outliers(N_TOTAL)
         l2 = make_outliers(N_TOTAL)
         return dict(
