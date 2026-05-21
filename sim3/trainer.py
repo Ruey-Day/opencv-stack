@@ -28,6 +28,7 @@ from lib.timer import AverageMeter, Timer
 from lib.loss import TotalLoss
 from sim3.ransac import run_ransac_sim3
 from sim3.ransac_grassmannian import ransac_sim3 as _ransac_g
+from sim3.differentiable_solver import soft_sim3, sim3_pose_loss
 
 
 class Sim3Trainer:
@@ -163,7 +164,6 @@ class Sim3Trainer:
 
             for _ in range(iter_size):
                 data_timer.tic()
-                # s_gt is not used in the correspondence loss
                 matches, plucker1, plucker2, R_gt, t_gt, s_gt = next(data_loader_iter)
                 data_time += data_timer.toc(average=False)
 
@@ -174,7 +174,15 @@ class Sim3Trainer:
                 prob_matrix, prior1, prior2 = self.model(plucker1, plucker2)
 
                 MatchLoss = TotalLoss().to(self.device)
-                loss = MatchLoss(prob_matrix, matches)
+                bce_loss  = MatchLoss(prob_matrix, matches)
+
+                pose_weight = getattr(self.config, 'pose_loss_weight', 0.0)
+                if pose_weight > 0.0:
+                    R_est, s_est, t_est, _ = soft_sim3(prob_matrix, plucker1, plucker2)
+                    p_loss = sim3_pose_loss(R_est, s_est, R_gt, s_gt)
+                    loss   = bce_loss + pose_weight * p_loss
+                else:
+                    loss = bce_loss
 
                 if not torch.isnan(loss).any():
                     loss.backward()
@@ -276,7 +284,7 @@ class Sim3Trainer:
                 else:
                     best_s, best_rot, best_trans, best_ic, best_ic_mask = run_ransac_sim3(
                         plucker1_topK.T, plucker2_topK.T,
-                        inlier_threshold=0.1,
+                        inlier_threshold=0.3,
                     )
 
                 if best_rot is not None and best_trans is not None and best_s is not None:
