@@ -209,7 +209,7 @@ Three changes applied before the next training run:
 **Resume command (from 2026-05-14 checkpoint with cosine LR):**
 ```bash
 nohup bash -c "source ~/miniconda3/etc/profile.d/conda.sh && conda activate torch5090 && \
-  cd /home/rueyday/scale-aware-PlueckerNet && \
+  cd /home/rueyday/scale-aware-cross-modal-registration/ScalePluckerNet && \
   python train.py --dataset joint --cosine_lr --metric recall_rot --ransac grassmannian \
     --pretrain output/joint/2026-05-14/best_val_checkpoint.pth \
     --name 2026-05-17" >> output/train_joint_v3.log 2>&1 &

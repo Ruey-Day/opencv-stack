@@ -10,9 +10,7 @@ Extensions over the original PlueckerNet (all opt-in via flags):
 
   --dataset         Controls the training data source.
                       semantic3D / structured3D  — original PlueckerNet indoor data (SE3, s=1)
-                      replica_gs                 — Replica RGBD, world-space GlueStick lines
-                      7scenes_gs                 — 7-Scenes RGBD, world-space GlueStick lines
-                      joint (default)            — all four sources combined
+                      joint (default)            — combined sources
 
   --dustbin         Adds a learnable dustbin token (SuperGlue-style) so unmatched
                     lines are assigned to the dustbin rather than forced onto wrong

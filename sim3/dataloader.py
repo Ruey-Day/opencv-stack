@@ -19,6 +19,10 @@ import pickle
 import numpy as np
 from torch.utils.data import Dataset
 
+from sim3.pair_generator import (
+    load_pool_from_db, generate_pair, generate_inter_map_pair,
+)
+
 
 def _load(path):
     with open(path, 'rb') as f:
@@ -109,3 +113,71 @@ class Sim3PluckerData(Dataset):
 
     def __len__(self):
         return self.len
+
+
+class LiveSim3PluckerData(Dataset):
+    """Online dataset: generates a fresh pair from DB pools on every __getitem__.
+
+    The model never sees the same (SIM3, subset, noise) combination twice,
+    eliminating memorisation of fixed training pairs. DB pools are loaded once
+    at startup; generation is CPU-only and fast (~0.5 ms per pair).
+
+    Args:
+        db_paths:        list of .db map files to load pools from
+        epoch_size:      number of pairs per epoch (defines __len__)
+        config:          training config (in_channel)
+        inter_map_ratio: fraction of pairs generated as cross-map (default 0.3)
+    """
+
+    def __init__(self, db_paths, epoch_size, config, inter_map_ratio=0.3):
+        super().__init__()
+        self.pools = []
+        for db in db_paths:
+            pool = load_pool_from_db(db)
+            if len(pool) >= 6:
+                self.pools.append(pool)
+        if not self.pools:
+            raise RuntimeError(f"No valid pools found in {db_paths}")
+        print(f"[LiveSim3] loaded {len(self.pools)} pools, epoch_size={epoch_size}, "
+              f"inter_map_ratio={inter_map_ratio}")
+
+        self.epoch_size      = epoch_size
+        self.inter_map_ratio = inter_map_ratio if len(self.pools) >= 2 else 0.0
+        self.in_channel      = getattr(config, 'in_channel', None)
+
+    def __getitem__(self, index):
+        a_idx  = index % len(self.pools)
+        pool_a = self.pools[a_idx]
+
+        pair = None
+        while pair is None:
+            if self.inter_map_ratio > 0 and np.random.random() < self.inter_map_ratio:
+                b_idx = np.random.choice([i for i in range(len(self.pools)) if i != a_idx])
+                pair  = generate_inter_map_pair(pool_a, self.pools[b_idx])
+            else:
+                pair = generate_pair(pool_a)
+
+        plucker1 = pair['plucker1']
+        plucker2 = pair['plucker2']
+        matches_ind = pair['matches']
+
+        if self.in_channel is not None:
+            plucker1 = plucker1[:, :self.in_channel]
+            plucker2 = plucker2[:, :self.in_channel]
+
+        n1, n2 = plucker1.shape[0], plucker2.shape[0]
+        matches = np.zeros([n1, n2], dtype=np.float32)
+        if matches_ind.shape[1] > 0:
+            matches[matches_ind[0], matches_ind[1]] = 1.0
+
+        return (
+            matches.astype('float32'),
+            plucker1.astype('float32'),
+            plucker2.astype('float32'),
+            pair['R_gt'].astype('float32'),
+            pair['t_gt'].astype('float32'),
+            np.float32(pair['s_gt']),
+        )
+
+    def __len__(self):
+        return self.epoch_size
