@@ -56,7 +56,7 @@ sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import get_config
-from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData
+from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData, FixedLiveSim3PluckerData
 from sim3.trainer import Sim3Trainer
 
 logging.basicConfig(
@@ -91,8 +91,13 @@ def parse_args():
     p.add_argument('--db_train',        nargs='+', default=None,
                    help='[live mode] Path(s) to Structure-PLP-SLAM .db map files. '
                         'Shell globs are expanded automatically.')
+    p.add_argument('--db_val',          nargs='+', default=None,
+                   help='[live mode] .db files for live validation (default: same as --db_train). '
+                        'Ignored when a static .pkl val split is found on disk.')
     p.add_argument('--epoch_size',      type=int, default=16000,
                    help='[live mode] Pairs generated per epoch (default: 16000)')
+    p.add_argument('--val_size',        type=int, default=400,
+                   help='[live mode] Val pairs generated when no .pkl split exists (default: 400)')
     p.add_argument('--inter_map_ratio', type=float, default=0.3,
                    help='[live mode] Fraction of cross-map pairs (default: 0.3)')
 
@@ -210,11 +215,26 @@ def main():
         num_workers=args.workers, pin_memory=True,
     )
 
-    # Validation always uses a static .pkl split
+    # Validation: prefer a static .pkl split; fall back to live generation
     val_cfg = edict(dict(configs))
     val_cfg.dataset = val_dataset
+    val_pkl_dir = os.path.join(args.data_dir, f'{val_dataset}_valid')
+
+    if os.path.isdir(val_pkl_dir):
+        val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
+    else:
+        logging.info(f'  No .pkl val split at {val_pkl_dir}')
+        logging.info(f'  Generating {args.val_size} fixed val pairs from .db files …')
+        val_db_paths = _expand_globs(args.db_val) if args.db_val else db_paths
+        val_dataset_obj = FixedLiveSim3PluckerData(
+            db_paths=val_db_paths,
+            val_size=args.val_size,
+            config=configs,
+            seed=42,
+        )
+
     val_loader = DataLoader(
-        Sim3PluckerData(phase='valid', config=val_cfg),
+        val_dataset_obj,
         batch_size=1, shuffle=False, drop_last=False,
         num_workers=2,
     )
@@ -244,6 +264,18 @@ def main():
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
             trainer.optimizer, T_0=50, T_mult=2, eta_min=1e-6,
         )
+        # The trainer.__init__ already loaded the checkpoint into the old ExponentialLR
+        # scheduler, then we replaced it above — re-apply the saved state so the LR
+        # continues from where scratch-v1 left off rather than resetting to base_lr.
+        if args.resume and os.path.exists(args.resume):
+            ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
+            if 'scheduler' in ckpt:
+                try:
+                    trainer.scheduler.load_state_dict(ckpt['scheduler'])
+                    logging.info(f'Restored cosine scheduler state (last_epoch={ckpt["scheduler"].get("last_epoch")}, '
+                                 f'lr={ckpt["scheduler"].get("_last_lr")})')
+                except Exception as e:
+                    logging.warning(f'Could not restore scheduler state: {e}')
         logging.info('Scheduler: CosineAnnealingWarmRestarts(T_0=50, T_mult=2)')
 
     trainer.train()

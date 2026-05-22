@@ -1,10 +1,14 @@
 """
 Dataloader for Sim(3) Plücker line datasets.
 
-Extends the original PluckerData3D_precompute (lib/dataloader.py) to also
-load the ground-truth scale s_gt that is absent in the SE(3) version.
+Three dataset classes are provided:
 
-Expected directory layout:
+  Sim3PluckerData        — static .pkl files (pre-generated offline)
+  LiveSim3PluckerData    — online pair generation from .db pools (training)
+  FixedLiveSim3PluckerData — same generation but deterministic, for validation
+                             when no .pkl files are available
+
+Expected .pkl layout:
     <data_dir>/<dataset>_train/
         matches.pkl     list of (2, n_inliers)  int32 arrays
         plucker1.pkl    list of (n_lines, 6)    float32 arrays
@@ -181,3 +185,74 @@ class LiveSim3PluckerData(Dataset):
 
     def __len__(self):
         return self.epoch_size
+
+
+class FixedLiveSim3PluckerData(Dataset):
+    """Validation-time live dataset: generates a fixed set of pairs at
+    construction time with a deterministic seed, then serves from memory.
+
+    Identical generation logic to LiveSim3PluckerData, but the entire val set
+    is produced once at startup so validation metrics are comparable across
+    epochs — no .pkl files required.
+
+    Args:
+        db_paths:   list of .db map files to load pools from
+        val_size:   number of pairs to generate (default 400)
+        config:     training config (in_channel)
+        seed:       RNG seed for reproducibility (default 42)
+    """
+
+    def __init__(self, db_paths, val_size=400, config=None, seed=42):
+        super().__init__()
+        pools = []
+        for db in db_paths:
+            pool = load_pool_from_db(db)
+            if len(pool) >= 6:
+                pools.append(pool)
+        if not pools:
+            raise RuntimeError(f"No valid pools found in {db_paths}")
+
+        in_channel = getattr(config, 'in_channel', None) if config else None
+
+        np.random.seed(seed)
+        self.cache = []
+        n_ok = 0
+        attempts = 0
+        while n_ok < val_size and attempts < val_size * 10:
+            attempts += 1
+            pool = pools[n_ok % len(pools)]
+            pair = generate_pair(pool)
+            if pair is None:
+                continue
+
+            plucker1    = pair['plucker1']
+            plucker2    = pair['plucker2']
+            matches_ind = pair['matches']
+
+            if in_channel is not None:
+                plucker1 = plucker1[:, :in_channel]
+                plucker2 = plucker2[:, :in_channel]
+
+            n1, n2  = plucker1.shape[0], plucker2.shape[0]
+            matches = np.zeros([n1, n2], dtype=np.float32)
+            if matches_ind.shape[1] > 0:
+                matches[matches_ind[0], matches_ind[1]] = 1.0
+
+            self.cache.append((
+                matches.astype('float32'),
+                plucker1.astype('float32'),
+                plucker2.astype('float32'),
+                pair['R_gt'].astype('float32'),
+                pair['t_gt'].astype('float32'),
+                np.float32(pair['s_gt']),
+            ))
+            n_ok += 1
+
+        print(f"[FixedLive] generated {len(self.cache)} val pairs from "
+              f"{len(pools)} pools (seed={seed})")
+
+    def __getitem__(self, index):
+        return self.cache[index]
+
+    def __len__(self):
+        return len(self.cache)
