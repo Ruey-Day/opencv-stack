@@ -1,7 +1,5 @@
 __pycache__/
-.claude/
 results/
 output/
 dataset/
 CLAUDE.md
-TRAINING_HISTORY.md

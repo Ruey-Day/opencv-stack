@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 register.py
 ===========
@@ -131,7 +130,7 @@ def register(db_src: str, db_tgt: str, ckpt_path: str,
 def main():
     DEFAULT_CKPT = os.path.join(
         SCRIPT_DIR, "output", "slam_map",
-        "2026-05-21-slam-maps-v16", "best_val_checkpoint.pth",
+        "2026-05-20-slam-maps-v14", "best_val_checkpoint.pth",
     )
 
     ap = argparse.ArgumentParser(description="Register two SLAM line maps via ScalePluckerNet.")

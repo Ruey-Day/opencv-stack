@@ -260,13 +260,21 @@ def main():
         logging.warning(f'Pretrain not found: {args.pretrain}')
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
+    # After trainer.__init__ loads the checkpoint, the scheduler state from the
+    # checkpoint is applied to whatever scheduler type was just created. This
+    # contaminates the new scheduler (e.g. ExponentialLR gets CAWR's _last_lr).
+    # Always reset optimizer param_group LRs to the requested args.lr so that
+    # the actual training LR matches what was specified on the command line.
+    for pg in trainer.optimizer.param_groups:
+        pg['lr'] = args.lr
+    # Reinitialise the default ExponentialLR from scratch so it starts clean.
+    trainer.scheduler = lr_sched.ExponentialLR(trainer.optimizer,
+                                               gamma=trainer.config.exp_gamma)
+
     if args.cosine_lr:
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
             trainer.optimizer, T_0=50, T_mult=2, eta_min=1e-6,
         )
-        # The trainer.__init__ already loaded the checkpoint into the old ExponentialLR
-        # scheduler, then we replaced it above — re-apply the saved state so the LR
-        # continues from where scratch-v1 left off rather than resetting to base_lr.
         if args.resume and os.path.exists(args.resume):
             ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
             if 'scheduler' in ckpt:

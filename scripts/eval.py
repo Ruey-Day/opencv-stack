@@ -1,12 +1,4 @@
-#!/usr/bin/env python3
 """
-eval.py — unified ScalePluckerNet evaluation entry point.
-
-Replaces both eval_checkpoint.py and scripts/eval.py.
-
-Usage
------
-# Cross-dataset evaluation with per-overlap breakdown:
 python eval.py --checkpoint output/joint/.../best_val_checkpoint.pth \\
     --dataset replica_gs,7scenes_gs,se3real_sim3
 
@@ -36,13 +28,11 @@ from easydict import EasyDict as edict
 warnings.filterwarnings('ignore')
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, 'PlueckerNet'))
-sys.path.insert(0, SCRIPT_DIR)
+ROOT_DIR   = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, 'PlueckerNet'))
+sys.path.insert(0, ROOT_DIR)
 
 from sim3.dataloader import Sim3PluckerData
-
-
-# ── Model loading ─────────────────────────────────────────────────────────────
 
 class _DustbinWrapper(nn.Module):
     """Strips dustbin row/col so the caller sees a standard (B, N, M) matrix."""
@@ -54,12 +44,9 @@ class _DustbinWrapper(nn.Module):
         P_aug, r, c = self.inner(p1, p2)
         return P_aug[:, :-1, :-1], r, c
 
-
 _NEUTRAL_LAB = torch.tensor([50.0, 0.0, 0.0])
 
-
 class _Pad6Dto9DWrapper(nn.Module):
-    """Pads 6D Plücker input to 9D with a neutral LAB colour."""
     def __init__(self, model):
         super().__init__()
         self.inner = model
@@ -70,7 +57,6 @@ class _Pad6Dto9DWrapper(nn.Module):
             p1 = torch.cat([p1, pad.expand(p1.shape[0], p1.shape[1], 3)], dim=-1)
             p2 = torch.cat([p2, pad.expand(p2.shape[0], p2.shape[1], 3)], dim=-1)
         return self.inner(p1, p2)
-
 
 def _build_config(checkpoint_path, data_dir, dataset):
     """Load config embedded in checkpoint; fall back to safe defaults."""
@@ -112,21 +98,15 @@ def _load_model(cfg, ckpt, device):
         model.load_state_dict(sd, strict=False)
         return model
 
-
-# ── Error metrics ─────────────────────────────────────────────────────────────
-
 def _rot_err_deg(R_est, R_gt):
     tr = np.clip((np.trace(R_est @ R_gt.T) - 1) / 2, -1, 1)
     return float(np.degrees(np.arccos(tr)))
 
-
 def _scale_err_log(s_est, s_gt):
     return float(abs(np.log(max(float(s_est), 1e-6)) - np.log(max(float(s_gt), 1e-6))))
 
-
 def _trans_err(t_est, t_gt):
     return float(np.linalg.norm(np.asarray(t_est).flatten() - np.asarray(t_gt).flatten()))
-
 
 def _overlap_bucket(n_inliers):
     if n_inliers == 0:
@@ -134,9 +114,6 @@ def _overlap_bucket(n_inliers):
     if n_inliers <= 200:
         return 'sparse (~30%)'
     return 'dense (~70%)'
-
-
-# ── Model inference pass (runs once per dataset) ──────────────────────────────
 
 def _run_inference(model, val_loader, device, max_pairs):
     """Run model forward on all val pairs; cache top-K correspondences."""
@@ -171,9 +148,6 @@ def _run_inference(model, val_loader, device, max_pairs):
             torch.cuda.empty_cache()
     return cache
 
-
-# ── RANSAC evaluation over cached correspondences ────────────────────────────
-
 def _eval_cached(cache, run_ransac_fn):
     """Run RANSAC over pre-cached correspondences; return per-scene metrics."""
     all_rot, all_trans, all_scale, all_ir = [], [], [], []
@@ -206,9 +180,6 @@ def _eval_cached(cache, run_ransac_fn):
 
     return all_rot, all_trans, all_scale, all_ir, buckets
 
-
-# ── Summary statistics ─────────────────────────────────────────────────────────
-
 def _summarise(rot, trans, scale, ir):
     rots  = np.array(rot)
     trans_fin = np.array([x for x in trans if np.isfinite(x)])
@@ -229,7 +200,6 @@ def _summarise(rot, trans, scale, ir):
         avg_inlier_ratio = float(np.mean(ir)),
         n_pairs          = len(rot),
     )
-
 
 def _print_bucket_table(buckets):
     header = ['no_overlap (0%)', 'sparse (~30%)', 'dense (~70%)']
@@ -253,9 +223,6 @@ def _print_bucket_table(buckets):
         print(f"  {b:<{w}} {d['n']:>5} {recall:>10.3f} {med_r:>9.2f} "
               f"{med_t:>10.3f} {med_s:>10.3f} {avg_ir:>7.1f}%")
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 def parse_args():
     p = argparse.ArgumentParser(description='ScalePlueckerNet unified evaluation')
     p.add_argument('--checkpoint', required=True, help='Path to .pth checkpoint')
@@ -277,7 +244,6 @@ def parse_args():
                    help='Directory for JSON result files')
     p.add_argument('--label',      default=None, help='Human-readable label for results')
     return p.parse_args()
-
 
 def main():
     args   = parse_args()
@@ -383,8 +349,7 @@ def main():
                           f, indent=2)
             print(f'\n  Results saved: {out_f}')
             all_results[dataset] = m
-
-    # Summary table when evaluating multiple datasets
+    
     if len(all_results) > 1:
         print(f'\n{"="*75}')
         print(f'{"Dataset":<20} {"recall_rot":>10} {"med_rot (°)":>12} '
@@ -394,7 +359,6 @@ def main():
             print(f'{ds:<20} {m["recall_rot"]:>10.3f} {m["med_rot"]:>12.2f} '
                   f'{m["med_trans"]:>14.3f} {m["avg_inlier_ratio"]:>12.1f}%')
         print(f'{"="*75}')
-
 
 if __name__ == '__main__':
     main()
