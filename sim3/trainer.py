@@ -1,6 +1,4 @@
 """
-Sim(3) trainer for PlueckerNet.
-
 Differences from the original trainer_plucker.py:
   - Data batches include s_gt (ground-truth scale).
   - Validation uses run_ransac_sim3 instead of run_ransac.
@@ -21,7 +19,7 @@ import torch
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 
-# Original PlueckerNet utilities (imported via sys.path set in train_sim3.py)
+# Original PlueckerNet utilities
 from lib.utils import load_model
 from lib.file import ensure_dir
 from lib.timer import AverageMeter, Timer
