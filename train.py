@@ -20,19 +20,21 @@ script.  Cross-modal / SLAM-map fine-tuning is now done via --mode live with
 Examples
 --------
 # Standard training on the joint dataset:
-python train.py --dataset joint --batch 32 --lr 5e-4
+python train.py --dataset joint --batch 32 --lr 5e-4 --gamma 0.99
+
+# From scratch on SLAM-map live data (all available maps):
+python train.py --mode live \\
+    --db_train ../Structure-PLP-SLAM/*.db \\
+    --val_dataset slam_map \\
+    --lr 5e-4 --gamma 0.99 --batch 32 --epochs 1000
 
 # Fine-tune on live SLAM-map pairs starting from a joint checkpoint:
 python train.py --mode live \\
     --db_train /path/to/Structure-PLP-SLAM/*.db \\
     --val_dataset slam_map \\
     --n_lines 200 --n_inliers 60 \\
-    --pretrain output/joint/2026-05-12/best_val_checkpoint.pth \\
+    --pretrain output/joint/2026-05-17/best_val_checkpoint.pth \\
     --lr 1e-5 --batch 16 --epochs 300
-
-# Dustbin fine-tuning:
-python train.py --dataset joint --dustbin \\
-    --pretrain output/joint/2026-05-12/best_val_checkpoint.pth --lr 2e-4
 
 # Resume any run:
 python train.py --dataset joint --resume output/joint/2026-05-12/checkpoint.pth
@@ -56,7 +58,7 @@ sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import get_config
-from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData, FixedLiveSim3PluckerData
+from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData
 from sim3.trainer import Sim3Trainer
 
 logging.basicConfig(
@@ -102,9 +104,11 @@ def parse_args():
                    help='[live mode] Fraction of cross-map pairs (default: 0.3)')
 
     # Training
-    p.add_argument('--epochs',     type=int,   default=400)
+    p.add_argument('--epochs',     type=int,   default=1000)
     p.add_argument('--batch',      type=int,   default=32)
     p.add_argument('--lr',         type=float, default=5e-4)
+    p.add_argument('--gamma',      type=float, default=0.99,
+                   help='ExponentialLR decay per epoch (default: 0.99). Use 1.0 to disable.')
     p.add_argument('--gpu',        type=int,   default=0)
     p.add_argument('--workers',    type=int,   default=8)
     p.add_argument('--name',       default=None,
@@ -113,8 +117,6 @@ def parse_args():
     # Extensions
     p.add_argument('--in_channel', type=int, default=6,
                    help='6=geometry only (default)  9=Plücker+LAB color')
-    p.add_argument('--dustbin',    action='store_true',
-                   help='Enable learnable dustbin token for partial-overlap robustness')
     p.add_argument('--cosine_lr',  action='store_true',
                    help='CosineAnnealingWarmRestarts instead of ExponentialLR')
     p.add_argument('--pose_loss',  type=float, default=0.0,
@@ -163,6 +165,7 @@ def main():
     configs.model_nb            = args.name if args.name else str(date.today())
     configs.train_batch_size    = args.batch
     configs.train_lr            = args.lr
+    configs.exp_gamma           = args.gamma
     configs.train_epoches       = args.epochs
     configs.best_val_metric     = args.metric
     configs.ransac_type         = args.ransac
@@ -187,7 +190,6 @@ def main():
     logging.info(f'  dataset     : {args.dataset}')
     logging.info(f'  val_dataset : {val_dataset}')
     logging.info(f'  in_channel  : {args.in_channel}')
-    logging.info(f'  dustbin     : {args.dustbin}')
     logging.info(f'  cosine_lr   : {args.cosine_lr}')
     logging.info(f'  ransac      : {args.ransac}')
     logging.info(f'  metric      : {args.metric}')
@@ -220,18 +222,7 @@ def main():
     val_cfg.dataset = val_dataset
     val_pkl_dir = os.path.join(args.data_dir, f'{val_dataset}_valid')
 
-    if os.path.isdir(val_pkl_dir):
-        val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
-    else:
-        logging.info(f'  No .pkl val split at {val_pkl_dir}')
-        logging.info(f'  Generating {args.val_size} fixed val pairs from .db files …')
-        val_db_paths = _expand_globs(args.db_val) if args.db_val else db_paths
-        val_dataset_obj = FixedLiveSim3PluckerData(
-            db_paths=val_db_paths,
-            val_size=args.val_size,
-            config=configs,
-            seed=42,
-        )
+    val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
 
     val_loader = DataLoader(
         val_dataset_obj,
@@ -240,11 +231,7 @@ def main():
     )
 
     # ── Build trainer ─────────────────────────────────────────────────────────
-    if args.dustbin:
-        from sim3.trainer_dustbin import DustbinTrainer
-        trainer = DustbinTrainer(configs, train_loader, val_loader)
-    else:
-        trainer = Sim3Trainer(configs, train_loader, val_loader)
+    trainer = Sim3Trainer(configs, train_loader, val_loader)
 
     # ── Load pretrained weights (non-strict, for fine-tuning) ─────────────────
     if args.pretrain and os.path.exists(args.pretrain):

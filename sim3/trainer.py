@@ -45,6 +45,7 @@ class Sim3Trainer:
         self.best_val_metric = config.best_val_metric
         self.best_val_epoch  = -np.inf
         self.best_val        = -np.inf
+        self.curriculum_ir   = 0.0   # current val avg_inlier_ratio driving curriculum
 
         if config.use_gpu and not torch.cuda.is_available():
             raise ValueError('GPU not available but cuda flag set')
@@ -111,6 +112,7 @@ class Sim3Trainer:
             if self.test_valid and epoch % self.val_epoch_freq == 0:
                 with torch.no_grad():
                     val_dict = self._valid_epoch()
+                self.curriculum_ir = val_dict.get('avg_inlier_ratio', 0.0)
                 for k, v in val_dict.items():
                     self.writer.add_scalar(f'val/{k}', v, epoch)
                 if self.best_val < val_dict[self.best_val_metric]:
@@ -144,6 +146,9 @@ class Sim3Trainer:
 
     def _train_epoch(self, epoch):
         gc.collect()
+        ds = self.data_loader.dataset
+        if hasattr(ds, 'set_curriculum_phase'):
+            ds.set_curriculum_phase(self.curriculum_ir / 100.0)
         self.model.train()
         total_loss, total_num = 0.0, 0.0
 
