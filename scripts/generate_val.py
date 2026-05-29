@@ -24,8 +24,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--db', nargs='+', required=True,
-                   help='.db map files to generate validation pairs from '
-                        '(shell globs expanded)')
+                   help='.db map files to generate validation pairs')
     p.add_argument('--n', type=int, default=800,
                    help='Number of validation pairs (default: 800)')
     p.add_argument('--name', default='slam_map',
@@ -35,8 +34,7 @@ def main():
     p.add_argument('--seed', type=int, default=42,
                    help='RNG seed for reproducibility (default: 42)')
     args = p.parse_args()
-
-    # Expand globs
+    
     db_paths = []
     for pat in args.db:
         hits = sorted(glob.glob(pat))
@@ -47,8 +45,7 @@ def main():
 
     print(f'\nGenerating {args.name}_valid ({args.n} pairs, seed={args.seed})')
     print(f'Output: {out_dir}\n')
-
-    # Load pools
+    
     pools = []
     for db in db_paths:
         pool = load_pool_from_db(db)
@@ -59,8 +56,7 @@ def main():
 
     if not pools:
         sys.exit('[ERROR] No valid pools found.')
-
-    # Generate pairs with fixed seed
+    
     np.random.seed(args.seed)
     keys  = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']
     pairs = {k: [] for k in keys}
@@ -74,8 +70,7 @@ def main():
         for k in keys:
             pairs[k].append(pair[k])
         n_ok += 1
-
-    # Save
+    
     for k, v in pairs.items():
         with open(os.path.join(out_dir, f'{k}.pkl'), 'wb') as f:
             pickle.dump(v, f, protocol=4)

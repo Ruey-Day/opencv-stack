@@ -22,6 +22,29 @@ SLAM_RATIO_MAX = 0.60
 OVERLAP_LEVELS = np.array([0.00, 0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 0.90, 1.00])
 OVERLAP_PROBS  = np.array([0.10, 0.10, 0.12, 0.12, 0.12, 0.12, 0.12, 0.10, 0.10])
 
+# Curriculum schedules: easy → mid → hard (= OVERLAP_PROBS)
+# Easy: dense pairs dominate so the network gets strong gradient signal early
+# Mid: balanced, introduces sparser pairs
+# Hard: full distribution including lots of zero/near-zero overlap
+_OVERLAP_PROBS_EASY = np.array([0.02, 0.02, 0.04, 0.07, 0.10, 0.20, 0.25, 0.20, 0.10])
+_OVERLAP_PROBS_MID  = np.array([0.05, 0.06, 0.08, 0.10, 0.13, 0.16, 0.16, 0.14, 0.12])
+
+
+def get_curriculum_probs(phase_frac: float) -> np.ndarray:
+    """Return overlap probabilities for a given training phase fraction [0, 1].
+
+    0.0–0.3  : easy → mid  (dense pairs first)
+    0.3–1.0  : mid  → hard (gradually introduce sparse/zero-overlap)
+    """
+    if phase_frac < 0.3:
+        t = phase_frac / 0.3
+        probs = (1.0 - t) * _OVERLAP_PROBS_EASY + t * _OVERLAP_PROBS_MID
+    else:
+        t = (phase_frac - 0.3) / 0.7
+        probs = (1.0 - t) * _OVERLAP_PROBS_MID + t * OVERLAP_PROBS
+    probs = np.clip(probs, 0.0, None)
+    return (probs / probs.sum()).astype(np.float64)
+
 
 # ── DB loader ─────────────────────────────────────────────────────────────────
 
@@ -162,11 +185,12 @@ def _build_pair(rgbd_in: np.ndarray, n_rgbd: int,
 
 # ── Public generators ─────────────────────────────────────────────────────────
 
-def generate_pair(pool6: np.ndarray) -> dict | None:
+def generate_pair(pool6: np.ndarray, overlap_probs=None) -> dict | None:
     """Intra-map pair: both sides derived from the same pool."""
     if len(pool6) < 6:
         return None
-    overlap = float(np.random.choice(OVERLAP_LEVELS, p=OVERLAP_PROBS))
+    probs = OVERLAP_PROBS if overlap_probs is None else overlap_probs
+    overlap = float(np.random.choice(OVERLAP_LEVELS, p=probs))
     if overlap == 0.0:
         return _zero_overlap_pair()
     n_rgbd = max(4, min(int(round(overlap * len(pool6))), N_P2_TOTAL))
@@ -176,11 +200,13 @@ def generate_pair(pool6: np.ndarray) -> dict | None:
     return _build_pair(pool6[idx_rgbd].copy(), n_rgbd, pool_filler_slam=None)
 
 
-def generate_inter_map_pair(pool_a: np.ndarray, pool_b: np.ndarray) -> dict | None:
+def generate_inter_map_pair(pool_a: np.ndarray, pool_b: np.ndarray,
+                             overlap_probs=None) -> dict | None:
     """Cross-map pair: inliers from pool_a, SLAM-side outlier filler from pool_b."""
     if len(pool_a) < 6 or len(pool_b) < 4:
         return None
-    overlap = float(np.random.choice(OVERLAP_LEVELS, p=OVERLAP_PROBS))
+    probs = OVERLAP_PROBS if overlap_probs is None else overlap_probs
+    overlap = float(np.random.choice(OVERLAP_LEVELS, p=probs))
     if overlap == 0.0:
         return _zero_overlap_pair()
     n_rgbd = max(4, min(int(round(overlap * len(pool_a))), N_P2_TOTAL))

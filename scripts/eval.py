@@ -1,14 +1,10 @@
 """
-python eval.py --checkpoint output/joint/.../best_val_checkpoint.pth \\
-    --dataset replica_gs,7scenes_gs,se3real_sim3
+python eval.py --checkpoint output/joint/2026-05-17/best_val_checkpoint.pth \\
+    --dataset slam_map,7scenes,replica
 
 # Single dataset, single threshold:
-python eval.py --checkpoint output/slam_map/.../best_val_checkpoint.pth \\
+python eval.py --checkpoint output/slam_map/2026-05-20-slam-maps-v14/best_val_checkpoint.pth \\
     --dataset slam_map --threshold 0.5
-
-# Sweep RANSAC thresholds (faster: model runs once, RANSAC re-run per threshold):
-python eval.py --checkpoint output/slam_map/.../best_val_checkpoint.pth \\
-    --dataset slam_map --sweep
 
 # Grassmannian RANSAC backend:
 python eval.py --checkpoint ... --dataset slam_map --ransac grassmannian
@@ -21,7 +17,6 @@ import warnings
 import argparse
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 
@@ -33,30 +28,6 @@ sys.path.insert(0, os.path.join(ROOT_DIR, 'PlueckerNet'))
 sys.path.insert(0, ROOT_DIR)
 
 from sim3.dataloader import Sim3PluckerData
-
-class _DustbinWrapper(nn.Module):
-    """Strips dustbin row/col so the caller sees a standard (B, N, M) matrix."""
-    def __init__(self, model):
-        super().__init__()
-        self.inner = model
-
-    def forward(self, p1, p2):
-        P_aug, r, c = self.inner(p1, p2)
-        return P_aug[:, :-1, :-1], r, c
-
-_NEUTRAL_LAB = torch.tensor([50.0, 0.0, 0.0])
-
-class _Pad6Dto9DWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.inner = model
-
-    def forward(self, p1, p2):
-        if p1.shape[-1] == 6:
-            pad = _NEUTRAL_LAB.to(p1.device).view(1, 1, 3)
-            p1 = torch.cat([p1, pad.expand(p1.shape[0], p1.shape[1], 3)], dim=-1)
-            p2 = torch.cat([p2, pad.expand(p2.shape[0], p2.shape[1], 3)], dim=-1)
-        return self.inner(p1, p2)
 
 def _build_config(checkpoint_path, data_dir, dataset):
     """Load config embedded in checkpoint; fall back to safe defaults."""
@@ -80,23 +51,13 @@ def _build_config(checkpoint_path, data_dir, dataset):
     cfg.model_nb = 'eval'
     return cfg, ckpt
 
-
 def _load_model(cfg, ckpt, device):
     from lib.utils import load_model as _lm
     sd = ckpt.get('state_dict', ckpt.get('model', ckpt))
-    is_dustbin = any('bin_dist' in k or 'bin_score' in k for k in sd)
-
-    if is_dustbin:
-        from sim3.model_dustbin import PluckerNetKnnDustbin
-        model = PluckerNetKnnDustbin(cfg)
-        model.load_state_dict(sd, strict=True)
-        print('  (dustbin checkpoint — wrapping for eval)')
-        return _DustbinWrapper(model)
-    else:
-        Model = _lm('PluckerNetKnn')
-        model = Model(cfg)
-        model.load_state_dict(sd, strict=False)
-        return model
+    Model = _lm('PluckerNetKnn')
+    model = Model(cfg)
+    model.load_state_dict(sd, strict=False)
+    return model
 
 def _rot_err_deg(R_est, R_gt):
     tr = np.clip((np.trace(R_est @ R_gt.T) - 1) / 2, -1, 1)
@@ -116,7 +77,7 @@ def _overlap_bucket(n_inliers):
     return 'dense (~70%)'
 
 def _run_inference(model, val_loader, device, max_pairs):
-    """Run model forward on all val pairs; cache top-K correspondences."""
+    """Run model on all val pairs; cache top-K correspondences."""
     model.eval()
     cache = []
     with torch.no_grad():
@@ -124,7 +85,6 @@ def _run_inference(model, val_loader, device, max_pairs):
             if max_pairs and i >= max_pairs:
                 break
             matches, p1, p2, R_gt, t_gt, s_gt = batch
-
             prob, _, _ = model(p1.to(device), p2.to(device))
 
             k = min(100, prob.shape[1] * prob.shape[2])
@@ -228,14 +188,11 @@ def parse_args():
     p.add_argument('--checkpoint', required=True, help='Path to .pth checkpoint')
     p.add_argument('--dataset',    default='slam_map',
                    help='Comma-separated val split names (default: slam_map)')
-    p.add_argument('--data_dir',   default=os.path.join(SCRIPT_DIR, 'dataset'))
+    p.add_argument('--data_dir',   default=os.path.join(ROOT_DIR, 'dataset'))
     p.add_argument('--ransac',     default='sim3', choices=['sim3', 'grassmannian'],
                    help='RANSAC backend (default: sim3)')
-    p.add_argument('--threshold',  type=float, default=None,
-                   help='Single inlier threshold (default: 0.3 unless --sweep is set)')
-    p.add_argument('--sweep',      action='store_true',
-                   help='Sweep over [0.1, 0.3, 0.5, 1.0] thresholds. '
-                        'Model runs once; only RANSAC is re-run per threshold.')
+    p.add_argument('--threshold',  type=float, default=0.3,
+                   help='Inlier threshold (default: 0.3)')
     p.add_argument('--n_iter',     type=int, default=500,
                    help='RANSAC iterations per hypothesis (default: 500)')
     p.add_argument('--max_pairs',  type=int, default=800,
@@ -249,11 +206,9 @@ def main():
     args   = parse_args()
     device = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device('cpu')
 
-    datasets   = [d.strip() for d in args.dataset.split(',')]
-    thresholds = [args.threshold] if args.threshold else \
-                 ([0.1, 0.3, 0.5, 1.0] if args.sweep else [0.3])
-
-    # Build a threshold-aware RANSAC wrapper
+    datasets  = [d.strip() for d in args.dataset.split(',')]
+    threshold = args.threshold
+    
     if args.ransac == 'grassmannian':
         from sim3.ransac_grassmannian import ransac_sim3 as _rg
         def _make_ransac(thr):
@@ -291,64 +246,38 @@ def main():
 
         model = _load_model(cfg, ckpt, device)
 
-        # Handle 9D checkpoint evaluated on a 6D dataset
-        ckpt_ch  = getattr(cfg, 'in_channel', 6)
-        sample   = next(iter(val_loader))[1]
-        data_ch  = sample.shape[-1]
-        if ckpt_ch == 9 and data_ch == 6:
-            print('  (9D checkpoint on 6D dataset — padding with neutral LAB)')
-            model = _Pad6Dto9DWrapper(model)
-
         model = model.to(device)
 
-        # Run model inference once for this dataset
         print(f'  Running model inference (max {args.max_pairs} pairs)…')
         cache = _run_inference(model, val_loader, device, args.max_pairs)
         print(f'  Cached {len(cache)} pairs')
 
-        if len(thresholds) > 1:
-            # Threshold sweep — model already ran, only RANSAC varies
-            print(f'\n{"threshold":>10s}  {"recall_rot":>10s}  {"<5°":>6s}  '
-                  f'{"<10°":>6s}  {"<20°":>6s}  {"med_rot":>8s}  '
-                  f'{"med_s_err":>9s}  {"inlier%":>7s}')
-            print('-' * 80)
-            for thr in thresholds:
-                rot, trans, scale, ir, _ = _eval_cached(cache, _make_ransac(thr))
-                m = _summarise(rot, trans, scale, ir)
-                print(f'{thr:>10.3f}  {m["recall_rot"]:>10.3f}  '
-                      f'{m["pct_lt5"]:>6.3f}  {m["pct_lt10"]:>6.3f}  '
-                      f'{m["pct_lt20"]:>6.3f}  {m["med_rot"]:>8.1f}°  '
-                      f'{m["med_scale_err"]:>9.3f}  '
-                      f'{m["avg_inlier_ratio"]:>7.1f}%  (n={m["n_pairs"]})')
-        else:
-            # Single threshold — full breakdown + JSON output
-            thr = thresholds[0]
-            rot, trans, scale, ir, buckets = _eval_cached(cache, _make_ransac(thr))
-            m = _summarise(rot, trans, scale, ir)
+        rot, trans, scale, ir, buckets = _eval_cached(cache, _make_ransac(threshold))
+        m = _summarise(rot, trans, scale, ir)
 
-            print(f'\n  Overall ({m["n_pairs"]} scenes):')
-            print(f'    recall_rot={m["recall_rot"]:.3f}  '
-                  f'med_rot={m["med_rot"]:.2f}°  '
-                  f'med_trans={m["med_trans"]:.3f}  '
-                  f'med_s_err={m["med_scale_err"]:.3f}  '
-                  f'inlier%={m["avg_inlier_ratio"]:.1f}%')
-            _print_bucket_table(buckets)
+        print(f'\n  Overall ({m["n_pairs"]} scenes):')
+        print(f'    recall_rot={m["recall_rot"]:.3f}  '
+              f'med_rot={m["med_rot"]:.2f}°  '
+              f'med_trans={m["med_trans"]:.3f}  '
+              f'med_s_err={m["med_scale_err"]:.3f}  '
+              f'inlier%={m["avg_inlier_ratio"]:.1f}%')
+        _print_bucket_table(buckets)
 
-            os.makedirs(args.out_dir, exist_ok=True)
-            label = args.label or (
-                f'{os.path.basename(os.path.dirname(args.checkpoint))} → {dataset}'
-            )
-            safe    = label.replace(' ', '_').replace('/', '-').replace('→', 'on')
-            out_f   = os.path.join(args.out_dir, f'{safe}.json')
-            with open(out_f, 'w') as f:
-                json.dump({'label': label, 'checkpoint': args.checkpoint,
-                           'dataset': dataset, 'threshold': thr,
-                           'ransac': args.ransac, 'metrics': m,
-                           'by_overlap': {b: {k: v for k, v in d.items() if k != 'n'}
-                                          for b, d in buckets.items()}},
-                          f, indent=2)
-            print(f'\n  Results saved: {out_f}')
-            all_results[dataset] = m
+        os.makedirs(args.out_dir, exist_ok=True)
+        label = args.label or (
+            f'{os.path.basename(os.path.dirname(args.checkpoint))} → {dataset}'
+        )
+        safe  = label.replace(' ', '_').replace('/', '-').replace('→', 'on')
+        out_f = os.path.join(args.out_dir, f'{safe}.json')
+        with open(out_f, 'w') as f:
+            json.dump({'label': label, 'checkpoint': args.checkpoint,
+                       'dataset': dataset, 'threshold': threshold,
+                       'ransac': args.ransac, 'metrics': m,
+                       'by_overlap': {b: {k: v for k, v in d.items() if k != 'n'}
+                                      for b, d in buckets.items()}},
+                      f, indent=2)
+        print(f'\n  Results saved: {out_f}')
+        all_results[dataset] = m
     
     if len(all_results) > 1:
         print(f'\n{"="*75}')
