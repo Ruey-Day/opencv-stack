@@ -157,10 +157,12 @@ class LiveSim3PluckerData(Dataset):
     def __init__(self, db_paths, epoch_size, config,
                  inter_map_ratio=0.3, mode='symmetric'):
         super().__init__()
+        from sim3.pair_generator import SUBMAP_N_MIN
+        min_pool = SUBMAP_N_MIN if mode == 'submap' else 6
         self.pools = []
         for db in db_paths:
             pool = load_pool_from_db(db)
-            if len(pool) >= 6:
+            if len(pool) >= min_pool:
                 self.pools.append(pool)
         if not self.pools:
             raise RuntimeError(f"No valid pools found in {db_paths}")
@@ -181,7 +183,12 @@ class LiveSim3PluckerData(Dataset):
         pool_a = self.pools[a_idx]
 
         pair = None
+        _tries = 0
         while pair is None:
+            if _tries > 0:
+                a_idx = np.random.randint(len(self.pools))
+                pool_a = self.pools[a_idx]
+            _tries += 1
             if self.mode == 'submap':
                 context = None
                 if self.inter_map_ratio > 0 and np.random.random() < self.inter_map_ratio:
