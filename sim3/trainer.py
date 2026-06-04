@@ -315,23 +315,16 @@ class Sim3Trainer:
             )
             data_timer.reset()
 
-        recall = self._recalls(eval_res)
+        stats = self._summarise(eval_res)
 
         logging.info(
-            f'recall_rot: {recall[0]:.3f}  '
-            f'med_rot: {recall[1]:.2f}°  '
-            f'med_trans: {recall[2]:.3f}  '
-            f'med_scale_err(log): {recall[3]:.3f}  '
-            f'avg_inlier_ratio: {recall[4]:.1f}%'
+            f'med_rot: {stats["med_rot"]:.2f}°  '
+            f'med_trans: {stats["med_trans"]:.3f}  '
+            f'med_scale_err(log): {stats["med_scale_err"]:.3f}  '
+            f'avg_inlier_ratio: {stats["avg_inlier_ratio"]:.1f}%'
         )
 
-        return {
-            'recall_rot':       recall[0],
-            'med_rot':          recall[1],
-            'med_trans':        recall[2],
-            'med_scale_err':    recall[3],
-            'avg_inlier_ratio': recall[4],
-        }
+        return stats
 
     # ------------------------------------------------------------------
     # Evaluation helpers
@@ -354,22 +347,13 @@ class Sim3Trainer:
             return np.pi, np.inf
         return err_q, err_t
 
-    def _recalls(self, eval_res):
+    def _summarise(self, eval_res):
         """Compute summary statistics over the validation set."""
-        ths = np.arange(7) * 5
         cur_err_q = np.array(eval_res['err_q']) * 180.0 / np.pi
-
-        q_acc_hist, _ = np.histogram(cur_err_q, ths)
-        num_pair = float(len(cur_err_q))
-        q_acc_hist = q_acc_hist.astype(float) / num_pair
-        q_acc = np.cumsum(q_acc_hist)
-
-        recall_rot       = np.mean(q_acc[:4])
-        med_rot          = np.median(cur_err_q)
-        med_trans        = np.median(eval_res['err_t'])
-        # only finite scale errors (infinite = RANSAC failed)
-        finite_s = eval_res['err_s'][np.isfinite(eval_res['err_s'])]
-        med_scale_err    = np.median(finite_s) if len(finite_s) > 0 else np.inf
-        avg_inlier_ratio = np.mean(eval_res['inlier_ratio'])
-
-        return recall_rot, med_rot, med_trans, med_scale_err, avg_inlier_ratio
+        finite_s  = eval_res['err_s'][np.isfinite(eval_res['err_s'])]
+        return {
+            'med_rot':          float(np.median(cur_err_q)),
+            'med_trans':        float(np.median(eval_res['err_t'])),
+            'med_scale_err':    float(np.median(finite_s)) if len(finite_s) > 0 else float('inf'),
+            'avg_inlier_ratio': float(np.mean(eval_res['inlier_ratio'])),
+        }

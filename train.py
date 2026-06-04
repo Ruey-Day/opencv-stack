@@ -143,9 +143,9 @@ def parse_args():
                    help='RANSAC solver for validation metrics (default: grassmannian)')
     p.add_argument('--val_max_iter', type=int, default=-1,
                    help='Max validation samples per epoch (-1 = all)')
-    p.add_argument('--metric',  default='recall_rot',
-                   choices=['recall_rot', 'avg_inlier_ratio'],
-                   help='Metric used to pick the best checkpoint (default: recall_rot)')
+    p.add_argument('--metric',  default='avg_inlier_ratio',
+                   choices=['avg_inlier_ratio'],
+                   help='Metric used to pick the best checkpoint')
 
     # Checkpointing
     p.add_argument('--pretrain', default=None,
