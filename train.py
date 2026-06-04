@@ -249,10 +249,21 @@ def main():
         collate_fn=collate,
     )
 
-    val_cfg = edict(dict(configs))
-    val_cfg.dataset = val_dataset
-
-    val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
+    if args.mode == 'live' and args.db_val:
+        db_val_paths = _expand_globs(args.db_val)
+        logging.info(f'  live db_val: {len(db_val_paths)} held-out map files')
+        val_size = args.val_size if args.val_max_iter < 0 else args.val_max_iter
+        val_dataset_obj = LiveSim3PluckerData(
+            db_paths=db_val_paths,
+            epoch_size=val_size,
+            config=configs,
+            inter_map_ratio=args.inter_map_ratio,
+            mode='submap' if args.submap else 'symmetric',
+        )
+    else:
+        val_cfg = edict(dict(configs))
+        val_cfg.dataset = val_dataset
+        val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
 
     val_loader = DataLoader(
         val_dataset_obj,
