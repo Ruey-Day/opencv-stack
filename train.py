@@ -58,7 +58,7 @@ sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import get_config
-from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData
+from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData, variable_collate
 from sim3.trainer import Sim3Trainer
 
 logging.basicConfig(
@@ -102,10 +102,17 @@ def parse_args():
                    help='[live mode] Val pairs generated when no .pkl split exists (default: 400)')
     p.add_argument('--inter_map_ratio', type=float, default=0.3,
                    help='[live mode] Fraction of cross-map pairs (default: 0.3)')
+    p.add_argument('--submap',          action='store_true',
+                   help='[live mode] Use asymmetric submap generator instead of symmetric pairs')
 
     # Training
     p.add_argument('--epochs',     type=int,   default=1000)
-    p.add_argument('--batch',      type=int,   default=32)
+    p.add_argument('--batch',      type=int,   default=1,
+                   help='Batch size. Default 1 for variable-length pairs; '
+                        'use variable_collate (automatic) for batch > 1.')
+    p.add_argument('--iter_size',  type=int,   default=32,
+                   help='Gradient accumulation steps (effective batch = batch × iter_size). '
+                        'Default 32 gives the same gradient quality as the old batch=32.')
     p.add_argument('--lr',         type=float, default=5e-4)
     p.add_argument('--gamma',      type=float, default=0.99,
                    help='ExponentialLR decay per epoch (default: 0.99). Use 1.0 to disable.')
@@ -168,23 +175,22 @@ def main():
 
     val_dataset = args.val_dataset or args.dataset
 
-    configs.dataset             = args.dataset
-    configs.data_dir            = args.data_dir
-    configs.gpu_inds            = args.gpu
-    configs.model_nb            = args.name if args.name else str(date.today())
-    configs.train_batch_size    = args.batch
-    configs.train_lr            = args.lr
-    configs.exp_gamma           = args.gamma
-    configs.train_epoches       = args.epochs
-    configs.best_val_metric     = args.metric
-    configs.ransac_type         = args.ransac
-    configs.resume_dir          = None
-    configs.normalize_n_lines   = args.n_lines
-    configs.normalize_n_inliers = args.n_inliers
-    configs.in_channel          = args.in_channel
-    configs.pose_loss_weight    = args.pose_loss
-    configs.model_type          = args.model
-    configs.alt_n_blocks        = args.alt_n_blocks
+    configs.dataset          = args.dataset
+    configs.data_dir         = args.data_dir
+    configs.gpu_inds         = args.gpu
+    configs.model_nb         = args.name if args.name else str(date.today())
+    configs.train_batch_size = args.batch
+    configs.iter_size        = args.iter_size
+    configs.train_lr         = args.lr
+    configs.exp_gamma        = args.gamma
+    configs.train_epoches    = args.epochs
+    configs.best_val_metric  = args.metric
+    configs.ransac_type      = args.ransac
+    configs.resume_dir       = None
+    configs.in_channel       = args.in_channel
+    configs.pose_loss_weight = args.pose_loss
+    configs.model_type       = args.model
+    configs.alt_n_blocks     = args.alt_n_blocks
 
     dconfig = vars(configs)
     dconfig['resume'] = args.resume
@@ -206,10 +212,17 @@ def main():
     logging.info(f'  metric      : {args.metric}')
     logging.info(f'  pose_loss   : {args.pose_loss}')
     logging.info(f'  model       : {args.model}')
+    logging.info(f'  batch       : {args.batch}  iter_size: {args.iter_size}  '
+                 f'(effective batch: {args.batch * args.iter_size})')
     if args.model == 'alt':
         logging.info(f'  alt_n_blocks: {args.alt_n_blocks}')
+    if args.submap:
+        logging.info('  pair mode   : submap (asymmetric big-map→small-submap)')
 
     # ── Build training data loader ────────────────────────────────────────────
+    # variable_collate handles batches of different-N pairs; batch_size=1 needs none.
+    collate = variable_collate if args.batch > 1 else None
+
     if args.mode == 'live':
         if not args.db_train:
             raise ValueError('--mode live requires --db_train <path(s)>')
@@ -220,6 +233,7 @@ def main():
             epoch_size=args.epoch_size,
             config=configs,
             inter_map_ratio=args.inter_map_ratio,
+            mode='submap' if args.submap else 'symmetric',
         )
     else:
         train_dataset = Sim3PluckerData(phase='train', config=configs)
@@ -228,13 +242,12 @@ def main():
         train_dataset,
         batch_size=configs.train_batch_size,
         shuffle=True, drop_last=True,
-        num_workers=args.workers, pin_memory=True,
+        num_workers=args.workers, pin_memory=(args.batch > 1),
+        collate_fn=collate,
     )
 
-    # Validation: prefer a static .pkl split; fall back to live generation
     val_cfg = edict(dict(configs))
     val_cfg.dataset = val_dataset
-    val_pkl_dir = os.path.join(args.data_dir, f'{val_dataset}_valid')
 
     val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
 

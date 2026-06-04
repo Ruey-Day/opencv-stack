@@ -1,6 +1,11 @@
 """
 Sim3PluckerData        — static .pkl files (pre-generated offline)
-LiveSim3PluckerData    — online pair generation from .db pools (training)
+LiveSim3PluckerData    — online pair generation from .db pools
+
+Variable-length batching
+    Pairs have different N lines per side depending on pool size and overlap.
+    Use variable_collate as the DataLoader collate_fn (any batch size), or
+    set batch_size=1 to use PyTorch's default collate with no changes.
 
 Expected .pkl layout:
     <data_dir>/<dataset>_train/
@@ -12,20 +17,66 @@ Expected .pkl layout:
         s_gt.pkl        list of float32 scalars
 """
 import os
-import sys
 import pickle
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 from sim3.pair_generator import (
-    load_pool_from_db, generate_pair, generate_inter_map_pair,
-    OVERLAP_PROBS, get_curriculum_probs,
+    load_pool_from_db,
+    generate_pair,
+    generate_inter_map_pair,
+    generate_submap_pair,
+    OVERLAP_PROBS,
+    get_curriculum_probs,
 )
+
+
+# ── Variable-length collate ───────────────────────────────────────────────────
+
+def variable_collate(batch):
+    """
+    Collate variable-N Plücker samples by zero-padding to the max N in the batch.
+
+    Each item is (matches (N1,N2), plucker1 (N1,C), plucker2 (N2,C), R, t, s).
+    Returns stacked tensors with shapes (B,maxN1,maxN2), (B,maxN1,C), (B,maxN2,C),
+    (B,3,3), (B,3,1), (B,).
+
+    Padded entries are zero.  The loss ignores padded rows/cols because the
+    padded region of the matches matrix is also zero (no GT correspondences).
+    """
+    matches_l, p1_l, p2_l, R_l, t_l, s_l = zip(*batch)
+
+    B   = len(p1_l)
+    C   = p1_l[0].shape[1]
+    mn1 = max(p.shape[0] for p in p1_l)
+    mn2 = max(p.shape[0] for p in p2_l)
+
+    p1_pad = torch.zeros(B, mn1, C)
+    p2_pad = torch.zeros(B, mn2, C)
+    m_pad  = torch.zeros(B, mn1, mn2)
+
+    for i, (m, p1, p2) in enumerate(zip(matches_l, p1_l, p2_l)):
+        n1, n2 = p1.shape[0], p2.shape[0]
+        p1_pad[i, :n1] = torch.as_tensor(p1)
+        p2_pad[i, :n2] = torch.as_tensor(p2)
+        m_pad[i, :n1, :n2] = torch.as_tensor(m)
+
+    return (
+        m_pad,
+        p1_pad,
+        p2_pad,
+        torch.stack([torch.as_tensor(r) for r in R_l]),
+        torch.stack([torch.as_tensor(t) for t in t_l]),
+        torch.tensor(s_l, dtype=torch.float32),
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load(path):
     with open(path, 'rb') as f:
-        if sys.version_info[0] == 3:
-            return pickle.load(f, encoding='latin1')
-        return pickle.load(f)
+        return pickle.load(f, encoding='latin1')
+
 
 def load_sim3_data(config, split):
     var_names = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']
@@ -37,25 +88,27 @@ def load_sim3_data(config, split):
     return data
 
 
+# ── Static pkl dataset ────────────────────────────────────────────────────────
+
 class Sim3PluckerData(Dataset):
-    """Dataset for Sim(3) Plücker line matching.
+    """Dataset for Sim(3) Plücker line matching from pre-generated .pkl files.
 
     Returns per sample:
-        matches  (n1, n2) float32 — binary correspondence matrix
-        plucker1 (n1, 6)  float32
-        plucker2 (n2, 6)  float32
+        matches  (N1, N2) float32 — binary correspondence matrix
+        plucker1 (N1, C)  float32
+        plucker2 (N2, C)  float32
         R_gt     (3, 3)   float32
         t_gt     (3, 1)   float32
         s_gt     ()       float32 scalar
+
+    N1 and N2 are variable across samples.  Use variable_collate or batch_size=1.
     """
 
     def __init__(self, phase, config):
         super().__init__()
-        self.data        = load_sim3_data(config, phase)
-        self.len         = len(self.data['t_gt'])
-        self.normalize_n    = getattr(config, 'normalize_n_lines',   None)
-        self.normalize_n_in = getattr(config, 'normalize_n_inliers', None)
-        self.in_channel     = getattr(config, 'in_channel', None)
+        self.data       = load_sim3_data(config, phase)
+        self.len        = len(self.data['t_gt'])
+        self.in_channel = getattr(config, 'in_channel', None)
 
     def __getitem__(self, index):
         matches_ind = self.data['matches'][index]     # (2, n_inliers)
@@ -65,38 +118,14 @@ class Sim3PluckerData(Dataset):
         t_gt        = self.data['t_gt'][index]
         s_gt        = np.float32(self.data['s_gt'][index])
 
-        # Subsample to a fixed size when mixing datasets of different sizes.
-        if self.normalize_n is not None and plucker1.shape[0] > self.normalize_n:
-            n_in_want  = self.normalize_n_in or (self.normalize_n * 100 // 130)
-            n_out_want = self.normalize_n - n_in_want
-            n_in_have  = matches_ind.shape[1]
-
-            in_sel  = np.random.choice(n_in_have, min(n_in_want, n_in_have), replace=False)
-            in_idx1 = matches_ind[0, in_sel]
-            in_idx2 = matches_ind[1, in_sel]
-
-            out_pool1 = np.setdiff1d(np.arange(plucker1.shape[0]), in_idx1)
-            out_pool2 = np.setdiff1d(np.arange(plucker2.shape[0]), in_idx2)
-            out_sel1  = np.random.choice(out_pool1, min(n_out_want, len(out_pool1)), replace=False)
-            out_sel2  = np.random.choice(out_pool2, min(n_out_want, len(out_pool2)), replace=False)
-
-            n_in_actual = len(in_sel)
-            new1  = np.concatenate([plucker1[in_idx1], plucker1[out_sel1]])
-            new2  = np.concatenate([plucker2[in_idx2], plucker2[out_sel2]])
-            perm1 = np.random.permutation(len(new1))
-            perm2 = np.random.permutation(len(new2))
-            new1  = new1[perm1];  new2  = new2[perm2]
-            inv1  = np.argsort(perm1); inv2 = np.argsort(perm2)
-            matches_ind = np.stack([inv1[:n_in_actual], inv2[:n_in_actual]], axis=0)
-            plucker1, plucker2 = new1, new2
-
         if self.in_channel is not None:
             plucker1 = plucker1[:, :self.in_channel]
             plucker2 = plucker2[:, :self.in_channel]
 
         n1, n2 = plucker1.shape[0], plucker2.shape[0]
         matches = np.zeros([n1, n2], dtype=np.float32)
-        matches[matches_ind[0, :], matches_ind[1, :]] = 1.0
+        if matches_ind.shape[1] > 0:
+            matches[matches_ind[0, :], matches_ind[1, :]] = 1.0
 
         return (
             matches.astype('float32'),
@@ -111,21 +140,22 @@ class Sim3PluckerData(Dataset):
         return self.len
 
 
-class LiveSim3PluckerData(Dataset):
-    """Online dataset: generates a fresh pair from DB pools on every __getitem__.
+# ── Live dataset ──────────────────────────────────────────────────────────────
 
-    The model never sees the same (SIM3, subset, noise) combination twice,
-    eliminating memorisation of fixed training pairs. DB pools are loaded once
-    at startup; generation is CPU-only and fast (~0.5 ms per pair).
+class LiveSim3PluckerData(Dataset):
+    """Online dataset: generates fresh pairs from DB pools on every __getitem__.
 
     Args:
-        db_paths:        list of .db map files to load pools from
-        epoch_size:      number of pairs per epoch (defines __len__)
+        db_paths:        list of .db map files
+        epoch_size:      number of pairs per epoch
         config:          training config (in_channel)
         inter_map_ratio: fraction of pairs generated as cross-map (default 0.3)
+        mode:            'symmetric' (default) — classic intra/inter-map pairs;
+                         'submap'              — asymmetric big-map→small-submap pairs
     """
 
-    def __init__(self, db_paths, epoch_size, config, inter_map_ratio=0.3):
+    def __init__(self, db_paths, epoch_size, config,
+                 inter_map_ratio=0.3, mode='symmetric'):
         super().__init__()
         self.pools = []
         for db in db_paths:
@@ -135,15 +165,15 @@ class LiveSim3PluckerData(Dataset):
         if not self.pools:
             raise RuntimeError(f"No valid pools found in {db_paths}")
         print(f"[LiveSim3] loaded {len(self.pools)} pools, epoch_size={epoch_size}, "
-              f"inter_map_ratio={inter_map_ratio}")
+              f"inter_map_ratio={inter_map_ratio}, mode={mode}")
 
         self.epoch_size      = epoch_size
         self.inter_map_ratio = inter_map_ratio if len(self.pools) >= 2 else 0.0
         self.in_channel      = getattr(config, 'in_channel', None)
         self.overlap_probs   = OVERLAP_PROBS.copy()
+        self.mode            = mode
 
     def set_curriculum_phase(self, phase_frac: float):
-        """Update overlap distribution for curriculum training. Call once per epoch."""
         self.overlap_probs = get_curriculum_probs(phase_frac)
 
     def __getitem__(self, index):
@@ -152,15 +182,22 @@ class LiveSim3PluckerData(Dataset):
 
         pair = None
         while pair is None:
-            if self.inter_map_ratio > 0 and np.random.random() < self.inter_map_ratio:
-                b_idx = np.random.choice([i for i in range(len(self.pools)) if i != a_idx])
-                pair  = generate_inter_map_pair(pool_a, self.pools[b_idx],
-                                                overlap_probs=self.overlap_probs)
+            if self.mode == 'submap':
+                context = None
+                if self.inter_map_ratio > 0 and np.random.random() < self.inter_map_ratio:
+                    b_idx   = np.random.choice([i for i in range(len(self.pools)) if i != a_idx])
+                    context = self.pools[b_idx]
+                pair = generate_submap_pair(pool_a, context_pool=context)
             else:
-                pair = generate_pair(pool_a, overlap_probs=self.overlap_probs)
+                if self.inter_map_ratio > 0 and np.random.random() < self.inter_map_ratio:
+                    b_idx = np.random.choice([i for i in range(len(self.pools)) if i != a_idx])
+                    pair  = generate_inter_map_pair(pool_a, self.pools[b_idx],
+                                                    overlap_probs=self.overlap_probs)
+                else:
+                    pair = generate_pair(pool_a, overlap_probs=self.overlap_probs)
 
-        plucker1 = pair['plucker1']
-        plucker2 = pair['plucker2']
+        plucker1    = pair['plucker1']
+        plucker2    = pair['plucker2']
         matches_ind = pair['matches']
 
         if self.in_channel is not None:
