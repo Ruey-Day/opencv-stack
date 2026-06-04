@@ -1,14 +1,5 @@
-"""
-pair_generator.py
-=================
-Core SLAM-map pair generation logic shared between:
-  - scripts/generate_slam_map_dataset.py  (offline pkl generation)
-  - sim3/dataloader.py                    (online LiveSim3PluckerData)
-"""
 import numpy as np
 import msgpack
-
-# ── Constants ─────────────────────────────────────────────────────────────────
 
 N_P1_TOTAL = 200
 N_P2_TOTAL = 200

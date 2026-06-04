@@ -16,19 +16,16 @@ import sys
 import pickle
 import numpy as np
 from torch.utils.data import Dataset
-
 from sim3.pair_generator import (
     load_pool_from_db, generate_pair, generate_inter_map_pair,
     OVERLAP_PROBS, get_curriculum_probs,
 )
-
 
 def _load(path):
     with open(path, 'rb') as f:
         if sys.version_info[0] == 3:
             return pickle.load(f, encoding='latin1')
         return pickle.load(f)
-
 
 def load_sim3_data(config, split):
     var_names = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']

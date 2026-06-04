@@ -15,7 +15,7 @@ ScalePlueckerNet/
 │   ├── trainer.py             # Sim3Trainer — Sim(3) RANSAC validation, curriculum hook
 │   ├── pair_generator.py      # Live pair generation from SLAM .db maps + curriculum schedule
 │   ├── ransac.py              # Sim(3) RANSAC — L2 residual in Plücker space
-│   ├── ransac_grassmannian.py # Sim(3) RANSAC — Grassmannian angle metric (default)
+│   ├── ransac_grassmannian.py # Sim(3) RANSAC — L2 metric + stratified sampling + LO-RANSAC (default)
 │   └── __init__.py
 │
 ├── scripts/
@@ -334,8 +334,10 @@ First attempt to train entirely from random initialization on live SLAM-map data
 - Best at epoch 588: **avg_inlier_ratio=18.06%**, recall_rot≈0.29
 - LR decayed to ~1.4e-7 by epoch 815 — model stalled
 
-**Phase 3** (epoch 0+, CosineAnnealingWarmRestarts, lr reset to 5e-4) *(current)*
+**Phase 3** (epoch 0+, CosineAnnealingWarmRestarts, lr reset to 5e-4) *(current — epoch 408 as of 2026-05-29)*
 - Restarted from epoch-588 best checkpoint with `--cosine_lr`
+- Best so far: epoch 336, **avg_inlier_ratio=18.421%**, recall_rot≈0.30
+- Recent epochs (400–408) plateauing ~17.5%; best not yet beaten
 - Checkpoint: `output/joint/scratch-v5/best_val_checkpoint.pth`
 - Monitor: `tail -f output/scratch_v5.log`
 
@@ -382,7 +384,7 @@ Val set: `slam_map_valid`. Comparison once phase 3 completes:
 |-------|-----------------|-----------|-------|
 | Joint/2026-05-17 (pretrained) | 92.11% | 0.999 | pkl joint data |
 | SLAM-map v14 (fine-tuned) | — | — | fine-tuned from joint |
-| scratch-v5 best so far | **18.06%** | 0.29 | from random init, in progress |
+| scratch-v5 best so far | **18.421%** | 0.30 | epoch 336, from random init, phase 3 ongoing |
 
 The scratch-v5 gap vs pretrained confirms that basic Sim(3) geometry reasoning (learned on the joint pkl data) is the primary contribution of pretraining. The curriculum and LR reset (phase 3) are ongoing attempts to close this gap without pkl data.
 
@@ -407,11 +409,21 @@ s, R, t, n_inliers, mask = run_ransac_sim3(
 
 ### Grassmannian backend (`sim3/ransac_grassmannian.py`)
 
-Principal-angle inlier test on the Grassmannian G(1,5): checks whether two Plücker lines are consistent with the same Sim(3) transform without needing an explicit threshold on residual scale. Includes:
-- Stratified direction-bin sampling to avoid degenerate (all-parallel) minimal sets
-- Tikhonov regularisation for scale estimation
+Structurally richer solver that shares the same L2 inlier metric as `ransac.py` but adds:
+- **Stratified direction-bin sampling** — partitions correspondences by dominant direction axis and draws one line per bin, preventing degenerate all-parallel minimal sets
+- **Iterative local optimisation (LO-RANSAC)** — after the main loop, re-fits `(R, s, t)` on the current inlier set up to `lo_iters=10` times, each time expanding the inlier set; uses the full joint LS solver so refinement is not biased by translation
+- More iterations by default (`n_iter=5000`, `early_exit_iters=200`)
 
-Default for training validation and evaluation.
+Default for training validation and evaluation. On the seq02→seq01 benchmark (GT scale 2.7947) it achieves **0.0% scale error** vs 1.7% for the L2 backend at the same inlier count.
+
+```python
+R, t, s, inlier_mask, n_inliers = ransac_sim3(
+    plucker1.T,   # (6, N) — columns are lines
+    plucker2.T,
+    inlier_threshold=0.3,
+)
+# s=0.0 / n_inliers=0 on failure
+```
 
 ---
 
@@ -428,3 +440,41 @@ Default for training validation and evaluation.
 **InlierProb sign.** `InlierProb` starts positive (~+1) at random init and goes negative as training progresses. Negative is correct — it means the network assigns more mass to true inliers. Target: approaching −1.
 
 **SE(3) solver fails when scale ≠ 1.** The original PlueckerNet RANSAC absorbs `(s−1)·Rm₁` into a spurious translation, giving wrong rotation error up to ~90°. This is the core motivation for the Sim(3) extension.
+
+---
+
+## `ransac_grassmannian.py` — Bug Fixes (2026-05-29)
+
+Four bugs were identified and fixed. All are now resolved in the current code.
+
+**1. Grassmannian inlier metric was scale-blind (critical)**
+
+The original inlier test normalized both Plücker vectors to unit norm before computing `arccos(|L1·L2|)`. Normalizing erases the moment magnitude, which carries the scale information — a hypothesis with `s=0.36` scores identically to `s=2.8` whenever the normalized directions align. Result: RANSAC consistently returned inverted or near-zero scales.
+
+*Fix:* Replaced with the unnormalized L2 residual `‖transform(L1) − L2‖` (same metric as `ransac.py`). The threshold parameter was renamed from `inlier_angle_rad` to `inlier_threshold`.
+
+**2. 3-line minimal solver with direction sign-flip produced wrong scales (critical)**
+
+`solve_rotation` flipped source directions `d1` to align signs with `d2` before computing the cross-covariance. The subsequent `solve_translation_scale` then computed `Rd1 = R @ d1_original` (not sign-flipped), so for any line that had been flipped, `Rd1 ≈ -d2` — the wrong sign on the `t × direction` term. With a 35% inlier rate, the 3-line solver produced the correct scale only 13% of the time vs 47% for the 2-line solver.
+
+*Fix:* Replaced the custom 3-line solver with `model_estimate_sim3` from `ransac.py` (2-line, no sign-flip, uses `d2` directly). Dropped `min_sample` from 3 to 2.
+
+**3. LO scale estimator was translation-biased (significant)**
+
+The local-optimisation loop estimated scale as `median(‖m2‖ / ‖R·m1‖)`. This formula is only unbiased when `t = 0`; with large translation the `t × (R·d)` term adds to the moment and the bias can exceed 200%.
+
+*Fix:* Replaced with `solve_translation_scale(L1_inliers, L2_inliers, R)` — the full joint LS that correctly accounts for the translation term.
+
+**4. Sign flip in `solve_translation_scale` was mathematically wrong (minor)**
+
+When `lstsq` returned `s < 0`, the code did `s = -s; t = -t`. Negating both satisfies `−m2 = s·R·m1 + t×d` — not the actual constraint. In practice the inlier check rejected these hypotheses, so the impact was limited.
+
+*Fix:* Removed the flip. The RANSAC loop's existing `s <= 0 → skip` guard handles it correctly.
+
+**Net effect after all fixes:**
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Scale estimate (seq02→seq01, GT=2.7947) | 0.02–0.20 (inverted/near-zero) | **2.7955 (0.0% error)** |
+| Inliers | 17 | **71** |
+| L2 backend for comparison | 2.8431 (1.7% error), 71 inliers | — |
