@@ -217,6 +217,8 @@ python train.py --mode live \
 | `--pretrain` | — | Warm-start from checkpoint (`strict=False`) |
 | `--resume` | — | Resume from checkpoint (restores optimizer + scheduler) |
 | `--name` | today's date | Run name; controls checkpoint path `output/<dataset>/<name>/` |
+| `--model` | `knn` | Architecture: `knn` = original PluckerNetKnn; `alt` = asymmetric alternating attention |
+| `--alt_n_blocks` | `3` | `[alt]` Number of alternating attention blocks (3 → same param count as `knn`) |
 
 ### Curriculum learning (live mode)
 
@@ -229,6 +231,37 @@ python train.py --mode live \
 | 1.0 (IR = 100%) | 0.41 | Full distribution including zero-overlap (hardest) |
 
 This is automatic when using `--mode live`. No flag needed.
+
+---
+
+## Architecture Variants
+
+### Baseline: `PluckerNetKnn` (`--model knn`, default)
+
+The original architecture from Liu et al. CVPR 2021, extended to Sim(3). A shared `SpatialAttentionalGNN` alternates self- and cross-attention layers over both Plücker sets. Each layer uses a **single** `AttentionalPropagation` module whose weights are shared between the SLAM-side and metric-side updates, making the model symmetric with respect to the two inputs.
+
+### Asymmetric Alternating Attention: `PluckerNetKnnAlt` (`--model alt`)
+
+Inspired by the geometric alternating attention in FUSER (Jiang et al., CVPR 2026). Replaces the shared GNN with `AsymmetricAlternatingGNN`, which stacks `n_blocks` blocks each containing **four independent** `AttentionalPropagation` modules:
+
+| Module | Query | Key/Value | Purpose |
+|--------|-------|-----------|---------|
+| `self0` | SLAM lines | SLAM lines | Within-source geometric context |
+| `self1` | metric lines | metric lines | Within-target geometric context |
+| `cross0` | SLAM lines | metric lines | Source reads target for scale/pose signal |
+| `cross1` | metric lines | SLAM lines | Target reads source to localise matches |
+
+**Why it matters:** SLAM lines (noisy, arbitrary scale, sparse) and metric map lines (accurate, metric, dense) are structurally different. Sharing weights forces the network to use the same representation for both roles. Separate modules let each direction learn its own statistical pattern.
+
+**Parameter parity:** `--alt_n_blocks 3` gives 3 × 4 = 12 `AttentionalPropagation` modules, identical to the 12 in the default `knn` model — same parameter count (2.24M), different architecture.
+
+```bash
+# Fair comparison (same param count):
+python train.py --dataset joint --model alt
+
+# More expressive (2× GNN params):
+python train.py --dataset joint --model alt --alt_n_blocks 6
+```
 
 ---
 
