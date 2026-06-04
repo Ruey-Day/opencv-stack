@@ -152,7 +152,7 @@ Each split is a directory of 6 pickle files (lists of numpy arrays):
 | `t_gt.pkl` | `(3, 1)` | float32 |
 | `s_gt.pkl` | scalar (`0.0` = zero-overlap / no valid pose) | float32 |
 
-**Live pairs** always have exactly `N_P1_TOTAL = N_P2_TOTAL = 200` lines per side (hardcoded in `sim3/pair_generator.py`).
+**Live pairs have variable line counts** — no fixed cap. Sizes are determined by pool size, overlap fraction, and a random outlier ratio. Use `batch_size=1` (default) with `iter_size=32` for gradient accumulation, or `batch_size>1` with the automatic `variable_collate` zero-padding.
 
 ---
 
@@ -161,31 +161,48 @@ Each split is a directory of 6 pickle files (lists of numpy arrays):
 ### Standard mode (offline pkl)
 
 ```bash
-# Train joint model from scratch:
-python train.py --dataset joint --batch 32 --lr 5e-4 --gamma 0.99
-
-# Fine-tune from existing checkpoint:
-python train.py --dataset joint --cosine_lr \
-    --pretrain output/joint/2026-05-17/best_val_checkpoint.pth
+# Train on pre-generated pkl dataset:
+python train.py --dataset joint --batch 1 --iter_size 32 --lr 5e-4 --gamma 0.99
 
 # Resume a run:
 python train.py --dataset joint --resume output/joint/<name>/checkpoint.pth
 ```
 
-### Live mode (SLAM-map pairs, on-the-fly generation)
+### Live mode — symmetric pairs (original)
 
 ```bash
-# From scratch on all available maps:
+# From scratch, all available maps:
 python train.py --mode live \
     --db_train ../Structure-PLP-SLAM/*.db \
     --val_dataset slam_map \
-    --lr 5e-4 --gamma 0.99 --batch 32 --epochs 1000
+    --lr 5e-4 --gamma 0.99 --epochs 1000
 
 # Fine-tune from joint checkpoint:
 python train.py --mode live \
     --db_train ../Structure-PLP-SLAM/*.db \
     --val_dataset slam_map \
-    --lr 1e-5 --gamma 1.0 --batch 16 --epochs 300 \
+    --lr 1e-5 --gamma 1.0 --epochs 300 \
+    --pretrain output/joint/2026-05-17/best_val_checkpoint.pth
+```
+
+### Live mode — submap pairs (new asymmetric scenario)
+
+Registers a small monocular submap (30–120 lines, arbitrary scale) against a large
+metric SLAM map (100–500 lines). Only 5–35 % of the big map overlaps with the submap;
+the remainder are realistic context lines. Pairs are variable size — no fixed cap.
+
+```bash
+# Train from scratch with alternating attention model:
+python train.py --mode live --submap --model alt \
+    --db_train ../Structure-PLP-SLAM/*.db \
+    --val_dataset slam_map \
+    --lr 5e-4 --gamma 0.99 --epochs 1000
+
+# Warm-start from the joint checkpoint:
+python train.py --mode live --submap --model alt \
+    --db_train ../Structure-PLP-SLAM/*.db \
+    --val_dataset slam_map \
+    --lr 1e-4 --gamma 0.995 --epochs 1000 \
     --pretrain output/joint/2026-05-17/best_val_checkpoint.pth
 ```
 
@@ -204,8 +221,10 @@ python train.py --mode live \
 | `--epoch_size` | `16000` | `[live]` Pairs generated per epoch |
 | `--val_size` | `400` | `[live]` Val pairs when no pkl split exists |
 | `--inter_map_ratio` | `0.3` | `[live]` Fraction of cross-map pairs |
+| `--submap` | off | `[live]` Use asymmetric submap generator (big-map→small-submap) |
 | `--epochs` | `1000` | |
-| `--batch` | `32` | |
+| `--batch` | `1` | Batch size. Variable-length pairs require `batch=1` or `variable_collate` (auto) |
+| `--iter_size` | `32` | Gradient accumulation steps; effective batch = `batch × iter_size` |
 | `--lr` | `5e-4` | Initial learning rate |
 | `--gamma` | `0.99` | ExponentialLR decay per epoch; use `1.0` to disable |
 | `--cosine_lr` | off | CosineAnnealingWarmRestarts(T_0=50, T_mult=2) instead of ExponentialLR |
