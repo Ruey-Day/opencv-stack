@@ -29,6 +29,7 @@ Minimal solver (3 line pairs → 7 DOF = 3 rotation + 3 translation + 1 scale):
 """
 
 import numpy as np
+from sim3.ransac import model_estimate_sim3 as _minimal_sim3
 
 
 # ── Plücker utilities ─────────────────────────────────────────────────────────
@@ -139,19 +140,18 @@ def solve_translation_scale(
     Returns:
         t: (3,) translation,   s: float scale  (> 0 means SLAM is smaller)
     """
-    m1, d1 = L1[:3], L1[3:]   # (3, N)
-    m2     = L2[:3]            # (3, N)
+    m1     = L1[:3]            # (3, N)
+    m2, d2 = L2[:3], L2[3:]   # (3, N) — use target direction directly
     N = L1.shape[1]
 
-    Rd1 = R @ d1               # (3, N)
     Rm1 = R @ m1               # (3, N)
 
     A = np.zeros((3 * N, 4))
     b = np.zeros(3 * N)
     for i in range(N):
         row = 3 * i
-        # t × (R·d1) = -(R·d1) × t = -skew(R·d1) · t
-        A[row:row + 3, :3] = -_skew(Rd1[:, i])  # coefficient of t
+        # t × d2_i  =  -skew(d2_i) · t
+        A[row:row + 3, :3] = -_skew(d2[:, i])   # coefficient of t
         A[row:row + 3,  3] =  Rm1[:, i]          # coefficient of s  (R·m1_i)
         b[row:row + 3]     =  m2[:, i]
 
@@ -162,12 +162,6 @@ def solve_translation_scale(
 
     x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
     t, s = x[:3], float(x[3])
-
-    # Resolve sign ambiguity: scale must be positive
-    if s < 0:
-        s = -s
-        t = -t
-
     return t, s
 
 
@@ -216,18 +210,17 @@ def solve_translation_fixed_scale(
     Returns:
         t: (3,) translation vector
     """
-    m1, d1 = L1[:3], L1[3:]
-    m2     = L2[:3]
+    m1     = L1[:3]
+    m2, d2 = L2[:3], L2[3:]   # use target direction directly
     N      = L1.shape[1]
 
-    Rd1 = R @ d1       # (3, N)
     Rm1 = R @ m1       # (3, N)
 
     A = np.zeros((3 * N, 3))
     b = np.zeros(3 * N)
     for i in range(N):
         row = 3 * i
-        A[row:row + 3] = -_skew(Rd1[:, i])            # -skew(R·d1) coeff of t
+        A[row:row + 3] = -_skew(d2[:, i])             # -skew(d2) coeff of t
         b[row:row + 3] = m2[:, i] - s * Rm1[:, i]     # residual
 
     t, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
@@ -237,44 +230,53 @@ def solve_translation_fixed_scale(
 def ransac_sim3(
     L1: np.ndarray,
     L2: np.ndarray,
-    n_iter: int = 2000,
-    inlier_angle_rad: float = 0.10,    # ≈ 5.7°
+    n_iter: int = 5000,
+    inlier_threshold: float = 0.3,
     min_inliers: int = 6,
-    min_sample: int = 3,
+    min_sample: int = 2,
     seed: int = 42,
     s_prior: float = -1.0,
     lambda_s: float = 5.0,
-    early_exit_iters: int = 50,
-    lo_iters: int = 4,
+    early_exit_iters: int = 200,
+    lo_iters: int = 10,
 ) -> tuple:
     """
-    RANSAC SIM(3) solver using Grassmannian distance as the inlier metric.
+    RANSAC SIM(3) solver for Plücker line correspondences.
+
+    Uses Procrustes rotation + joint LS for (s, t) as the minimal solver, and
+    an L2 Plücker residual as the inlier metric.  The Grassmannian distance
+    (arccos of normalised dot product) is NOT used as the inlier test because
+    normalising both Plücker vectors to unit norm erases the moment magnitude,
+    making the metric blind to scale — a hypothesis with s=0.36 scores the same
+    as s=2.8 whenever the normalised directions happen to align.  The L2 residual
+    ‖L2 − M_SIM3 · L1‖ preserves scale information and correctly penalises
+    scale error.
 
     The algorithm:
       1. Sample ``min_sample`` random line correspondences.
       2. Estimate R via Procrustes, then (t, s) via linear least squares.
-      3. Transform all source lines and compute Grassmannian distance to
-         their targets; count inliers below ``inlier_angle_rad``.
+      3. Transform all source lines and compute L2 Plücker residual to targets;
+         count inliers below ``inlier_threshold``.
       4. Keep the hypothesis with the most inliers.
-      5. Re-estimate the SIM(3) on all inliers (final refinement).
+      5. Iterative local optimisation: re-fit (R, s, t) on inlier set, expand.
 
     Early exit: if after ``early_exit_iters`` iterations the best inlier count
-    is still zero, the correspondences are almost certainly all wrong (no-overlap
-    scene) and the remaining iterations would be wasted.  Returns failure immediately.
+    is still zero, returns failure immediately.
 
     Args:
         L1:  (6, N)  Plücker coords of source lines  (SLAM, arb. scale)
         L2:  (6, N)  Plücker coords of target lines  (DA3, metric)
-        n_iter: RANSAC iterations
-        inlier_angle_rad: Grassmannian distance threshold (radians, default 0.10 ≈ 5.7°)
+        n_iter: RANSAC iterations (default 5000)
+        inlier_threshold: L2 Plücker residual threshold (default 0.3)
         min_inliers: minimum inliers to declare a valid hypothesis
         min_sample:  minimal sample size (≥ 3 for numerical stability)
         seed: RNG seed for reproducibility
         s_prior: if > 0, regularise scale toward this value (use rough estimate)
         lambda_s: strength of scale regularisation
-        early_exit_iters: abort after this many iterations if best_ic is still 0
-        lo_iters: local-optimization passes — each pass re-fits (R, s, t) on the
-            current inlier set and expands inliers; stops early if count stops growing
+        early_exit_iters: abort after this many iterations if best_ic is still 0 (default 200)
+        lo_iters: local-optimization passes — each pass re-fits (R, s, t) via joint
+            LS on the current inlier set and expands inliers; stops early if count
+            stops growing (default 10)
 
     Returns:
         R_best: (3, 3),  t_best: (3,),  s_best: float,
@@ -290,15 +292,11 @@ def ransac_sim3(
     bins = [np.where(dominant_axis == ax)[0] for ax in range(3)]
     bins = [b for b in bins if len(b) > 0]             # drop empty bins
 
-    # Pre-normalise only for the Grassmannian distance check (inlier test).
-    # The SIM(3) *solver* always uses the physical (unnormalised) coordinates.
-    L2_n = normalize_plucker(L2)
-
     def _evaluate(R_c, t_c, s_c):
-        """Transform L1 and count Grassmannian inliers."""
-        L1_tf = normalize_plucker(transform_lines(L1, R_c, t_c, s_c))
-        dists = grassmannian_distance(L1_tf, L2_n)
-        mask  = dists < inlier_angle_rad
+        """Transform L1 and count L2-residual inliers."""
+        L1_tf = transform_lines(L1, R_c, t_c, s_c)
+        dists = np.linalg.norm(L1_tf - L2, axis=0)  # (N,) unnormalised Plücker residual
+        mask  = dists < inlier_threshold
         return mask, int(mask.sum()), dists
 
     best_ic   = 0
@@ -333,23 +331,11 @@ def ransac_sim3(
             idx = rng.choice(N, min_sample, replace=False)
 
         try:
-            R_cand = solve_rotation(L1[3:, idx], L2[3:, idx])
-
-            if s_prior > 0:
-                # Two-stage: fix scale to prior, solve translation only.
-                # More robust for scenes dominated by parallel lines.
-                s_cand = s_prior
-                t_cand = solve_translation_fixed_scale(
-                    L1[:, idx], L2[:, idx], R_cand, s_cand
-                )
-            else:
-                # Joint (t, s) solve when no prior is available.
-                t_cand, s_cand = solve_translation_scale(
-                    L1[:, idx], L2[:, idx], R_cand,
-                    s_prior=s_prior, lambda_s=lambda_s,
-                )
-                if s_cand <= 0 or not np.isfinite(s_cand):
-                    continue
+            result = _minimal_sim3(L1[:, idx], L2[:, idx])
+            if result is None:
+                continue
+            s_cand, R_cand, t_cand = result
+            t_cand = t_cand.flatten()
         except (np.linalg.LinAlgError, ValueError):
             continue
 
@@ -366,16 +352,15 @@ def ransac_sim3(
         for _ in range(lo_iters):
             try:
                 R_ref = solve_rotation(L1[3:, best_mask], L2[3:, best_mask])
-                # Robust scale from median of per-line moment-magnitude ratios.
-                s_ref = float(np.median(
-                    np.linalg.norm(L2[:3, best_mask], axis=0) /
-                    (np.linalg.norm(R_ref @ L1[:3, best_mask], axis=0) + 1e-12)
-                ))
-                if s_ref <= 0 or not np.isfinite(s_ref):
-                    s_ref = best_s
-                t_ref = solve_translation_fixed_scale(
-                    L1[:, best_mask], L2[:, best_mask], R_ref, s_ref
+                # Joint (t, s) solve on the current inlier set.  The median
+                # moment-magnitude ratio ||m2||/||R·m1|| is only unbiased when
+                # t=0; the full LS solve correctly accounts for the t×(R·d) term.
+                t_ref, s_ref = solve_translation_scale(
+                    L1[:, best_mask], L2[:, best_mask], R_ref,
+                    s_prior=best_s, lambda_s=lambda_s,
                 )
+                if s_ref <= 0 or not np.isfinite(s_ref):
+                    break
                 mask_ref, ic_ref, _ = _evaluate(R_ref, t_ref, s_ref)
                 if ic_ref >= best_ic:
                     best_R, best_t, best_s = R_ref, t_ref, s_ref
