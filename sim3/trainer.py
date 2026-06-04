@@ -26,14 +26,18 @@ from lib.timer import AverageMeter, Timer
 from lib.loss import TotalLoss
 from sim3.ransac import run_ransac_sim3
 from sim3.ransac_grassmannian import ransac_sim3 as _ransac_g
+from sim3.model_alternating import PluckerNetKnnAlt
 
 
 class Sim3Trainer:
 
     def __init__(self, config, data_loader, val_data_loader=None):
 
-        Model = load_model('PluckerNetKnn')
-        self.model = Model(config)
+        if getattr(config, 'model_type', 'knn') == 'alt':
+            self.model = PluckerNetKnnAlt(config)
+        else:
+            Model = load_model('PluckerNetKnn')
+            self.model = Model(config)
 
         logging.info(self.model)
 

@@ -122,6 +122,15 @@ def parse_args():
     p.add_argument('--pose_loss',  type=float, default=0.0,
                    help='Weight for differentiable Sim(3) pose loss (0 = disabled)')
 
+    # Model architecture
+    p.add_argument('--model', default='knn', choices=['knn', 'alt'],
+                   help='knn: original PluckerNetKnn (default); '
+                        'alt: asymmetric alternating attention (FUSER-inspired)')
+    p.add_argument('--alt_n_blocks', type=int, default=3,
+                   help='[alt model] Number of alternating attention blocks. '
+                        'Default 3 → 12 attention modules (same as knn baseline). '
+                        'Increase for more expressivity at higher compute cost.')
+
     # Validation RANSAC backend
     p.add_argument('--ransac',  default='grassmannian', choices=['sim3', 'grassmannian'],
                    help='RANSAC solver for validation metrics (default: grassmannian)')
@@ -174,6 +183,8 @@ def main():
     configs.normalize_n_inliers = args.n_inliers
     configs.in_channel          = args.in_channel
     configs.pose_loss_weight    = args.pose_loss
+    configs.model_type          = args.model
+    configs.alt_n_blocks        = args.alt_n_blocks
 
     dconfig = vars(configs)
     dconfig['resume'] = args.resume
@@ -194,6 +205,9 @@ def main():
     logging.info(f'  ransac      : {args.ransac}')
     logging.info(f'  metric      : {args.metric}')
     logging.info(f'  pose_loss   : {args.pose_loss}')
+    logging.info(f'  model       : {args.model}')
+    if args.model == 'alt':
+        logging.info(f'  alt_n_blocks: {args.alt_n_blocks}')
 
     # ── Build training data loader ────────────────────────────────────────────
     if args.mode == 'live':
