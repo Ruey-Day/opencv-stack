@@ -141,6 +141,8 @@ def parse_args():
     # Validation RANSAC backend
     p.add_argument('--ransac',  default='grassmannian', choices=['sim3', 'grassmannian'],
                    help='RANSAC solver for validation metrics (default: grassmannian)')
+    p.add_argument('--val_max_iter', type=int, default=-1,
+                   help='Max validation samples per epoch (-1 = all)')
     p.add_argument('--metric',  default='recall_rot',
                    choices=['recall_rot', 'avg_inlier_ratio'],
                    help='Metric used to pick the best checkpoint (default: recall_rot)')
@@ -186,6 +188,7 @@ def main():
     configs.train_epoches    = args.epochs
     configs.best_val_metric  = args.metric
     configs.ransac_type      = args.ransac
+    configs.val_max_iter     = args.val_max_iter
     configs.resume_dir       = None
     configs.in_channel       = args.in_channel
     configs.pose_loss_weight = args.pose_loss
