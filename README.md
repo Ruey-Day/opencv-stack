@@ -126,7 +126,51 @@ Currently available `.db` maps under `../Structure-PLP-SLAM/`:
 | Replica | 9 | office0–4 (GT), room0–1 (map + mono) |
 | TUM RGB-D | 16 | freiburg1 desk, freiburg2 xyz, freiburg3 long office |
 | KITTI | 1 | sequence 00 (outdoor) |
-| **Total** | **72** | |
+| S3E | 16+ | multi-robot indoor sequences (see below) |
+| **Total** | **88+** | |
+
+### S3E multi-robot dataset
+
+[S3E](https://github.com/PengYu-Team/S3E) is a large-scale multi-robot SLAM dataset with three robots (Alpha, Bob, Carol) each carrying synchronized stereo cameras, IMU, and LiDAR. 18 sequences across two versions cover diverse indoor/outdoor environments.
+
+**Processing pipeline** (`scripts/process_s3e.py`):
+
+1. Extract stereo frames from ROS2 `.db3` bags via CDR message parsing (JPEG → grayscale PNG, EuRoC format)
+2. Run `run_euroc_slam_with_line` to produce a `.db` map file per robot-sequence
+3. Delete temp frames
+
+```bash
+# Process all indoor sequences for all robots:
+python scripts/process_s3e.py \
+    --sequences S3E_Laboratory_1 S3E_Laboratory_2 S3E_Laboratory_3 S3E_Laboratory_4 \
+                S3E_Library_1 S3E_Teaching_Building_1 S3E_Dormitory_1 \
+    --skip-existing
+
+# Note: S3E_Tunnel_1 and S3E_Library_2 are LiDAR-only bags (no stereo cameras) — skipped automatically
+```
+
+**Per-robot calibration:** Each robot has distinct stereo intrinsics. Using Alpha's calibration for Bob/Carol leaves line triangulation with wrong rectification, producing near-zero line landmarks. Three separate YAML configs are provided:
+
+| Robot | Config | fx | focal_x_baseline |
+|-------|--------|----|-----------------|
+| Alpha | `scripts/S3E_stereo.yaml` | 1175.51 | 423.18 |
+| Bob | `scripts/S3E_stereo_bob.yaml` | 1200.35 | 432.13 |
+| Carol | `scripts/S3E_stereo_carol.yaml` | 1192.07 | 429.14 |
+
+Post-rectification parameters computed via `cv2.stereoRectify` from `S3Ev1/Calibration/{alpha,bob,carol}.yaml`. S3E_stereo.py uses per-robot YAML automatically.
+
+**Usable maps** (≥ 30 line landmarks, needed for submap training):
+
+| Sequence | Alpha | Bob | Carol |
+|----------|-------|-----|-------|
+| Laboratory 1–4 | ✓ | ✓ (recalib) | ✓ (recalib) |
+| Library 1 | ✓ | ✓ (recalib) | ✓ (recalib) |
+| Teaching Building 1 | ✓ | ✓ (recalib) | ✓ (recalib) |
+| Dormitory 1 | ✓ | ✓ (recalib) | ✓ (recalib) |
+
+**Structure-PLP-SLAM bug fixes** required for S3E maps to save correctly:
+- `landmark_line.cc`: added null guard for `_ref_keyfrm` in `update_information()` and `to_json()`
+- `map_database.cc`: removed `lm_line->update_information()` call inside `to_json()` — it deadlocks when `_mtx_observations` is held and `keyframe._mtx_pos` is contested; the call updates only the distance cache which is not serialized anyway
 
 The `dataset/maps/` folder contains an additional 71 7-Scenes `.db` files used for validation set generation.
 
@@ -232,7 +276,7 @@ python train.py --mode live --submap --model alt \
 | `--workers` | `8` | Reduce to 4 when running multiple jobs |
 | `--in_channel` | `6` | `6` = geometry only; `9` = Plücker + LAB color |
 | `--ransac` | `grassmannian` | Validation RANSAC: `sim3` \| `grassmannian` |
-| `--metric` | `recall_rot` | Checkpoint criterion: `recall_rot` \| `avg_inlier_ratio` |
+| `--metric` | `avg_inlier_ratio` | Checkpoint criterion: `avg_inlier_ratio` only |
 | `--pretrain` | — | Warm-start from checkpoint (`strict=False`) |
 | `--resume` | — | Resume from checkpoint (restores optimizer + scheduler) |
 | `--name` | today's date | Run name; controls checkpoint path `output/<dataset>/<name>/` |
@@ -365,6 +409,37 @@ Iterative fine-tuning from the joint/2026-05-17 checkpoint on live SLAM-map pair
 - All runs: `normalize_n_lines=200`, `ransac_type=sim3`, `exp_gamma=1.0` (constant LR)
 - Best checkpoint: **`output/slam_map/2026-05-20-slam-maps-v14/best_val_checkpoint.pth`**
 - Val set: `slam_map_valid` (800 scenes, 200 lines, scale range 0.10–9.73, median 8 inliers)
+
+### 2026-06-04 — submap-knn (live submap training)
+
+First run with the asymmetric **submap registration** scenario: plucker1 = small monocular submap (30–120 lines, arbitrary scale), plucker2 = large metric SLAM map (100–500 lines). Key changes:
+
+- `--submap` flag: uses `generate_submap_pair` instead of symmetric pairs
+- `--model knn`: original PluckerNetKnn (alt model was slower with no benefit)
+- `epoch_size=32000` (1000 steps/epoch), `iter_size=32`
+- Live validation from 4 held-out TUM RGB-D freiburg maps
+- Warm-started from `slam_map/2026-05-20-slam-maps-v14`
+- **74 → 78 `.db` map files** as S3E Alpha maps were added mid-run
+
+| Phase | Epochs | Best avg_inlier_ratio | Notes |
+|-------|--------|----------------------|-------|
+| submap-knn (run4) | 0–32 | 22.4% (ep 23) | initial run, epoch_size=16000 |
+| submap-knn-s3e (run5) | 0–228 | **24.845%** (ep 156) | epoch_size=32000, 51 pools |
+
+Checkpoint: `output/joint/2026-06-04-submap-knn-s3e/best_val_checkpoint.pth`
+
+### 2026-06-07 — submap-knn-s3e-v2 *(current run)*
+
+Restarted from 24.845% checkpoint after diagnosing S3E calibration issue:
+
+- **Per-robot calibration fix**: Bob and Carol maps re-generated with correct intrinsics (previous maps used Alpha's calibration for all robots, producing near-zero line pools)
+- Pretrain: `output/joint/2026-06-04-submap-knn-s3e/best_val_checkpoint.pth` (24.845%)
+- `lr=5e-6` (reduced from 1e-5 given prior decay to 3.2e-6)
+- **88 `.db` map files** once Bob/Carol S3E maps complete processing
+
+Automated restart watcher (`scripts/restart_after_s3e.sh`) will launch a final run (`2026-06-07-submap-knn-s3e-full`) once all Bob/Carol maps are ready.
+
+Monitor: `tail -f output/submap_run6.log`
 
 ### 2026-05-27/28 — scratch-v5 *(from-scratch live training, in progress)*
 
