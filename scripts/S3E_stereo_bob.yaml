@@ -1,0 +1,67 @@
+# S3E multi-robot dataset — stereo configuration for Structure-PLP-SLAM
+# Robot: Bob  (per-robot calibration from S3Ev1/Calibration/bob.yaml)
+# Post-rectification parameters computed via cv2.stereoRectify
+
+Camera.name: "S3E stereo Bob"
+Camera.setup: "stereo"
+Camera.model: "perspective"
+
+Camera.fx: 1200.347276
+Camera.fy: 1200.347276
+Camera.cx: 615.302895
+Camera.cy: 507.236397
+
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
+Camera.k3: 0.0
+
+Camera.fps: 10.0
+Camera.cols: 1224
+Camera.rows: 1024
+Camera.focal_x_baseline: 432.125020
+
+Camera.color_order: "Gray"
+
+#======================#
+# Stereo Rectification #
+#======================#
+
+StereoRectifier.K_left: [1176.371989001733, 0.0, 621.676298301324, 0.0, 1176.092984580754, 508.182115727477, 0.0, 0.0, 1.0]
+StereoRectifier.D_left: [-0.052418753922603, 0.104682361259496, 0.000650517607061, 0.000103793518711, 0.0]
+StereoRectifier.R_left: [0.9999889041477816, 0.002977057860295635, -0.003650850286589312, -0.0029702905494972467, 0.9999938632378733, 0.001857649225539652, 0.003656358211418108, -0.0018467845272344856, 0.9999916101805754]
+StereoRectifier.K_right: [1170.903035724522, 0.0, 602.239017335193, 0.0, 1170.731039292330, 505.701781863552, 0.0, 0.0, 1.0]
+StereoRectifier.D_right: [-0.053314338222019, 0.099513356190201, -0.000114531609168, 0.001057111311330, 0.0]
+StereoRectifier.R_right: [1.0, -2.0775042842584085e-14, 2.5624034144522412e-14, 2.082349189880382e-14, 0.9999982846353335, -0.0018522220143940382, -2.5584786025878437e-14, 0.001852222014394039, 0.9999982846353335]
+
+#================#
+# ORB Parameters #
+#================#
+
+Feature.max_num_keypoints: 1000
+Feature.scale_factor: 1.2
+Feature.num_levels: 8
+Feature.ini_fast_threshold: 20
+Feature.min_fast_threshold: 7
+
+#========================#
+# Initializer Parameters #
+#========================#
+
+Initializer.num_min_triangulated_pts: 50
+
+#===========================#
+# PangolinViewer Parameters #
+#===========================#
+
+PangolinViewer.keyframe_size: 0.07
+PangolinViewer.keyframe_line_width: 1
+PangolinViewer.graph_line_width: 1
+PangolinViewer.point_size: 2
+PangolinViewer.camera_size: 0.08
+PangolinViewer.camera_line_width: 3
+PangolinViewer.viewpoint_x: 0
+PangolinViewer.viewpoint_y: -0.65
+PangolinViewer.viewpoint_z: -1.9
+PangolinViewer.viewpoint_f: 400
