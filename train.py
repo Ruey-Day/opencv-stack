@@ -49,6 +49,7 @@ from datetime import date
 import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
+from torch.utils.data import RandomSampler
 import torch.optim.lr_scheduler as lr_sched
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
@@ -106,6 +107,10 @@ def parse_args():
                    help='[live mode] Use asymmetric submap generator instead of symmetric pairs')
 
     # Training
+    p.add_argument('--train_epoch_size', type=int, default=0,
+                   help='[standard mode] If > 0, each epoch samples this many pairs with '
+                        'replacement from the full dataset (keeps epochs short on large datasets). '
+                        '0 = use the full dataset per epoch.')
     p.add_argument('--epochs',     type=int,   default=1000)
     p.add_argument('--batch',      type=int,   default=1,
                    help='Batch size. Default 1 for variable-length pairs; '
@@ -238,13 +243,27 @@ def main():
     else:
         train_dataset = Sim3PluckerData(phase='train', config=configs)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=configs.train_batch_size,
-        shuffle=True, drop_last=True,
-        num_workers=args.workers, pin_memory=(args.batch > 1),
-        collate_fn=collate,
-    )
+    if args.mode == 'standard' and args.train_epoch_size > 0:
+        train_sampler = RandomSampler(train_dataset,
+                                      replacement=True,
+                                      num_samples=args.train_epoch_size)
+        logging.info(f'  train_epoch_size: {args.train_epoch_size} '
+                     f'(dataset has {len(train_dataset)} pairs)')
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=configs.train_batch_size,
+            sampler=train_sampler, drop_last=True,
+            num_workers=args.workers, pin_memory=(args.batch > 1),
+            collate_fn=collate,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=configs.train_batch_size,
+            shuffle=True, drop_last=True,
+            num_workers=args.workers, pin_memory=(args.batch > 1),
+            collate_fn=collate,
+        )
 
     if args.mode == 'live' and args.db_val:
         db_val_paths = _expand_globs(args.db_val)

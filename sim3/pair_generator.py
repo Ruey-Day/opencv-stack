@@ -203,33 +203,80 @@ def make_line_bundle(n: int, spread: float = 0.5, pos_range: float = 3.0) -> np.
     return np.concatenate([M, D], axis=1).astype(np.float32)
 
 
+def make_parallel_group(n: int, spread: float = 0.05,
+                        pos_range: float = 3.0) -> np.ndarray:
+    """N nearly-parallel lines — simulates corridors, pipes, rails, power lines."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    anchor = np.random.randn(3).astype(np.float32)
+    anchor /= np.linalg.norm(anchor) + 1e-9
+    D = anchor[None] + np.random.randn(n, 3).astype(np.float32) * spread
+    D /= np.linalg.norm(D, axis=1, keepdims=True) + 1e-9
+    P = np.random.uniform(-pos_range, pos_range, (n, 3)).astype(np.float32)
+    M = np.cross(P, D)
+    return np.concatenate([M, D], axis=1).astype(np.float32)
+
+
+def make_grid_patch(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """Lines in two perpendicular in-plane directions — fences, grids, lattices."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    normal = np.random.randn(3).astype(np.float64)
+    normal /= np.linalg.norm(normal) + 1e-9
+    perp = np.random.randn(3).astype(np.float64)
+    perp -= perp.dot(normal) * normal
+    u = (perp / (np.linalg.norm(perp) + 1e-9)).astype(np.float32)
+    v = np.cross(normal, u).astype(np.float32)
+
+    nh = n // 2
+    nv = n - nh
+
+    # Horizontal lines: direction u, positions along v axis
+    Dh = np.tile(u, (nh, 1))
+    Ph = (np.random.uniform(-pos_range, pos_range, (nh, 1)) * v[None]
+          + np.random.uniform(-pos_range, pos_range, (nh, 1)) * u[None]).astype(np.float32)
+    Mh = np.cross(Ph, Dh)
+
+    # Vertical lines: direction v, positions along u axis
+    Dv = np.tile(v, (nv, 1))
+    Pv = (np.random.uniform(-pos_range, pos_range, (nv, 1)) * u[None]
+          + np.random.uniform(-pos_range, pos_range, (nv, 1)) * v[None]).astype(np.float32)
+    Mv = np.cross(Pv, Dv)
+
+    return np.concatenate([
+        np.concatenate([Mh, Dh], axis=1),
+        np.concatenate([Mv, Dv], axis=1),
+    ], axis=0).astype(np.float32)
+
+
 def make_structured_pool(n: int) -> np.ndarray:
     """
     Diverse synthetic line pool from random geometric primitives.
 
-    Each call independently draws random counts of plane patches, wireframe
-    edges, and line bundles, then fills any remainder with random lines.
-    All primitive orientations are uniform over SO(3) — no Manhattan-world
-    or scene-type prior.  Suitable as a drop-in replacement for any context
-    where real map pools are unavailable.
+    Randomly combines plane patches, wireframe edges, line bundles, parallel
+    groups, grid patches, and unstructured lines.  All orientations are drawn
+    uniformly from SO(3) — no Manhattan-world or axis-aligned bias.
     """
     if n == 0:
         return np.zeros((0, 6), np.float32)
 
-    n_planes  = np.random.randint(0, 5)   # 0–4 random planes
-    n_boxes   = np.random.randint(0, 4)   # 0–3 wireframes
-    n_bundles = np.random.randint(0, 3)   # 0–2 line bundles
+    n_planes    = np.random.randint(0, 5)   # 0–4 planes
+    n_boxes     = np.random.randint(0, 4)   # 0–3 wireframe boxes
+    n_bundles   = np.random.randint(0, 3)   # 0–2 line bundles (corners/poles)
+    n_parallels = np.random.randint(0, 3)   # 0–2 parallel groups (corridors/rails)
+    n_grids     = np.random.randint(0, 3)   # 0–2 grid patches (fences/lattices)
 
-    # Build a flat list of (maker_fn, instance_count) tasks
-    tasks = ([(make_plane_patch,  1)] * n_planes +
-             [(make_wireframe,    1)] * n_boxes  +
-             [(make_line_bundle,  1)] * n_bundles)
+    tasks = ([(make_plane_patch,    1)] * n_planes    +
+             [(make_wireframe,      1)] * n_boxes     +
+             [(make_line_bundle,    1)] * n_bundles   +
+             [(make_parallel_group, 1)] * n_parallels +
+             [(make_grid_patch,     1)] * n_grids)
 
     if not tasks:
         return make_outliers(n)
 
-    # Distribute n lines across all primitive instances via Dirichlet split
-    fracs = np.random.dirichlet(np.ones(len(tasks) + 1))   # +1 for random fill
+    # Distribute n lines across all primitive instances + a random-fill slot
+    fracs = np.random.dirichlet(np.ones(len(tasks) + 1))
     alloc = np.floor(fracs * n).astype(int)
     alloc[-1] += n - alloc.sum()   # give rounding remainder to random fill
 
@@ -496,3 +543,158 @@ def generate_submap_pair(big_pool: np.ndarray,
     cov_hi = max(COVERAGE_MAX, min_cov_needed * 1.2)
     coverage_frac = float(np.random.uniform(cov_lo, cov_hi))
     return _build_submap_pair(big_pool, coverage_frac, context_pool=context_pool)
+
+
+# ── Fully-synthetic diverse pair generator ────────────────────────────────────
+
+# Scenario names and sampling probabilities
+_SCENARIOS = ['submap', 'relocalize', 'loop', 'dense_sparse', 'zero_overlap']
+_SCENARIO_P = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+
+
+def generate_diverse_pair() -> dict:
+    """
+    Generate one fully-synthetic training pair from a randomly chosen scenario.
+
+    No map files are required — all line pools are produced by make_structured_pool,
+    which combines random geometric primitives (plane patches, wireframes, line
+    bundles, parallel groups, grid patches) with no axis-aligned or scene-type
+    prior.
+
+    Scenarios and their real-world analogues
+    ----------------------------------------
+    submap      (30%) — small/noisy/sparse monocular query submap vs large/clean
+                        metric reference map.  Low overlap (beta(1.5,5)), high
+                        moment noise on the query side, 10–150 vs 80–700 lines.
+    relocalize  (25%) — cross-session re-localization: two maps of similar size
+                        from different SLAM runs.  Moderate overlap, similar noise.
+    loop        (20%) — loop-closure: both maps from the same session, high
+                        overlap (beta(5,2)), low noise.
+    dense_sparse(15%) — one map is very dense (RGB-D / LiDAR) the other sparse
+                        (monocular).  Any overlap, large density ratio.
+    zero_overlap(10%) — completely disjoint views — no inliers (hard negative).
+
+    Scale: log-uniform in [0.1, 10] for all scenarios (Sim(3) dataset).
+    Line counts: variable per pair — NOT padded to any fixed size.
+
+    Returns
+    -------
+    dict with keys: plucker1 (n1,6), plucker2 (n2,6), matches (2,k),
+                    R_gt (3,3), t_gt (3,1), s_gt scalar.
+    plucker1 = query / SLAM side   (arbitrary scale, noisy)
+    plucker2 = reference / metric side  (metric scale, cleaner)
+    """
+    scenario = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
+
+    # ── Zero-overlap: two unrelated structured pools ──────────────────────────
+    if scenario == 'zero_overlap':
+        n1 = np.random.randint(10, 400)
+        n2 = np.random.randint(10, 600)
+        s  = float(np.exp(np.random.uniform(np.log(SCALE_RANGE[0]),
+                                             np.log(SCALE_RANGE[1]))))
+        return dict(
+            plucker1 = make_structured_pool(n1),
+            plucker2 = make_structured_pool(n2),
+            matches  = np.zeros((2, 0), np.int32),
+            R_gt     = np.eye(3, dtype=np.float32),
+            t_gt     = np.zeros((3, 1), dtype=np.float32),
+            s_gt     = np.float32(s),
+        )
+
+    # ── Scenario-specific size / overlap / noise parameters ──────────────────
+    if scenario == 'submap':
+        n1           = np.random.randint(10, 150)
+        n2           = np.random.randint(max(n1, 80), 700)
+        overlap_frac = float(np.random.beta(1.5, 5.0))       # bias: low overlap
+        noise1       = float(np.exp(np.random.uniform(np.log(0.020), np.log(0.50))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.05))))
+
+    elif scenario == 'relocalize':
+        base         = int(np.exp(np.random.uniform(np.log(30), np.log(400))))
+        r            = np.random.uniform(0.5, 2.0)
+        n1           = max(10, int(base * r))
+        n2           = max(10, int(base / r))
+        overlap_frac = float(np.random.beta(2.5, 2.5))       # moderate overlap
+        noise_shared = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.20))))
+        noise1       = noise2 = noise_shared
+
+    elif scenario == 'loop':
+        n_both       = np.random.randint(30, 500)
+        n1           = n2 = n_both
+        overlap_frac = float(np.random.beta(5.0, 2.0))       # bias: high overlap
+        noise_shared = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.15))))
+        noise1       = noise2 = noise_shared
+
+    else:  # dense_sparse
+        n2           = np.random.randint(150, 700)            # dense reference
+        density_r    = np.random.uniform(0.05, 0.40)
+        n1           = max(5, int(n2 * density_r))            # sparse query
+        overlap_frac = float(np.random.beta(2.0, 2.0))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.30))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
+
+    # ── Shared inlier count ───────────────────────────────────────────────────
+    k  = max(0, int(overlap_frac * min(n1, n2)))
+    n1 = max(n1, k)
+    n2 = max(n2, k)
+
+    # ── Random Sim(3): query frame → reference frame ──────────────────────────
+    # p_ref = s * R * p_query + t
+    s   = float(np.exp(np.random.uniform(np.log(SCALE_RANGE[0]),
+                                          np.log(SCALE_RANGE[1]))))
+    R   = random_rotation()
+    t   = np.random.uniform(-2.0, 2.0, 3).astype(np.float32)
+    # Inverse Sim(3): reference → query
+    s_i = 1.0 / s
+    R_i = R.T
+    t_i = -(R_i @ t) * s_i
+
+    # ── Inlier lines ──────────────────────────────────────────────────────────
+    if k > 0:
+        # Generate inlier pool in the reference frame, then transform to query
+        inliers_ref = make_structured_pool(k + max(k // 4, 8))[:k].copy()
+        inliers_q   = apply_sim3_plucker(inliers_ref, s_i, R_i, t_i)
+        # Independent moment noise on each side
+        inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
+        inliers_ref[:, :3] += np.random.randn(k, 3).astype(np.float32) * noise2
+    else:
+        inliers_q   = np.zeros((0, 6), np.float32)
+        inliers_ref = np.zeros((0, 6), np.float32)
+
+    # ── Outlier lines (no correspondences) ───────────────────────────────────
+    n_out1 = max(0, n1 - k)
+    n_out2 = max(0, n2 - k)
+
+    # Query outliers: generated in the reference frame, then transformed to
+    # query frame so moment magnitudes are consistent with the inliers.
+    out_q = (apply_sim3_plucker(make_structured_pool(n_out1), s_i, R_i, t_i)
+             if n_out1 > 0 else np.zeros((0, 6), np.float32))
+    out_r = (make_structured_pool(n_out2)
+             if n_out2 > 0 else np.zeros((0, 6), np.float32))
+
+    # ── Assemble and shuffle ──────────────────────────────────────────────────
+    q_parts = [p for p in [inliers_q, out_q]   if len(p) > 0]
+    r_parts = [p for p in [inliers_ref, out_r] if len(p) > 0]
+
+    query_all = (np.concatenate(q_parts, axis=0)
+                 if q_parts else make_structured_pool(max(n1, 10)))
+    ref_all   = (np.concatenate(r_parts, axis=0)
+                 if r_parts else make_structured_pool(max(n2, 10)))
+
+    i1 = np.random.permutation(len(query_all))
+    i2 = np.random.permutation(len(ref_all))
+    query_all = query_all[i1]
+    ref_all   = ref_all[i2]
+
+    # Inliers occupied rows 0..k-1 before the shuffle
+    m1 = np.argsort(i1)[:k].astype(np.int32)
+    m2 = np.argsort(i2)[:k].astype(np.int32)
+
+    return dict(
+        plucker1 = query_all.astype(np.float32),
+        plucker2 = ref_all.astype(np.float32),
+        matches  = np.stack([m1, m2], 0) if k > 0 else np.zeros((2, 0), np.int32),
+        R_gt     = R.astype(np.float32),
+        t_gt     = t.reshape(3, 1).astype(np.float32),
+        s_gt     = np.float32(s),
+    )
