@@ -122,8 +122,6 @@ def parse_args():
                    help='Override run name (default: today\'s date)')
 
     # Extensions
-    p.add_argument('--in_channel', type=int, default=6,
-                   help='6=geometry only (default)  9=Plücker+LAB color')
     p.add_argument('--cosine_lr',  action='store_true',
                    help='CosineAnnealingWarmRestarts instead of ExponentialLR')
     p.add_argument('--pose_loss',  type=float, default=0.0,
@@ -190,7 +188,7 @@ def main():
     configs.ransac_type      = args.ransac
     configs.val_max_iter     = args.val_max_iter
     configs.resume_dir       = None
-    configs.in_channel       = args.in_channel
+    configs.in_channel       = 6
     configs.pose_loss_weight = args.pose_loss
     configs.model_type       = args.model
     configs.alt_n_blocks     = args.alt_n_blocks
@@ -209,7 +207,6 @@ def main():
     logging.info(f'  mode        : {args.mode}')
     logging.info(f'  dataset     : {args.dataset}')
     logging.info(f'  val_dataset : {val_dataset}')
-    logging.info(f'  in_channel  : {args.in_channel}')
     logging.info(f'  cosine_lr   : {args.cosine_lr}')
     logging.info(f'  ransac      : {args.ransac}')
     logging.info(f'  metric      : {args.metric}')
