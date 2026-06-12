@@ -106,7 +106,7 @@ def apply_sim3_plucker(L6: np.ndarray, s: float, R: np.ndarray,
     return np.concatenate([m_new, d_new], axis=1).astype(np.float32)
 
 
-# ── Outlier generator ─────────────────────────────────────────────────────────
+# ── Outlier generator (kept as a building block) ─────────────────────────────
 
 def make_outliers(n: int, n_clusters: int = 5, spread: float = 0.2,
                   pos_range: float = 3.0) -> np.ndarray:
@@ -128,19 +128,136 @@ def make_outliers(n: int, n_clusters: int = 5, spread: float = 0.2,
     return out[np.random.permutation(len(out))][:n]
 
 
+# ── Structured pool generators ────────────────────────────────────────────────
+# All orientations are drawn uniformly from SO(3) — no axis-aligned or
+# Manhattan-world bias — so the network cannot exploit any scene-type prior.
+
+def make_plane_patch(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """N lines lying on a randomly oriented plane (any surface type)."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    normal = np.random.randn(3).astype(np.float64)
+    normal /= np.linalg.norm(normal) + 1e-9
+    perp = np.random.randn(3).astype(np.float64)
+    perp -= perp.dot(normal) * normal
+    u = perp / (np.linalg.norm(perp) + 1e-9)
+    v = np.cross(normal, u)
+
+    angles = np.random.uniform(0.0, 2.0 * np.pi, n)
+    D = (np.outer(np.cos(angles), u) + np.outer(np.sin(angles), v)).astype(np.float32)
+    D /= np.linalg.norm(D, axis=1, keepdims=True) + 1e-9
+
+    a = np.random.uniform(-pos_range, pos_range, n)
+    b = np.random.uniform(-pos_range, pos_range, n)
+    P = (np.outer(a, u) + np.outer(b, v)).astype(np.float32)
+    M = np.cross(P, D)
+    return np.concatenate([M, D], axis=1).astype(np.float32)
+
+
+def make_wireframe(n: int, scale: float = 2.0) -> np.ndarray:
+    """Edges of a randomly oriented and scaled cuboid, subsampled/repeated to n."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    dims = np.random.uniform(0.3, 1.5, 3) * scale
+    # 8 corners of axis-aligned box, then randomly rotated
+    signs = np.array([[-1,-1,-1],[-1,-1,1],[-1,1,-1],[-1,1,1],
+                      [ 1,-1,-1],[ 1,-1,1],[ 1, 1,-1],[ 1, 1,1]], np.float64)
+    corners = signs * dims[None]
+    R = random_rotation().astype(np.float64)
+    origin = np.random.uniform(-scale, scale, 3)
+    corners = (R @ corners.T).T + origin
+    # 12 edges: 4 parallel to each of the 3 local axes
+    edge_pairs = [
+        (0,1),(2,3),(4,5),(6,7),
+        (0,2),(1,3),(4,6),(5,7),
+        (0,4),(1,5),(2,6),(3,7),
+    ]
+    lines = []
+    for a, b in edge_pairs:
+        diff = corners[b] - corners[a]
+        ln = np.linalg.norm(diff)
+        if ln < 1e-9:
+            continue
+        d = (diff / ln).astype(np.float32)
+        p = ((corners[a] + corners[b]) * 0.5).astype(np.float32)
+        lines.append(np.concatenate([np.cross(p, d), d]))
+    if not lines:
+        return make_outliers(n)
+    arr = np.array(lines, np.float32)
+    idx = np.random.choice(len(arr), n, replace=(n > len(arr)))
+    return arr[idx]
+
+
+def make_line_bundle(n: int, spread: float = 0.5, pos_range: float = 3.0) -> np.ndarray:
+    """N lines passing near a common focus (corners, poles, radiating structures)."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    focus = np.random.uniform(-pos_range, pos_range, 3).astype(np.float32)
+    D = np.random.randn(n, 3).astype(np.float32)
+    D /= np.linalg.norm(D, axis=1, keepdims=True) + 1e-9
+    offsets = np.random.randn(n, 3).astype(np.float32) * spread
+    # Project offset perpendicular to direction so each line passes near focus
+    proj = (offsets * D).sum(axis=1, keepdims=True) * D
+    P = focus[None] + offsets - proj
+    M = np.cross(P, D)
+    return np.concatenate([M, D], axis=1).astype(np.float32)
+
+
+def make_structured_pool(n: int) -> np.ndarray:
+    """
+    Diverse synthetic line pool from random geometric primitives.
+
+    Each call independently draws random counts of plane patches, wireframe
+    edges, and line bundles, then fills any remainder with random lines.
+    All primitive orientations are uniform over SO(3) — no Manhattan-world
+    or scene-type prior.  Suitable as a drop-in replacement for any context
+    where real map pools are unavailable.
+    """
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+
+    n_planes  = np.random.randint(0, 5)   # 0–4 random planes
+    n_boxes   = np.random.randint(0, 4)   # 0–3 wireframes
+    n_bundles = np.random.randint(0, 3)   # 0–2 line bundles
+
+    # Build a flat list of (maker_fn, instance_count) tasks
+    tasks = ([(make_plane_patch,  1)] * n_planes +
+             [(make_wireframe,    1)] * n_boxes  +
+             [(make_line_bundle,  1)] * n_bundles)
+
+    if not tasks:
+        return make_outliers(n)
+
+    # Distribute n lines across all primitive instances via Dirichlet split
+    fracs = np.random.dirichlet(np.ones(len(tasks) + 1))   # +1 for random fill
+    alloc = np.floor(fracs * n).astype(int)
+    alloc[-1] += n - alloc.sum()   # give rounding remainder to random fill
+
+    parts = []
+    for (maker, _), k in zip(tasks, alloc[:-1]):
+        if k > 0:
+            parts.append(maker(k))
+    if alloc[-1] > 0:
+        parts.append(make_outliers(alloc[-1]))
+
+    pool = np.concatenate(parts, axis=0)
+    return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+
 def _random_outliers_from_pool(pool: np.ndarray, n: int) -> np.ndarray:
-    """Draw n random lines from pool; fall back to make_outliers if pool too small."""
+    """Draw n lines from pool; fall back to make_structured_pool if pool too small."""
     if pool is not None and len(pool) >= n > 0:
         idx = np.random.choice(len(pool), n, replace=False)
         return pool[idx]
-    return make_outliers(n)
+    return make_structured_pool(n)
 
 
 # ── Symmetric pair builder (cap-free) ─────────────────────────────────────────
 
 def _build_pair(rgbd_in: np.ndarray,
                 pool_filler_slam=None,
-                pool_filler_rgbd=None) -> dict:
+                pool_filler_rgbd=None,
+                force_scale: float = None) -> dict:
     """
     Cap-free symmetric pair.
 
@@ -162,8 +279,10 @@ def _build_pair(rgbd_in: np.ndarray,
     slam_in_metric[:, :3] += np.random.randn(n_slam_in, 3).astype(np.float32) * noise_sigma
 
     # Random Sim(3) — maps metric frame → SLAM frame
-    log_s = np.random.uniform(np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1]))
-    s = float(np.exp(log_s))
+    if force_scale is not None:
+        s = float(force_scale)
+    else:
+        s = float(np.exp(np.random.uniform(np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1]))))
     R = random_rotation()
     t = np.random.uniform(-2.0, 2.0, 3).astype(np.float32)
 
@@ -213,13 +332,13 @@ def _build_pair(rgbd_in: np.ndarray,
 
 
 def _zero_overlap_pair() -> dict:
-    """Pair with no true correspondences — variable size random outlier lines."""
+    """Pair with no true correspondences — structured pools with no inliers."""
     log_s = np.random.uniform(np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1]))
     n1 = np.random.randint(30, 101)
     n2 = np.random.randint(30, 101)
     return dict(
-        plucker1 = make_outliers(n1),
-        plucker2 = make_outliers(n2),
+        plucker1 = make_structured_pool(n1),
+        plucker2 = make_structured_pool(n2),
         matches  = np.zeros((2, 0), dtype=np.int32),
         R_gt     = np.eye(3, dtype=np.float32),
         t_gt     = np.zeros((3, 1), dtype=np.float32),
@@ -319,7 +438,8 @@ def _build_submap_pair(big_pool: np.ndarray,
 
 # ── Public generators ─────────────────────────────────────────────────────────
 
-def generate_pair(pool6: np.ndarray, overlap_probs=None) -> dict | None:
+def generate_pair(pool6: np.ndarray, overlap_probs=None,
+                  force_scale: float = None) -> dict | None:
     """Intra-map symmetric pair (cap-free)."""
     if len(pool6) < 6:
         return None
@@ -333,7 +453,8 @@ def generate_pair(pool6: np.ndarray, overlap_probs=None) -> dict | None:
     idx_rgbd  = np.random.choice(len(pool6), n_rgbd, replace=False)
     remaining = np.delete(pool6, idx_rgbd, axis=0)
     return _build_pair(pool6[idx_rgbd].copy(),
-                       pool_filler_rgbd=remaining if len(remaining) else None)
+                       pool_filler_rgbd=remaining if len(remaining) else None,
+                       force_scale=force_scale)
 
 
 def generate_inter_map_pair(pool_a: np.ndarray, pool_b: np.ndarray,
@@ -363,8 +484,15 @@ def generate_submap_pair(big_pool: np.ndarray,
     plucker1 (submap)  — 30–120 lines, arbitrary scale
     plucker2 (big map) — 100–500 lines, metric scale
     """
-    if len(big_pool) < max(6, SUBMAP_N_MIN):
+    n = len(big_pool)
+    if n < max(6, SUBMAP_N_MIN):
         return None
 
-    coverage_frac = float(np.random.uniform(COVERAGE_MIN, COVERAGE_MAX))
+    # Ensure coverage_frac is large enough that n_overlap >= SUBMAP_N_MIN.
+    # For small pools this may push coverage above COVERAGE_MAX, which is fine
+    # since the submap still samples a random fraction of the overlap region.
+    min_cov_needed = SUBMAP_N_MIN / n
+    cov_lo = max(COVERAGE_MIN, min_cov_needed)
+    cov_hi = max(COVERAGE_MAX, min_cov_needed * 1.2)
+    coverage_frac = float(np.random.uniform(cov_lo, cov_hi))
     return _build_submap_pair(big_pool, coverage_frac, context_pool=context_pool)
