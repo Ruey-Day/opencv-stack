@@ -49,6 +49,7 @@ from datetime import date
 import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
+from torch.utils.data import RandomSampler
 import torch.optim.lr_scheduler as lr_sched
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
@@ -58,7 +59,7 @@ sys.path.insert(0, os.path.abspath(PLUECKERNET_DIR))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import get_config
-from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData
+from sim3.dataloader import Sim3PluckerData, LiveSim3PluckerData, variable_collate
 from sim3.trainer import Sim3Trainer
 
 logging.basicConfig(
@@ -102,10 +103,21 @@ def parse_args():
                    help='[live mode] Val pairs generated when no .pkl split exists (default: 400)')
     p.add_argument('--inter_map_ratio', type=float, default=0.3,
                    help='[live mode] Fraction of cross-map pairs (default: 0.3)')
+    p.add_argument('--submap',          action='store_true',
+                   help='[live mode] Use asymmetric submap generator instead of symmetric pairs')
 
     # Training
+    p.add_argument('--train_epoch_size', type=int, default=0,
+                   help='[standard mode] If > 0, each epoch samples this many pairs with '
+                        'replacement from the full dataset (keeps epochs short on large datasets). '
+                        '0 = use the full dataset per epoch.')
     p.add_argument('--epochs',     type=int,   default=1000)
-    p.add_argument('--batch',      type=int,   default=32)
+    p.add_argument('--batch',      type=int,   default=1,
+                   help='Batch size. Default 1 for variable-length pairs; '
+                        'use variable_collate (automatic) for batch > 1.')
+    p.add_argument('--iter_size',  type=int,   default=32,
+                   help='Gradient accumulation steps (effective batch = batch × iter_size). '
+                        'Default 32 gives the same gradient quality as the old batch=32.')
     p.add_argument('--lr',         type=float, default=5e-4)
     p.add_argument('--gamma',      type=float, default=0.99,
                    help='ExponentialLR decay per epoch (default: 0.99). Use 1.0 to disable.')
@@ -115,19 +127,28 @@ def parse_args():
                    help='Override run name (default: today\'s date)')
 
     # Extensions
-    p.add_argument('--in_channel', type=int, default=6,
-                   help='6=geometry only (default)  9=Plücker+LAB color')
     p.add_argument('--cosine_lr',  action='store_true',
                    help='CosineAnnealingWarmRestarts instead of ExponentialLR')
     p.add_argument('--pose_loss',  type=float, default=0.0,
                    help='Weight for differentiable Sim(3) pose loss (0 = disabled)')
 
+    # Model architecture
+    p.add_argument('--model', default='knn', choices=['knn', 'alt'],
+                   help='knn: original PluckerNetKnn (default); '
+                        'alt: asymmetric alternating attention (FUSER-inspired)')
+    p.add_argument('--alt_n_blocks', type=int, default=3,
+                   help='[alt model] Number of alternating attention blocks. '
+                        'Default 3 → 12 attention modules (same as knn baseline). '
+                        'Increase for more expressivity at higher compute cost.')
+
     # Validation RANSAC backend
     p.add_argument('--ransac',  default='grassmannian', choices=['sim3', 'grassmannian'],
                    help='RANSAC solver for validation metrics (default: grassmannian)')
-    p.add_argument('--metric',  default='recall_rot',
-                   choices=['recall_rot', 'avg_inlier_ratio'],
-                   help='Metric used to pick the best checkpoint (default: recall_rot)')
+    p.add_argument('--val_max_iter', type=int, default=-1,
+                   help='Max validation samples per epoch (-1 = all)')
+    p.add_argument('--metric',  default='avg_inlier_ratio',
+                   choices=['avg_inlier_ratio'],
+                   help='Metric used to pick the best checkpoint')
 
     # Checkpointing
     p.add_argument('--pretrain', default=None,
@@ -159,21 +180,23 @@ def main():
 
     val_dataset = args.val_dataset or args.dataset
 
-    configs.dataset             = args.dataset
-    configs.data_dir            = args.data_dir
-    configs.gpu_inds            = args.gpu
-    configs.model_nb            = args.name if args.name else str(date.today())
-    configs.train_batch_size    = args.batch
-    configs.train_lr            = args.lr
-    configs.exp_gamma           = args.gamma
-    configs.train_epoches       = args.epochs
-    configs.best_val_metric     = args.metric
-    configs.ransac_type         = args.ransac
-    configs.resume_dir          = None
-    configs.normalize_n_lines   = args.n_lines
-    configs.normalize_n_inliers = args.n_inliers
-    configs.in_channel          = args.in_channel
-    configs.pose_loss_weight    = args.pose_loss
+    configs.dataset          = args.dataset
+    configs.data_dir         = args.data_dir
+    configs.gpu_inds         = args.gpu
+    configs.model_nb         = args.name if args.name else str(date.today())
+    configs.train_batch_size = args.batch
+    configs.iter_size        = args.iter_size
+    configs.train_lr         = args.lr
+    configs.exp_gamma        = args.gamma
+    configs.train_epoches    = args.epochs
+    configs.best_val_metric  = args.metric
+    configs.ransac_type      = args.ransac
+    configs.val_max_iter     = args.val_max_iter
+    configs.resume_dir       = None
+    configs.in_channel       = 6
+    configs.pose_loss_weight = args.pose_loss
+    configs.model_type       = args.model
+    configs.alt_n_blocks     = args.alt_n_blocks
 
     dconfig = vars(configs)
     dconfig['resume'] = args.resume
@@ -189,13 +212,22 @@ def main():
     logging.info(f'  mode        : {args.mode}')
     logging.info(f'  dataset     : {args.dataset}')
     logging.info(f'  val_dataset : {val_dataset}')
-    logging.info(f'  in_channel  : {args.in_channel}')
     logging.info(f'  cosine_lr   : {args.cosine_lr}')
     logging.info(f'  ransac      : {args.ransac}')
     logging.info(f'  metric      : {args.metric}')
     logging.info(f'  pose_loss   : {args.pose_loss}')
+    logging.info(f'  model       : {args.model}')
+    logging.info(f'  batch       : {args.batch}  iter_size: {args.iter_size}  '
+                 f'(effective batch: {args.batch * args.iter_size})')
+    if args.model == 'alt':
+        logging.info(f'  alt_n_blocks: {args.alt_n_blocks}')
+    if args.submap:
+        logging.info('  pair mode   : submap (asymmetric big-map→small-submap)')
 
     # ── Build training data loader ────────────────────────────────────────────
+    # variable_collate handles batches of different-N pairs; batch_size=1 needs none.
+    collate = variable_collate if args.batch > 1 else None
+
     if args.mode == 'live':
         if not args.db_train:
             raise ValueError('--mode live requires --db_train <path(s)>')
@@ -206,23 +238,48 @@ def main():
             epoch_size=args.epoch_size,
             config=configs,
             inter_map_ratio=args.inter_map_ratio,
+            mode='submap' if args.submap else 'symmetric',
         )
     else:
         train_dataset = Sim3PluckerData(phase='train', config=configs)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=configs.train_batch_size,
-        shuffle=True, drop_last=True,
-        num_workers=args.workers, pin_memory=True,
-    )
+    if args.mode == 'standard' and args.train_epoch_size > 0:
+        train_sampler = RandomSampler(train_dataset,
+                                      replacement=True,
+                                      num_samples=args.train_epoch_size)
+        logging.info(f'  train_epoch_size: {args.train_epoch_size} '
+                     f'(dataset has {len(train_dataset)} pairs)')
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=configs.train_batch_size,
+            sampler=train_sampler, drop_last=True,
+            num_workers=args.workers, pin_memory=(args.batch > 1),
+            collate_fn=collate,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=configs.train_batch_size,
+            shuffle=True, drop_last=True,
+            num_workers=args.workers, pin_memory=(args.batch > 1),
+            collate_fn=collate,
+        )
 
-    # Validation: prefer a static .pkl split; fall back to live generation
-    val_cfg = edict(dict(configs))
-    val_cfg.dataset = val_dataset
-    val_pkl_dir = os.path.join(args.data_dir, f'{val_dataset}_valid')
-
-    val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
+    if args.mode == 'live' and args.db_val:
+        db_val_paths = _expand_globs(args.db_val)
+        logging.info(f'  live db_val: {len(db_val_paths)} held-out map files')
+        val_size = args.val_size if args.val_max_iter < 0 else args.val_max_iter
+        val_dataset_obj = LiveSim3PluckerData(
+            db_paths=db_val_paths,
+            epoch_size=val_size,
+            config=configs,
+            inter_map_ratio=args.inter_map_ratio,
+            mode='submap' if args.submap else 'symmetric',
+        )
+    else:
+        val_cfg = edict(dict(configs))
+        val_cfg.dataset = val_dataset
+        val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
 
     val_loader = DataLoader(
         val_dataset_obj,
