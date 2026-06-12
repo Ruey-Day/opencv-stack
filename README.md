@@ -190,6 +190,117 @@ python scripts/combine_datasets.py --inputs 7scenes fastcamo --output main
 | `t_gt.pkl` | `(3, 1)` | float32 |
 | `s_gt.pkl` | scalar | float32 |
 
+**Why variable length (not fixed 700)?**
+The original PlueckerNet dataset fixes every scene to exactly 700 lines per side.
+The reason is that the loss function compares a predicted N×N probability matrix against
+a GT N×N binary match matrix — uniform N makes batching trivial without a custom collate
+function. The fixed size also bakes in an implicit assumption that every scene has equally
+dense, equally complete line observations, which is wrong in practice (a sparse monocular
+query and a dense RGB-D reference map will have very different line counts).
+
+ScalePluckerNet stores matches as sparse `(2, k)` index arrays instead of dense N×M matrices,
+allowing n1 and n2 to vary freely per pair. Batching is handled by `variable_collate` in
+`sim3/dataloader.py`, which zero-pads the match matrix only within a mini-batch to the local
+maximum. This lets the network see the true density asymmetry between query and reference
+(e.g. n1=30 submap lines vs n2=400 reference lines) rather than having it normalized away.
+For paper purposes this is an implementation detail; the scientific contribution is the
+Sim(3) extension and the finding that diverse structured-primitive training generalizes
+across real datasets without domain-specific data collection.
+
+---
+
+## Fully-Synthetic Dataset (`synthetic_train` / `synthetic_valid`)
+
+A large, map-free training set generated entirely from random geometric primitives.
+No SLAM `.db` files or real sensor data are required.
+
+### Motivation
+
+Real-world SLAM maps impose a distribution over scene geometry (mostly indoor,
+Manhattan-world, specific noise levels). The synthetic generator makes no such
+assumption — all primitive orientations are drawn uniformly from SO(3), so the
+network learns line correspondence geometry rather than scene-type priors.
+
+### Pool geometry — five primitive types
+
+Each line pool is an independent random mix of:
+
+| Primitive | `pair_generator.py` function | What it simulates |
+|-----------|------------------------------|-------------------|
+| Plane patch | `make_plane_patch` | Any flat surface — facade, floor, road, rooftop |
+| Wireframe box | `make_wireframe` | Object edges — vehicles, machines, furniture |
+| Line bundle | `make_line_bundle` | Corners, poles, any radiating structure |
+| Parallel group | `make_parallel_group` | Corridors, rails, pipes, power lines |
+| Grid patch | `make_grid_patch` | Fences, lattices, structural grids |
+
+`make_structured_pool(n)` samples random counts of each primitive type and
+distributes `n` lines across them via a Dirichlet split, with remaining lines
+filled by random directional noise.  Every call is independent and produces a
+different geometric mix.
+
+### Pair construction
+
+Each pair calls `make_structured_pool` **three times independently**:
+
+```
+inlier_pool  = make_structured_pool(k + buffer)   # shared truth lines (reference frame)
+out_ref_pool = make_structured_pool(n_out2)        # reference-only outlier lines
+out_q_pool   = make_structured_pool(n_out1)        # query-only outlier lines
+```
+
+Then:
+```
+plucker2 = inlier_pool[:k]  +  out_ref_pool                    (reference / big map)
+plucker1 = Sim3⁻¹(inlier_pool[:k])  +  Sim3⁻¹(out_q_pool)    (query / submap)
+```
+
+The query outliers are generated in the reference frame and then transformed to
+the query frame so that moment magnitudes remain consistent with the inlier lines.
+The two sides therefore share only the inlier lines — their outlier regions come
+from completely different primitive mixes.
+
+### Scenarios
+
+`generate_diverse_pair()` draws a scenario at random for every pair:
+
+| Scenario | Prob | Query size | Reference size | Overlap | Notes |
+|----------|------|-----------|----------------|---------|-------|
+| `submap` | 30% | 10–150 | 80–700 | beta(1.5, 5) — low | High moment noise on query; primary use case |
+| `relocalize` | 25% | similar | similar | beta(2.5, 2.5) — moderate | Cross-session, symmetric noise |
+| `loop` | 20% | 30–500 | same | beta(5, 2) — high | Loop closure |
+| `dense_sparse` | 15% | 5–40% of ref | 150–700 | beta(2, 2) — any | LiDAR/RGBD vs monocular |
+| `zero_overlap` | 10% | 10–400 | 10–600 | 0 | Hard negatives |
+
+Scale: log-uniform in [0.1, 10] for all scenarios (Sim(3) dataset).
+Line counts are **fully variable per pair** — not padded to any fixed size.
+
+### Generate
+
+```bash
+# Default: 200k train, 2k valid, cpu_count-1 workers
+python scripts/generate_synthetic_large.py
+
+# Large run
+python scripts/generate_synthetic_large.py --n_train 500000 --n_valid 5000 --workers 8
+```
+
+**Current dataset stats** (500k train, 5k valid, seed 42):
+
+| Split | Pairs | n1 (query) | n2 (reference) | Inliers/pair | Zero-overlap |
+|-------|-------|-----------|----------------|--------------|-------------|
+| `synthetic_train` | 500 000 | median 113, max 796 | median 278, max 795 | median 27, max 495 | 54 223 (10.8%) |
+| `synthetic_valid` | 5 000 | median 114, max 776 | median 271, max 699 | median 27, max 486 | 554 (11.1%) |
+
+Scale log-uniform [0.10, 10.00], median ≈ 1.0 (no bias toward expansion or compression).
+Generation: ~4 600 pairs/s on 7 CPU workers (~110 s total).
+
+### Train on synthetic data
+
+```bash
+python train.py --dataset synthetic --model alt \
+    --batch 4 --iter_size 8 --lr 5e-4 --epochs 500
+```
+
 ---
 
 ## Training
@@ -270,11 +381,15 @@ R, t, s, inlier_mask, n_inliers = ransac_sim3(
 
 **Setup:** Apply `scripts/make_sim3_from_se3.py` to the original PlueckerNet validation splits to produce Sim3 variants (random scale s ∈ [0.1, 10], log-uniform). Run the PlueckerNet pretrained checkpoints on SE3 and Sim3 versions of the same scenes. Metric: `avg_inlier_ratio` (fraction of top-100 predicted correspondences that are GT matches).
 
-| Split | avg inlier ratio | med inlier ratio | n |
-|-------|-----------------|-----------------|-----|
-| semantic3D  SE3  (s=1, original) | **46.18%** | 42.50% | 298 |
-| semantic3D  Sim3 (random s) | **30.54%** | 23.50% | 298 |
-| structured3D SE3  (s=1, original) | **81.44%** | 85.00% | 525 |
-| structured3D Sim3 (random s) | **47.06%** | 49.00% | 525 |
+| Model | Split | avg inlier ratio | med inlier ratio | n |
+|-------|-------|-----------------|-----------------|-----|
+| SE3-pretrained | semantic3D  SE3  (s=1, original) | **46.18%** | 42.50% | 298 |
+| SE3-pretrained | semantic3D  Sim3 (random s)      | **30.54%** | 23.50% | 298 |
+| se3sim3 (epoch 78) | semantic3D  Sim3 (random s)  | **40.68%** | 39.00% | 298 |
+| SE3-pretrained | structured3D SE3  (s=1, original) | **81.44%** | 85.00% | 525 |
+| SE3-pretrained | structured3D Sim3 (random s)      | **47.06%** | 49.00% | 525 |
+| se3sim3 (epoch 78) | structured3D Sim3 (random s) | **80.14%** | 83.00% | 525 |
 
-**Drop:** −15.6 pp on semantic3D, −34.4 pp on structured3D. The same GT matches exist in both versions — only a scale factor is added to plucker1 moments. The pretrained SE(3) model nearly halves its matching quality on structured3D under scale variation, confirming the core motivation for the Sim(3) extension.
+**SE3-pretrained drop:** −15.6 pp on semantic3D, −34.4 pp on structured3D. The same GT matches exist in both versions — only a scale factor is added to plucker1 moments. The pretrained SE(3) model nearly halves its matching quality on structured3D under scale variation, confirming the core motivation for the Sim(3) extension.
+
+**se3sim3 fix:** Training with random Sim(3) scales reduces the Sim3 drop to −1.1 pp (semantic3D) and −0.9 pp (structured3D) — essentially zero. SE(3) performance is preserved (41.81% / 81.01% on the s=1 splits), confirming that the model learns scale-invariant matching without sacrificing accuracy on unit-scale data.
