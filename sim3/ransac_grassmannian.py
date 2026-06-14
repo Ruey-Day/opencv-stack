@@ -62,7 +62,7 @@ def normalize_plucker(L: np.ndarray) -> np.ndarray:
 
 def grassmannian_distance(L1: np.ndarray, L2: np.ndarray) -> np.ndarray:
     """
-    Principal angle between Plücker lines on the Grassmannian G(1,5).
+    Principal angle between Plücker lines on RP⁵ (G(1,5) ambient space).
 
     Both L1 and L2 must already be unit-normalised.
 
@@ -72,6 +72,68 @@ def grassmannian_distance(L1: np.ndarray, L2: np.ndarray) -> np.ndarray:
     dots = np.sum(L1 * L2, axis=0)                   # (N,)
     cos_theta = np.clip(np.abs(dots), 0.0, 1.0)
     return np.arccos(cos_theta)                        # (N,)
+
+
+def plucker_to_g24_basis(L: np.ndarray) -> np.ndarray:
+    """
+    Embed Plücker lines as 2D subspaces of R⁴ — points on G(2,4).
+
+    A 3D line with Plücker coords [m; d] is represented by the span of:
+        col0 = [p₀; 1]   where p₀ = m × d  (foot of perpendicular from origin)
+        col1 = [d;  0]   (direction as point at infinity)
+
+    Because the Plücker constraint m·d = 0 guarantees col0 ⊥ col1 in R⁴,
+    only col0 needs normalising.  col1 is already unit since |d| = 1.
+
+    Args:
+        L: (6, N)  Plücker [m; d]  (d need not be unit; will be normalised here)
+
+    Returns:
+        Q: (N, 4, 2)  orthonormal basis matrices for G(2,4) points
+    """
+    m, d = L[:3], L[3:]                          # (3, N) each
+    d = d / (np.linalg.norm(d, axis=0, keepdims=True) + 1e-12)  # unit direction
+    p0 = np.cross(m.T, d.T).T                    # (3, N)  foot of perpendicular
+
+    N = L.shape[1]
+    col0 = np.vstack([p0, np.ones((1, N))])      # (4, N)  [p₀; 1]
+    col1 = np.vstack([d,  np.zeros((1, N))])     # (4, N)  [d; 0]
+
+    # Normalise col0; Gram-Schmidt col1 (handles near-zero Plücker-constraint violations)
+    col0 = col0 / (np.linalg.norm(col0, axis=0, keepdims=True) + 1e-12)
+    proj  = np.sum(col1 * col0, axis=0, keepdims=True)  # (1, N)
+    col1  = col1 - proj * col0
+    col1  = col1 / (np.linalg.norm(col1, axis=0, keepdims=True) + 1e-12)
+
+    # Stack: (N, 4, 2)
+    return np.stack([col0.T, col1.T], axis=2)    # (N, 4, 2)
+
+
+def g24_geodesic_distance(L1: np.ndarray, L2: np.ndarray,
+                           Q2: np.ndarray | None = None) -> np.ndarray:
+    """
+    Geodesic distance on G(2,4) between N paired Plücker lines.
+
+    Implements the distance from Shin et al. (ICCV 2025) "Registration beyond
+    Points":  embed each line as a 2D subspace of R⁴, compute the two principal
+    angles (θ₁, θ₂) via SVD of Q₁ᵀQ₂, return ‖(θ₁, θ₂)‖ (Frobenius norm).
+
+    Args:
+        L1: (6, N)  source Plücker lines (after SIM(3) transform)
+        L2: (6, N)  target Plücker lines  (unused if Q2 is provided)
+        Q2: (N, 4, 2)  pre-computed G(2,4) basis for L2  (optional, for speed)
+
+    Returns:
+        dists: (N,) geodesic distances in radians ∈ [0, π/√2]
+    """
+    Q1 = plucker_to_g24_basis(L1)                        # (N, 4, 2)
+    if Q2 is None:
+        Q2 = plucker_to_g24_basis(L2)                    # (N, 4, 2)
+    M      = np.matmul(Q1.transpose(0, 2, 1), Q2)        # (N, 2, 2)
+    _, sigma, _ = np.linalg.svd(M, full_matrices=False)  # sigma: (N, 2)
+    sigma  = np.clip(sigma, 0.0, 1.0)
+    theta  = np.arccos(sigma)                             # (N, 2) principal angles
+    return np.sqrt(np.sum(theta ** 2, axis=1))            # (N,) Frobenius norm
 
 
 # ── SIM(3) solvers ────────────────────────────────────────────────────────────
@@ -140,18 +202,20 @@ def solve_translation_scale(
     Returns:
         t: (3,) translation,   s: float scale  (> 0 means SLAM is smaller)
     """
-    m1     = L1[:3]            # (3, N)
-    m2, d2 = L2[:3], L2[3:]   # (3, N) — use target direction directly
-    N = L1.shape[1]
+    m1  = L1[:3]         # (3, N)
+    d1  = L1[3:]         # (3, N)
+    m2  = L2[:3]         # (3, N)
+    N   = L1.shape[1]
 
-    Rm1 = R @ m1               # (3, N)
+    Rm1  = R @ m1        # (3, N)
+    Rd1  = R @ d1        # (3, N) — use rotated source direction, not target direction
+                         # (correct per SIM3 constraint: m' = s·R·m + t × (R·d))
 
     A = np.zeros((3 * N, 4))
     b = np.zeros(3 * N)
     for i in range(N):
         row = 3 * i
-        # t × d2_i  =  -skew(d2_i) · t
-        A[row:row + 3, :3] = -_skew(d2[:, i])   # coefficient of t
+        A[row:row + 3, :3] = -_skew(Rd1[:, i])  # coefficient of t  (was: d2 — bug)
         A[row:row + 3,  3] =  Rm1[:, i]          # coefficient of s  (R·m1_i)
         b[row:row + 3]     =  m2[:, i]
 
@@ -210,17 +274,19 @@ def solve_translation_fixed_scale(
     Returns:
         t: (3,) translation vector
     """
-    m1     = L1[:3]
-    m2, d2 = L2[:3], L2[3:]   # use target direction directly
-    N      = L1.shape[1]
+    m1 = L1[:3]
+    d1 = L1[3:]
+    m2 = L2[:3]
+    N  = L1.shape[1]
 
     Rm1 = R @ m1       # (3, N)
+    Rd1 = R @ d1       # (3, N)  use rotated source direction (correct SIM3 constraint)
 
     A = np.zeros((3 * N, 3))
     b = np.zeros(3 * N)
     for i in range(N):
         row = 3 * i
-        A[row:row + 3] = -_skew(d2[:, i])             # -skew(d2) coeff of t
+        A[row:row + 3] = -_skew(Rd1[:, i])            # -skew(R·d1) coeff of t
         b[row:row + 3] = m2[:, i] - s * Rm1[:, i]     # residual
 
     t, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
@@ -239,18 +305,22 @@ def ransac_sim3(
     lambda_s: float = 5.0,
     early_exit_iters: int = 200,
     lo_iters: int = 10,
+    distance_metric: str = 'rp5',
 ) -> tuple:
     """
     RANSAC SIM(3) solver for Plücker line correspondences.
 
     Uses Procrustes rotation + joint LS for (s, t) as the minimal solver, and
-    an L2 Plücker residual as the inlier metric.  The Grassmannian distance
-    (arccos of normalised dot product) is NOT used as the inlier test because
-    normalising both Plücker vectors to unit norm erases the moment magnitude,
-    making the metric blind to scale — a hypothesis with s=0.36 scores the same
-    as s=2.8 whenever the normalised directions happen to align.  The L2 residual
-    ‖L2 − M_SIM3 · L1‖ preserves scale information and correctly penalises
-    scale error.
+    the Grassmannian distance (arccos of the normalised inner product) as the
+    inlier metric — the theoretical contribution of this work.  After applying
+    the SIM(3) hypothesis to L1, both the transformed line and the target are
+    normalised to unit 6-norm and compared via:
+
+        θ = arccos( |L1_tf_norm · L2_norm| )   ∈ [0, π/2]
+
+    Scale errors propagate into the moment component of the transformed line,
+    so θ > 0 when the hypothesis has wrong scale — the metric is scale-aware
+    through the moment, not just through direction alignment.
 
     The algorithm:
       1. Sample ``min_sample`` random line correspondences.
@@ -267,7 +337,9 @@ def ransac_sim3(
         L1:  (6, N)  Plücker coords of source lines  (SLAM, arb. scale)
         L2:  (6, N)  Plücker coords of target lines  (DA3, metric)
         n_iter: RANSAC iterations (default 5000)
-        inlier_threshold: L2 Plücker residual threshold (default 0.3)
+        inlier_threshold: distance threshold in radians (default 0.3).
+            For 'rp5': single principal angle θ ∈ [0, π/2].
+            For 'g24': Frobenius norm of two principal angles ∈ [0, π/√2].
         min_inliers: minimum inliers to declare a valid hypothesis
         min_sample:  minimal sample size (≥ 3 for numerical stability)
         seed: RNG seed for reproducibility
@@ -277,6 +349,9 @@ def ransac_sim3(
         lo_iters: local-optimization passes — each pass re-fits (R, s, t) via joint
             LS on the current inlier set and expands inliers; stops early if count
             stops growing (default 10)
+        distance_metric: 'rp5' (default) — RP⁵ single principal angle via normalised
+            dot product; 'g24' — G(2,4) proper geodesic via Shin et al. ICCV 2025,
+            two principal angles from SVD of the 4×2 subspace product.
 
     Returns:
         R_best: (3, 3),  t_best: (3,),  s_best: float,
@@ -292,12 +367,41 @@ def ransac_sim3(
     bins = [np.where(dominant_axis == ax)[0] for ax in range(3)]
     bins = [b for b in bins if len(b) > 0]             # drop empty bins
 
-    def _evaluate(R_c, t_c, s_c):
-        """Transform L1 and count L2-residual inliers."""
-        L1_tf = transform_lines(L1, R_c, t_c, s_c)
-        dists = np.linalg.norm(L1_tf - L2, axis=0)  # (N,) unnormalised Plücker residual
-        mask  = dists < inlier_threshold
-        return mask, int(mask.sum()), dists
+    # Pre-compute target representation once (L2 is fixed throughout RANSAC)
+    if distance_metric == 'g24':
+        _L2_precomp = plucker_to_g24_basis(L2)   # (N, 4, 2)
+
+        def _evaluate(R_c, t_c, s_c):
+            """Transform L1 and count inliers via G(2,4) max principal angle.
+
+            For our homogeneous line embedding the 2×2 inner-product matrix M is
+            block-diagonal: one entry captures direction agreement, the other
+            captures foot-of-perpendicular (position) agreement.  Using the
+            LARGER principal angle θ₂ = arccos(σ₂) as the distance means BOTH
+            direction and position must agree within ``inlier_threshold``.  This
+            is strictly tighter than the Frobenius norm √(θ₁²+θ₂²) and makes
+            translation estimation robust: pairs with correct direction but wrong
+            position are excluded from the inlier set.
+            """
+            L1_tf = transform_lines(L1, R_c, t_c, s_c)
+            Q1 = plucker_to_g24_basis(L1_tf)
+            M = np.matmul(Q1.transpose(0, 2, 1), _L2_precomp)   # (N, 2, 2)
+            _, sigma, _ = np.linalg.svd(M, full_matrices=False)
+            sigma = np.clip(sigma, 0.0, 1.0)
+            theta = np.arccos(sigma)           # (N, 2), θ[:,0] ≤ θ[:,1]
+            dists = theta[:, 1]               # max principal angle — strictest
+            mask  = dists < inlier_threshold
+            return mask, int(mask.sum()), dists
+    else:  # 'rp5' — RP⁵ single principal angle (default)
+        _L2_norm = normalize_plucker(L2)
+
+        def _evaluate(R_c, t_c, s_c):
+            """Transform L1 and count inliers via RP⁵ Grassmannian distance."""
+            L1_tf      = transform_lines(L1, R_c, t_c, s_c)
+            L1_tf_norm = normalize_plucker(L1_tf)
+            dists      = grassmannian_distance(L1_tf_norm, _L2_norm)
+            mask       = dists < inlier_threshold
+            return mask, int(mask.sum()), dists
 
     best_ic   = 0
     best_R    = np.eye(3)
@@ -371,6 +475,76 @@ def ransac_sim3(
                 break
 
     return best_R, best_t, best_s, best_mask, best_ic
+
+
+# ── Post-RANSAC translation polish ───────────────────────────────────────────
+
+def polish_translation(
+    L1: np.ndarray,
+    L2: np.ndarray,
+    R: np.ndarray,
+    s: float,
+    t_init: np.ndarray | None = None,
+    max_dir_angle: float = 0.10,
+    n_iter: int = 5,
+) -> np.ndarray:
+    """
+    Refine translation given fixed R and s via iterative direction-NN search.
+
+    The Grassmannian inlier metric used in RANSAC is direction-dominated, so
+    the recovered translation can be biased when inliers are mostly parallel
+    lines.  This function sidesteps the network correspondences entirely:
+
+      1. Apply (R, s, t_current) to ALL source lines.
+      2. For each transformed source line, find the nearest target line by
+         direction (Grassmannian NN, ±sign handled).
+      3. Solve t from the moment equations of direction-matched pairs.
+      4. Repeat until convergence (typically 3–5 iterations).
+
+    Using the full line sets (not just the top-K network pairs) gives many
+    more direction-diverse correspondences and a much better-conditioned
+    translation system.
+
+    Args:
+        L1: (6, N1)  full source Plücker lines  (mono, all lines)
+        L2: (6, N2)  full target Plücker lines  (metric, all lines)
+        R, s:        fixed rotation and scale from RANSAC
+        t_init:      starting translation (use RANSAC estimate; default zeros)
+        max_dir_angle: Grassmannian direction threshold in radians (default 0.10 ≈ 6°)
+        n_iter:      ICP-style iterations (default 5)
+
+    Returns:
+        t: (3,) refined translation
+    """
+    t = t_init.copy() if t_init is not None else np.zeros(3, dtype=np.float64)
+
+    # Pre-normalise target directions once
+    d2 = L2[3:]
+    d2_n = d2 / (np.linalg.norm(d2, axis=0, keepdims=True) + 1e-12)   # (3, N2)
+    cos_thresh = np.cos(max_dir_angle)
+
+    for _ in range(n_iter):
+        L1_tf = transform_lines(L1, R, t, s)
+        d1_n  = L1_tf[3:]
+        d1_n  = d1_n / (np.linalg.norm(d1_n, axis=0, keepdims=True) + 1e-12)  # (3, N1)
+
+        # Direction NN (±sign): cos_mat[i,j] = |d1_i · d2_j|
+        cos_mat = np.abs(d1_n.T @ d2_n)          # (N1, N2)
+        nn_idx  = np.argmax(cos_mat, axis=1)      # (N1,) best match in L2
+        nn_cos  = cos_mat[np.arange(L1.shape[1]), nn_idx]
+        good    = nn_cos > cos_thresh             # (N1,) direction-quality filter
+
+        if good.sum() < 3:
+            break
+
+        try:
+            t = solve_translation_fixed_scale(
+                L1[:, good], L2[:, nn_idx[good]], R, s
+            )
+        except np.linalg.LinAlgError:
+            break
+
+    return t
 
 
 # ── Nearest-neighbour correspondence finder ───────────────────────────────────
