@@ -249,28 +249,65 @@ def make_grid_patch(n: int, pos_range: float = 3.0) -> np.ndarray:
     ], axis=0).astype(np.float32)
 
 
+def make_staircase(n: int) -> np.ndarray:
+    """Stair nosings + risers: coplanar parallel lines at regular offsets.
+
+    Covers staircases, ladders, shelves, bleachers — any scene with lines
+    that are simultaneously parallel AND coplanar (a mode absent from both
+    make_parallel_group and make_plane_patch individually).
+    """
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    R = random_rotation().astype(np.float64)
+    step_dir  = R[:, 0]   # direction along each nosing edge
+    up_dir    = R[:, 1]   # vertical (step rise)
+    depth_dir = R[:, 2]   # stair climbing direction
+
+    step_h  = np.random.uniform(0.15, 0.30)   # rise ~20 cm
+    step_d  = np.random.uniform(0.25, 0.40)   # run  ~30 cm
+    origin  = np.random.uniform(-2.0, 2.0, 3)
+
+    n_steps = max(3, n // 2)
+    lines = []
+    for i in range(n_steps):
+        o = (origin + i * (step_h * up_dir + step_d * depth_dir)).astype(np.float32)
+        # nosing edge — horizontal, parallel to step_dir
+        d = step_dir.astype(np.float32)
+        lines.append(np.concatenate([np.cross(o, d), d]))
+        # riser edge — vertical face
+        d2 = up_dir.astype(np.float32)
+        lines.append(np.concatenate([np.cross(o, d2), d2]))
+
+    arr = np.array(lines, np.float32)
+    idx = np.random.choice(len(arr), n, replace=(n > len(arr)))
+    return arr[idx]
+
+
 def make_structured_pool(n: int) -> np.ndarray:
     """
     Diverse synthetic line pool from random geometric primitives.
 
     Randomly combines plane patches, wireframe edges, line bundles, parallel
-    groups, grid patches, and unstructured lines.  All orientations are drawn
-    uniformly from SO(3) — no Manhattan-world or axis-aligned bias.
+    groups, grid patches, staircase structures, and unstructured lines.
+    All orientations are drawn uniformly from SO(3) — no Manhattan-world or
+    axis-aligned bias.
     """
     if n == 0:
         return np.zeros((0, 6), np.float32)
 
-    n_planes    = np.random.randint(0, 5)   # 0–4 planes
-    n_boxes     = np.random.randint(0, 4)   # 0–3 wireframe boxes
-    n_bundles   = np.random.randint(0, 3)   # 0–2 line bundles (corners/poles)
-    n_parallels = np.random.randint(0, 3)   # 0–2 parallel groups (corridors/rails)
-    n_grids     = np.random.randint(0, 3)   # 0–2 grid patches (fences/lattices)
+    n_planes     = np.random.randint(0, 5)   # 0–4 planes
+    n_boxes      = np.random.randint(0, 4)   # 0–3 wireframe boxes
+    n_bundles    = np.random.randint(0, 3)   # 0–2 line bundles (corners/poles)
+    n_parallels  = np.random.randint(0, 3)   # 0–2 parallel groups (corridors/rails)
+    n_grids      = np.random.randint(0, 3)   # 0–2 grid patches (fences/lattices)
+    n_staircases = np.random.randint(0, 3)   # 0–2 staircase structures
 
-    tasks = ([(make_plane_patch,    1)] * n_planes    +
-             [(make_wireframe,      1)] * n_boxes     +
-             [(make_line_bundle,    1)] * n_bundles   +
-             [(make_parallel_group, 1)] * n_parallels +
-             [(make_grid_patch,     1)] * n_grids)
+    tasks = ([(make_plane_patch,    1)] * n_planes     +
+             [(make_wireframe,      1)] * n_boxes      +
+             [(make_line_bundle,    1)] * n_bundles    +
+             [(make_parallel_group, 1)] * n_parallels  +
+             [(make_grid_patch,     1)] * n_grids      +
+             [(make_staircase,      1)] * n_staircases)
 
     if not tasks:
         return make_outliers(n)
@@ -324,6 +361,10 @@ def _build_pair(rgbd_in: np.ndarray,
     slam_in_metric = rgbd_in[idx_slam].copy()
     noise_sigma = np.random.uniform(SLAM_NOISE_MIN, SLAM_NOISE_MAX)
     slam_in_metric[:, :3] += np.random.randn(n_slam_in, 3).astype(np.float32) * noise_sigma
+    # Direction noise: short segments have high angular uncertainty in monocular SLAM
+    dir_noise = np.random.uniform(0.0, 0.05)
+    slam_in_metric[:, 3:] += np.random.randn(n_slam_in, 3).astype(np.float32) * dir_noise
+    slam_in_metric[:, 3:] /= np.linalg.norm(slam_in_metric[:, 3:], axis=1, keepdims=True) + 1e-9
 
     # Random Sim(3) — maps metric frame → SLAM frame
     if force_scale is not None:
@@ -424,9 +465,12 @@ def _build_submap_pair(big_pool: np.ndarray,
     idx_submap    = np.random.choice(n_overlap, n_submap, replace=False)
     submap_metric = overlap_lines[idx_submap].copy()
 
-    # SLAM-like noise on moments
+    # SLAM-like noise on moments and directions
     noise_sigma = np.random.uniform(SLAM_NOISE_MIN, SLAM_NOISE_MAX)
     submap_metric[:, :3] += np.random.randn(n_submap, 3).astype(np.float32) * noise_sigma
+    dir_noise = np.random.uniform(0.0, 0.05)
+    submap_metric[:, 3:] += np.random.randn(n_submap, 3).astype(np.float32) * dir_noise
+    submap_metric[:, 3:] /= np.linalg.norm(submap_metric[:, 3:], axis=1, keepdims=True) + 1e-9
 
     # Sim(3): big-map frame → submap frame
     log_s = np.random.uniform(np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1]))
@@ -657,6 +701,13 @@ def generate_diverse_pair() -> dict:
         # Independent moment noise on each side
         inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
         inliers_ref[:, :3] += np.random.randn(k, 3).astype(np.float32) * noise2
+        # Direction noise for both sides
+        dir_noise1 = np.random.uniform(0.0, 0.05)
+        dir_noise2 = np.random.uniform(0.0, 0.02)
+        inliers_q  [:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise1
+        inliers_q  [:, 3:] /= np.linalg.norm(inliers_q  [:, 3:], axis=1, keepdims=True) + 1e-9
+        inliers_ref[:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise2
+        inliers_ref[:, 3:] /= np.linalg.norm(inliers_ref[:, 3:], axis=1, keepdims=True) + 1e-9
     else:
         inliers_q   = np.zeros((0, 6), np.float32)
         inliers_ref = np.zeros((0, 6), np.float32)
