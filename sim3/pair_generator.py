@@ -48,6 +48,7 @@ def get_curriculum_probs(phase_frac: float) -> np.ndarray:
 # ── Physical constants ────────────────────────────────────────────────────────
 
 SCALE_RANGE      = (0.1, 10.0)
+ROOM_SCALE_RANGE = (0.1,  5.0)   # tighter range for indoor room scenario
 SLAM_NOISE_MIN   = 0.02
 SLAM_NOISE_MAX   = 0.30
 SLAM_RATIO_MIN   = 0.10   # fraction of metric inliers observed by SLAM
@@ -281,6 +282,87 @@ def make_staircase(n: int) -> np.ndarray:
     arr = np.array(lines, np.float32)
     idx = np.random.choice(len(arr), n, replace=(n > len(arr)))
     return arr[idx]
+
+
+def make_room_pool(n: int) -> np.ndarray:
+    """
+    Manhattan-world indoor room scene calibrated to 7-Scenes / real indoor SLAM.
+
+    Scene half-extents match typical office/kitchen rooms (2–5 m).  Moments
+    are bounded by the room radius → |m| ≤ ~4, matching real SLAM map statistics.
+
+    Direction distribution:
+      75 % near-axis-aligned (3 main axes, ±1.7° Gaussian spread)
+            → walls, floor, ceiling, furniture edges
+      25 % fully random  → oblique architectural features
+
+    A random full-SO(3) rotation is applied to the whole scene so the network
+    cannot learn a fixed-axis prior — it must recognise Manhattan structure as
+    a geometric pattern, not a fixed orientation.
+    """
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+
+    # Room half-extents: width/depth 1–2.5 m, height 1–1.5 m (full room 2–5 m)
+    hw = np.random.uniform(1.0, 2.5)
+    hd = np.random.uniform(1.0, 2.5)
+    hh = np.random.uniform(1.0, 1.5)
+
+    # --- Midpoints ----------------------------------------------------------
+    # 60 % biased toward the 6 room surfaces (walls, floor, ceiling)
+    n_surf = int(0.60 * n)
+    n_int  = n - n_surf
+
+    # Pick a random face for each surface point, then sample on that face
+    face_half = np.array([[hw,0,0],[-hw,0,0],[0,hh,0],[0,-hh,0],[0,0,hd],[0,0,-hd]],
+                          np.float32)
+    fi = np.random.randint(6, size=n_surf)
+    fn = face_half[fi]                                     # normal direction
+    axis = np.argmax(np.abs(fn), axis=1)                   # which axis is fixed
+
+    P_surf = np.random.uniform(-1.0, 1.0, (n_surf, 3)).astype(np.float32)
+    P_surf *= np.array([hw, hh, hd], np.float32)
+    # Pin the normal axis to the face and add a tiny inward offset
+    P_surf[np.arange(n_surf), axis] = fn[np.arange(n_surf), axis]
+    P_surf += fn / (np.linalg.norm(fn, axis=1, keepdims=True) + 1e-9) \
+              * np.random.uniform(-0.05, 0.0, (n_surf, 1)).astype(np.float32)
+
+    P_int = np.column_stack([
+        np.random.uniform(-hw, hw, n_int),
+        np.random.uniform(-hh, hh, n_int),
+        np.random.uniform(-hd, hd, n_int),
+    ]).astype(np.float32)
+
+    P = np.concatenate([P_surf, P_int], axis=0) if n_int > 0 else P_surf
+
+    # --- Directions ---------------------------------------------------------
+    n_ax  = int(0.75 * n)
+    n_rnd = n - n_ax
+
+    ax_idx = np.random.randint(3, size=n_ax)
+    D_ax   = np.zeros((n_ax, 3), np.float32)
+    D_ax[np.arange(n_ax), ax_idx] = 1.0
+    D_ax  += np.random.randn(n_ax, 3).astype(np.float32) * 0.03   # ~1.7° noise
+    D_ax  /= np.linalg.norm(D_ax, axis=1, keepdims=True) + 1e-9
+
+    D_rnd  = (np.random.randn(n_rnd, 3).astype(np.float32)
+              if n_rnd > 0 else np.zeros((0, 3), np.float32))
+    if n_rnd > 0:
+        D_rnd /= np.linalg.norm(D_rnd, axis=1, keepdims=True) + 1e-9
+
+    D = np.concatenate([D_ax, D_rnd], axis=0)
+
+    # Shuffle so axis-aligned / random lines are mixed throughout the cloud
+    perm = np.random.permutation(n)
+    P, D = P[perm], D[perm]
+
+    M = np.cross(P, D)
+    pool = np.concatenate([M, D], axis=1).astype(np.float32)
+
+    # Random full-SO(3) rotation: removes the fixed-axis prior
+    R = random_rotation()
+    pool = apply_sim3_plucker(pool, 1.0, R, np.zeros(3, np.float32))
+    return pool
 
 
 def make_structured_pool(n: int) -> np.ndarray:
@@ -592,8 +674,8 @@ def generate_submap_pair(big_pool: np.ndarray,
 # ── Fully-synthetic diverse pair generator ────────────────────────────────────
 
 # Scenario names and sampling probabilities
-_SCENARIOS = ['submap', 'relocalize', 'loop', 'dense_sparse', 'zero_overlap']
-_SCENARIO_P = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+_SCENARIOS = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'zero_overlap']
+_SCENARIO_P = np.array([0.30, 0.22, 0.18, 0.14, 0.10, 0.06])
 
 
 def generate_diverse_pair() -> dict:
@@ -630,15 +712,25 @@ def generate_diverse_pair() -> dict:
     """
     scenario = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
 
+    # Pool function and SIM(3) ranges: room scenario uses physically-bounded
+    # pools and a tighter scale range to match real indoor SLAM statistics.
+    if scenario == 'room':
+        pool_fn     = make_room_pool
+        s_lo, s_hi  = np.log(ROOM_SCALE_RANGE[0]), np.log(ROOM_SCALE_RANGE[1])
+        t_range     = 1.5   # smaller translation (room-sized offsets)
+    else:
+        pool_fn     = make_structured_pool
+        s_lo, s_hi  = np.log(SCALE_RANGE[0]), np.log(SCALE_RANGE[1])
+        t_range     = 2.0
+
     # ── Zero-overlap: two unrelated structured pools ──────────────────────────
     if scenario == 'zero_overlap':
         n1 = np.random.randint(10, 400)
         n2 = np.random.randint(10, 600)
-        s  = float(np.exp(np.random.uniform(np.log(SCALE_RANGE[0]),
-                                             np.log(SCALE_RANGE[1]))))
+        s  = float(np.exp(np.random.uniform(s_lo, s_hi)))
         return dict(
-            plucker1 = make_structured_pool(n1),
-            plucker2 = make_structured_pool(n2),
+            plucker1 = pool_fn(n1),
+            plucker2 = pool_fn(n2),
             matches  = np.zeros((2, 0), np.int32),
             R_gt     = np.eye(3, dtype=np.float32),
             t_gt     = np.zeros((3, 1), dtype=np.float32),
@@ -646,7 +738,16 @@ def generate_diverse_pair() -> dict:
         )
 
     # ── Scenario-specific size / overlap / noise parameters ──────────────────
-    if scenario == 'submap':
+    if scenario == 'room':
+        # Line counts match real 7-Scenes SLAM maps (100–1000 lines per side)
+        n2           = np.random.randint(80, 1100)           # metric reference
+        ratio        = np.random.uniform(0.3, 3.0)
+        n1           = max(30, min(int(n2 * ratio), 1100))   # mono query
+        overlap_frac = float(np.random.beta(3.0, 2.0))       # moderate-to-high overlap
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.15))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.05))))
+
+    elif scenario == 'submap':
         n1           = np.random.randint(10, 150)
         n2           = np.random.randint(max(n1, 80), 700)
         overlap_frac = float(np.random.beta(1.5, 5.0))       # bias: low overlap
@@ -684,10 +785,9 @@ def generate_diverse_pair() -> dict:
 
     # ── Random Sim(3): query frame → reference frame ──────────────────────────
     # p_ref = s * R * p_query + t
-    s   = float(np.exp(np.random.uniform(np.log(SCALE_RANGE[0]),
-                                          np.log(SCALE_RANGE[1]))))
+    s   = float(np.exp(np.random.uniform(s_lo, s_hi)))
     R   = random_rotation()
-    t   = np.random.uniform(-2.0, 2.0, 3).astype(np.float32)
+    t   = np.random.uniform(-t_range, t_range, 3).astype(np.float32)
     # Inverse Sim(3): reference → query
     s_i = 1.0 / s
     R_i = R.T
@@ -696,7 +796,7 @@ def generate_diverse_pair() -> dict:
     # ── Inlier lines ──────────────────────────────────────────────────────────
     if k > 0:
         # Generate inlier pool in the reference frame, then transform to query
-        inliers_ref = make_structured_pool(k + max(k // 4, 8))[:k].copy()
+        inliers_ref = pool_fn(k + max(k // 4, 8))[:k].copy()
         inliers_q   = apply_sim3_plucker(inliers_ref, s_i, R_i, t_i)
         # Independent moment noise on each side
         inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
@@ -718,9 +818,9 @@ def generate_diverse_pair() -> dict:
 
     # Query outliers: generated in the reference frame, then transformed to
     # query frame so moment magnitudes are consistent with the inliers.
-    out_q = (apply_sim3_plucker(make_structured_pool(n_out1), s_i, R_i, t_i)
+    out_q = (apply_sim3_plucker(pool_fn(n_out1), s_i, R_i, t_i)
              if n_out1 > 0 else np.zeros((0, 6), np.float32))
-    out_r = (make_structured_pool(n_out2)
+    out_r = (pool_fn(n_out2)
              if n_out2 > 0 else np.zeros((0, 6), np.float32))
 
     # ── Assemble and shuffle ──────────────────────────────────────────────────

@@ -257,6 +257,7 @@ def transform_lines(
 
 def solve_translation_fixed_scale(
     L1: np.ndarray, L2: np.ndarray, R: np.ndarray, s: float,
+    t_prior: np.ndarray | None = None, lambda_t: float = 2.0,
 ) -> np.ndarray:
     """
     Solve for translation t with R and s fixed.
@@ -266,10 +267,19 @@ def solve_translation_fixed_scale(
     and solve via least squares.  This 3N×3 system is well-conditioned
     whenever at least two correspondences have different directions.
 
+    When ``t_prior`` is provided, a Tikhonov term  λ·I · t = λ·t_prior  is
+    appended to the LS system.  This anchors the minimum-norm solution toward
+    t_prior in directions where the line correspondences leave t unconstrained
+    (e.g. horizontal-only lines leave the vertical translation unconstrained).
+    The prior weight lambda_t is tiny relative to the line equations, so it
+    does not affect well-constrained directions.
+
     Args:
         L1, L2: (6, N) Plücker [m; d]
         R: (3, 3)
         s: fixed scale factor
+        t_prior: (3,) soft anchor for t in unconstrained directions
+        lambda_t: Tikhonov weight for t_prior (default 2.0)
 
     Returns:
         t: (3,) translation vector
@@ -289,6 +299,11 @@ def solve_translation_fixed_scale(
         A[row:row + 3] = -_skew(Rd1[:, i])            # -skew(R·d1) coeff of t
         b[row:row + 3] = m2[:, i] - s * Rm1[:, i]     # residual
 
+    if t_prior is not None:
+        tp = np.asarray(t_prior, dtype=np.float64)
+        A = np.vstack([A, lambda_t * np.eye(3)])
+        b = np.concatenate([b, lambda_t * tp])
+
     t, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
     return t
 
@@ -306,6 +321,7 @@ def ransac_sim3(
     early_exit_iters: int = 200,
     lo_iters: int = 10,
     distance_metric: str = 'rp5',
+    lo_dir_threshold: float | None = None,
 ) -> tuple:
     """
     RANSAC SIM(3) solver for Plücker line correspondences.
@@ -352,6 +368,13 @@ def ransac_sim3(
         distance_metric: 'rp5' (default) — RP⁵ single principal angle via normalised
             dot product; 'g24' — G(2,4) proper geodesic via Shin et al. ICCV 2025,
             two principal angles from SVD of the 4×2 subspace product.
+        lo_dir_threshold: if set, the LO Procrustes step uses only inlier pairs whose
+            direction angle (arccos|R·d1 · d2|) is below this value (radians).
+            Translation/scale LS still uses all inliers.  Useful when
+            ``inlier_threshold`` is loose enough to accept position-matched pairs
+            with large direction disagreement — tighter direction subset gives
+            cleaner R while the full inlier pool gives accurate t.
+            Typical value: 0.15 rad (≈ 8.6°).  Default: None (use all inliers).
 
     Returns:
         R_best: (3, 3),  t_best: (3,),  s_best: float,
@@ -451,14 +474,12 @@ def ransac_sim3(
             best_t    = t_cand
             best_s    = s_cand
 
-    # ── Local optimization: iteratively re-fit on expanding inlier set ────
+    # ── Local optimization: maximize inlier count (good for t, s) ───────────
     if best_ic >= min_inliers:
         for _ in range(lo_iters):
             try:
                 R_ref = solve_rotation(L1[3:, best_mask], L2[3:, best_mask])
-                # Joint (t, s) solve on the current inlier set.  The median
-                # moment-magnitude ratio ||m2||/||R·m1|| is only unbiased when
-                # t=0; the full LS solve correctly accounts for the t×(R·d) term.
+                # Joint (t, s) solve — full LS correctly accounts for t×(R·d).
                 t_ref, s_ref = solve_translation_scale(
                     L1[:, best_mask], L2[:, best_mask], R_ref,
                     s_prior=best_s, lambda_s=lambda_s,
@@ -471,6 +492,43 @@ def ransac_sim3(
                     best_mask, best_ic = mask_ref, ic_ref
                 else:
                     break  # inlier set stopped growing — converged
+            except (np.linalg.LinAlgError, ValueError):
+                break
+
+    # ── Rotation polish: direction-tight Procrustes on the final inlier set ──
+    # The standard LO above maximises inlier count but may converge with a
+    # slightly biased R because position-matched pairs with loose direction
+    # agreement bias the Procrustes.  This phase iterates direction-tight
+    # Procrustes on the fixed inlier set with scale held constant (s from
+    # the standard LO is accurate; only R and t need refinement).
+    if lo_dir_threshold is not None and best_ic >= min_inliers:
+        L1_in = L1[:, best_mask]
+        L2_in = L2[:, best_mask]
+        R_pol = best_R.copy()
+        s_fixed = float(best_s)   # lock scale — only refine R and t
+        t_anchor = best_t.copy()  # LO translation — anchor unconstrained directions
+        for _ in range(lo_iters):
+            try:
+                Rd1 = R_pol @ L1_in[3:]
+                dir_cos = np.abs(np.sum(Rd1 * L2_in[3:], axis=0))
+                dir_tight = dir_cos > np.cos(lo_dir_threshold)
+                if dir_tight.sum() < 3:
+                    break
+                R_new = solve_rotation(
+                    L1_in[3:][:, dir_tight], L2_in[3:][:, dir_tight]
+                )
+                # Anchor t toward the LO estimate in unconstrained directions.
+                t_new = solve_translation_fixed_scale(
+                    L1_in, L2_in, R_new, s_fixed,
+                    t_prior=t_anchor, lambda_t=2.0,
+                )
+                if not np.all(np.isfinite(t_new)):
+                    break
+                if np.allclose(R_new, R_pol, atol=1e-6):
+                    best_R, best_t = R_new, t_new
+                    break  # converged
+                R_pol = R_new
+                best_R, best_t = R_new, t_new
             except (np.linalg.LinAlgError, ValueError):
                 break
 
