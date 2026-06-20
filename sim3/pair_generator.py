@@ -50,12 +50,15 @@ def get_curriculum_probs(phase_frac: float) -> np.ndarray:
 SCALE_RANGE      = (0.1, 10.0)
 ROOM_SCALE_RANGE = (0.1,  5.0)   # tighter range for indoor room scenario
 SLAM_NOISE_MIN   = 0.02
-SLAM_NOISE_MAX   = 0.30
+SLAM_NOISE_MAX   = 0.10           # was 0.30; cap so noise << moment magnitude
 SLAM_RATIO_MIN   = 0.10   # fraction of metric inliers observed by SLAM
 SLAM_RATIO_MAX   = 0.60
-OUTLIER_FRAC_MIN = 0.30   # fraction of each side that are outliers
-OUTLIER_FRAC_MAX = 0.70
+OUTLIER_FRAC_MIN = 0.20   # was 0.30; fewer outliers → higher inlier ratio
+OUTLIER_FRAC_MAX = 0.60   # was 0.70
 MAX_SIDE         = 600    # soft upper-bound per side (prevents OOM on huge pools)
+
+# Minimum inliers per pair — pairs with fewer are unlearnable
+MIN_INLIERS      = 20
 
 # Submap scenario
 SUBMAP_N_MIN     = 30    # smallest possible submap
@@ -441,7 +444,7 @@ def _build_pair(rgbd_in: np.ndarray,
     idx_slam   = np.random.choice(n_rgbd, n_slam_in, replace=False)
 
     slam_in_metric = rgbd_in[idx_slam].copy()
-    noise_sigma = np.random.uniform(SLAM_NOISE_MIN, SLAM_NOISE_MAX)
+    noise_sigma = np.random.uniform(SLAM_NOISE_MIN, SLAM_NOISE_MAX)  # now capped at 0.10
     slam_in_metric[:, :3] += np.random.randn(n_slam_in, 3).astype(np.float32) * noise_sigma
     # Direction noise: short segments have high angular uncertainty in monocular SLAM
     dir_noise = np.random.uniform(0.0, 0.05)
@@ -673,9 +676,11 @@ def generate_submap_pair(big_pool: np.ndarray,
 
 # ── Fully-synthetic diverse pair generator ────────────────────────────────────
 
-# Scenario names and sampling probabilities
-_SCENARIOS = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'zero_overlap']
-_SCENARIO_P = np.array([0.30, 0.22, 0.18, 0.14, 0.10, 0.06])
+# Scenario names and sampling probabilities.
+# zero_overlap removed: pairs with no correspondences provide no learning signal.
+# loop boosted: high-overlap pairs give the clearest gradient early in training.
+_SCENARIOS = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse']
+_SCENARIO_P = np.array([0.30, 0.10, 0.22, 0.28, 0.10])
 
 
 def generate_diverse_pair() -> dict:
@@ -744,42 +749,44 @@ def generate_diverse_pair() -> dict:
         ratio        = np.random.uniform(0.3, 3.0)
         n1           = max(30, min(int(n2 * ratio), 1100))   # mono query
         overlap_frac = float(np.random.beta(3.0, 2.0))       # moderate-to-high overlap
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.15))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.05))))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.08))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
 
     elif scenario == 'submap':
-        n1           = np.random.randint(10, 150)
+        n1           = np.random.randint(30, 150)
         n2           = np.random.randint(max(n1, 80), 700)
-        overlap_frac = float(np.random.beta(1.5, 5.0))       # bias: low overlap
-        noise1       = float(np.exp(np.random.uniform(np.log(0.020), np.log(0.50))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.05))))
+        # was beta(1.5,5.0)≈23% mean; now beta(2.5,3.5)≈42% mean → more overlap
+        overlap_frac = float(np.random.beta(2.5, 3.5))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.10))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
 
     elif scenario == 'relocalize':
         base         = int(np.exp(np.random.uniform(np.log(30), np.log(400))))
         r            = np.random.uniform(0.5, 2.0)
-        n1           = max(10, int(base * r))
-        n2           = max(10, int(base / r))
+        n1           = max(30, int(base * r))
+        n2           = max(30, int(base / r))
         overlap_frac = float(np.random.beta(2.5, 2.5))       # moderate overlap
-        noise_shared = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.20))))
+        noise_shared = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.08))))
         noise1       = noise2 = noise_shared
 
     elif scenario == 'loop':
-        n_both       = np.random.randint(30, 500)
+        n_both       = np.random.randint(40, 500)
         n1           = n2 = n_both
         overlap_frac = float(np.random.beta(5.0, 2.0))       # bias: high overlap
-        noise_shared = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.15))))
+        noise_shared = float(np.exp(np.random.uniform(np.log(0.003), np.log(0.06))))
         noise1       = noise2 = noise_shared
 
     else:  # dense_sparse
         n2           = np.random.randint(150, 700)            # dense reference
-        density_r    = np.random.uniform(0.05, 0.40)
-        n1           = max(5, int(n2 * density_r))            # sparse query
-        overlap_frac = float(np.random.beta(2.0, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.30))))
+        density_r    = np.random.uniform(0.10, 0.50)         # was 0.05-0.40, floor raised
+        n1           = max(30, int(n2 * density_r))           # sparse query
+        overlap_frac = float(np.random.beta(2.5, 2.0))       # slight high-overlap bias
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.10))))
         noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
 
     # ── Shared inlier count ───────────────────────────────────────────────────
-    k  = max(0, int(overlap_frac * min(n1, n2)))
+    # Enforce MIN_INLIERS so every pair has enough signal for the network to learn.
+    k  = max(MIN_INLIERS, int(overlap_frac * min(n1, n2)))
     n1 = max(n1, k)
     n2 = max(n2, k)
 
@@ -793,16 +800,27 @@ def generate_diverse_pair() -> dict:
     R_i = R.T
     t_i = -(R_i @ t) * s_i
 
+    # ── Unified pool: inliers + outliers from the same geometric scene ───────
+    # Drawing all lines from one pool makes the outliers look like "other lines
+    # from the same room/structure" rather than lines from a different random
+    # primitive — harder negatives and more realistic than separate pool calls.
+    n_out1  = max(0, n1 - k)
+    n_out2  = max(0, n2 - k)
+    n_pool  = k + n_out1 + n_out2 + max(k // 4, 8)   # surplus for safety
+    big_pool = pool_fn(n_pool)
+
+    inliers_ref = big_pool[:k].copy()
+    out_q_ref   = big_pool[k:k + n_out1]              # query outliers in ref frame
+    out_r       = big_pool[k + n_out1:k + n_out1 + n_out2]
+
     # ── Inlier lines ──────────────────────────────────────────────────────────
     if k > 0:
-        # Generate inlier pool in the reference frame, then transform to query
-        inliers_ref = pool_fn(k + max(k // 4, 8))[:k].copy()
-        inliers_q   = apply_sim3_plucker(inliers_ref, s_i, R_i, t_i)
-        # Independent moment noise on each side
+        inliers_q = apply_sim3_plucker(inliers_ref, s_i, R_i, t_i)
+        # Moment noise: bounded by noise sigma in each frame
         inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
         inliers_ref[:, :3] += np.random.randn(k, 3).astype(np.float32) * noise2
-        # Direction noise for both sides
-        dir_noise1 = np.random.uniform(0.0, 0.05)
+        # Direction noise (small, same for both sides)
+        dir_noise1 = np.random.uniform(0.0, 0.03)
         dir_noise2 = np.random.uniform(0.0, 0.02)
         inliers_q  [:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise1
         inliers_q  [:, 3:] /= np.linalg.norm(inliers_q  [:, 3:], axis=1, keepdims=True) + 1e-9
@@ -813,15 +831,10 @@ def generate_diverse_pair() -> dict:
         inliers_ref = np.zeros((0, 6), np.float32)
 
     # ── Outlier lines (no correspondences) ───────────────────────────────────
-    n_out1 = max(0, n1 - k)
-    n_out2 = max(0, n2 - k)
-
-    # Query outliers: generated in the reference frame, then transformed to
-    # query frame so moment magnitudes are consistent with the inliers.
-    out_q = (apply_sim3_plucker(pool_fn(n_out1), s_i, R_i, t_i)
+    # Query outliers: transform from reference frame so moment magnitudes
+    # are consistent with the inliers in the query frame.
+    out_q = (apply_sim3_plucker(out_q_ref, s_i, R_i, t_i)
              if n_out1 > 0 else np.zeros((0, 6), np.float32))
-    out_r = (pool_fn(n_out2)
-             if n_out2 > 0 else np.zeros((0, 6), np.float32))
 
     # ── Assemble and shuffle ──────────────────────────────────────────────────
     q_parts = [p for p in [inliers_q, out_q]   if len(p) > 0]
