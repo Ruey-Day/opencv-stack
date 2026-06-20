@@ -52,7 +52,7 @@ def _worker(args):
     np.random.seed(seed)
 
     # Import here so the child process gets a fresh module state
-    from sim3.pair_generator import generate_diverse_pair
+    from lib.pair_generator import generate_diverse_pair
 
     keys = ['matches', 'plucker1', 'plucker2', 'R_gt', 't_gt', 's_gt']
     chunk = {k: [] for k in keys}

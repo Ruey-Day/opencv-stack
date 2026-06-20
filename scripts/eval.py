@@ -24,10 +24,9 @@ warnings.filterwarnings('ignore')
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR   = os.path.dirname(SCRIPT_DIR)
-sys.path.insert(0, os.path.join(ROOT_DIR, 'PlueckerNet'))
 sys.path.insert(0, ROOT_DIR)
 
-from sim3.dataloader import Sim3PluckerData
+from lib.dataloader import Sim3PluckerData
 
 def _build_config(checkpoint_path, data_dir, dataset):
     """Load config embedded in checkpoint; fall back to safe defaults."""
@@ -189,8 +188,6 @@ def parse_args():
     p.add_argument('--dataset',    default='slam_map',
                    help='Comma-separated val split names (default: slam_map)')
     p.add_argument('--data_dir',   default=os.path.join(ROOT_DIR, 'dataset'))
-    p.add_argument('--ransac',     default='sim3', choices=['sim3', 'grassmannian'],
-                   help='RANSAC backend (default: sim3)')
     p.add_argument('--threshold',  type=float, default=0.3,
                    help='Inlier threshold (default: 0.3)')
     p.add_argument('--n_iter',     type=int, default=500,
@@ -209,23 +206,14 @@ def main():
     datasets  = [d.strip() for d in args.dataset.split(',')]
     threshold = args.threshold
     
-    if args.ransac == 'grassmannian':
-        from sim3.ransac_grassmannian import ransac_sim3 as _rg
-        def _make_ransac(thr):
-            def _fn(p1k, p2k):
-                R, t, s, mask, ic = _rg(p1k, p2k, n_iter=args.n_iter,
-                                         inlier_angle_rad=thr)
-                return s, R, t, ic, mask
-            return _fn
-        print(f'RANSAC: Grassmannian  n_iter={args.n_iter}')
-    else:
-        from sim3.ransac import run_ransac_sim3 as _rs
-        def _make_ransac(thr):
-            def _fn(p1k, p2k):
-                return _rs(p1k, p2k, max_iterations=args.n_iter,
-                           inlier_threshold=thr)
-            return _fn
-        print(f'RANSAC: Sim3 L2  n_iter={args.n_iter}')
+    from lib.ransac_grassmannian import ransac_sim3 as _rg
+    def _make_ransac(thr):
+        def _fn(p1k, p2k):
+            R, t, s, mask, ic = _rg(p1k, p2k, n_iter=args.n_iter,
+                                     inlier_threshold=thr)
+            return s, R, t, ic, mask
+        return _fn
+    print(f'RANSAC: Grassmannian  n_iter={args.n_iter}')
 
     all_results = {}
 

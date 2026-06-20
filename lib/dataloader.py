@@ -21,7 +21,7 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from sim3.pair_generator import (
+from lib.pair_generator import (
     load_pool_from_db,
     generate_pair,
     generate_inter_map_pair,
@@ -157,7 +157,7 @@ class LiveSim3PluckerData(Dataset):
     def __init__(self, db_paths, epoch_size, config,
                  inter_map_ratio=0.3, mode='symmetric'):
         super().__init__()
-        from sim3.pair_generator import SUBMAP_N_MIN
+        from lib.pair_generator import SUBMAP_N_MIN
         min_pool = SUBMAP_N_MIN if mode == 'submap' else 6
         self.pools = []
         for db in db_paths:

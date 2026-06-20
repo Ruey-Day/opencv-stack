@@ -1,7 +1,7 @@
 """
 register.py
 ===========
-Register two Structure-PLP-SLAM line maps using ScalePluckerNet + L2 Plücker
+Register two Structure-PLP-SLAM line maps using ScalePluckerNet + Grassmannian
 RANSAC to recover a SIM(3) transformation (scale, rotation, translation).
 
 Typical use: mono map (arbitrary scale) → RGB-D metric map.
@@ -27,11 +27,10 @@ import torch
 from easydict import EasyDict as edict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "PlueckerNet"))
 sys.path.insert(0, SCRIPT_DIR)
 
-from sim3.pair_generator import load_pool_from_db
-from sim3.ransac import run_ransac_sim3
+from lib.pair_generator import load_pool_from_db
+from lib.ransac_grassmannian import ransac_sim3
 from lib.utils import load_model
 
 
@@ -102,9 +101,9 @@ def register(db_src: str, db_tgt: str, ckpt_path: str,
     best_ic = -1
     best_s, best_R, best_t = None, None, None
     for _ in range(n_runs):
-        s, R, t, ic, _ = run_ransac_sim3(pl1, pl2,
-                                          max_iterations=n_iter,
-                                          inlier_threshold=threshold)
+        R, t, s, _, ic = ransac_sim3(pl1, pl2,
+                                      n_iter=n_iter,
+                                      inlier_threshold=threshold)
         if ic > best_ic and s is not None and s > 0:
             best_ic, best_s, best_R, best_t = ic, s, R, t
 

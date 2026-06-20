@@ -31,17 +31,8 @@ the 12 modules in the default SpatialAttentionalGNN (GNN_layers=['self','cross']
 Increase n_blocks for more expressive models at the cost of compute.
 """
 
-import os
-import sys
-
 import torch
 import torch.nn as nn
-
-# Ensure PlueckerNet is importable when this module is loaded directly.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PLUCKERNET = os.path.join(_HERE, '..', 'PlueckerNet')
-if _PLUCKERNET not in sys.path:
-    sys.path.insert(0, _PLUCKERNET)
 
 from model.model_plucker import (
     AttentionalPropagation,

@@ -1,12 +1,8 @@
 """
-Differences from the original trainer_plucker.py:
+Extends the original PlueckerNet trainer to Sim(3):
   - Data batches include s_gt (ground-truth scale).
-  - Validation uses run_ransac_sim3 instead of run_ransac.
+  - Validation uses the Grassmannian RANSAC solver.
   - Validation reports scale error (log-ratio) in addition to R, t errors.
-  - Uses next(iter) instead of iter.next() for Python 3 compatibility.
-
-The network architecture (PluckerNetKnn) and the correspondence loss are
-unchanged — only the evaluation solver is extended to Sim(3).
 """
 import os
 import os.path as osp
@@ -19,14 +15,12 @@ import torch
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 
-# Original PlueckerNet utilities
 from lib.utils import load_model
 from lib.file import ensure_dir
 from lib.timer import AverageMeter, Timer
 from lib.loss import TotalLoss
-from sim3.ransac import run_ransac_sim3
-from sim3.ransac_grassmannian import ransac_sim3 as _ransac_g
-from sim3.model_alternating import PluckerNetKnnAlt
+from lib.ransac_grassmannian import ransac_sim3 as _ransac_g
+from lib.model_alternating import PluckerNetKnnAlt
 
 
 class Sim3Trainer:
@@ -274,18 +268,11 @@ class Sim3Trainer:
                 plucker1_topK = plucker1_raw[0, plucker1_indices[0, :k], :].cpu().numpy()
                 plucker2_topK = plucker2_raw[0, plucker2_indices[0, :k], :].cpu().numpy()
 
-                use_g = getattr(self.config, 'ransac_type', 'sim3') == 'grassmannian'
-                if use_g:
-                    best_rot, best_trans, best_s, best_ic_mask, best_ic = _ransac_g(
-                        plucker1_topK.T, plucker2_topK.T,
-                        n_iter=750, inlier_threshold=0.3,
-                    )
-                    best_trans = best_trans.reshape(3, 1) if best_rot is not None else None
-                else:
-                    best_s, best_rot, best_trans, best_ic, best_ic_mask = run_ransac_sim3(
-                        plucker1_topK.T, plucker2_topK.T,
-                        inlier_threshold=0.3,
-                    )
+                best_rot, best_trans, best_s, best_ic_mask, best_ic = _ransac_g(
+                    plucker1_topK.T, plucker2_topK.T,
+                    n_iter=750, inlier_threshold=0.3,
+                )
+                best_trans = best_trans.reshape(3, 1) if best_rot is not None else None
 
                 if best_rot is not None and best_trans is not None and best_s is not None:
                     err_q, err_t = self._evaluate_R_t(

@@ -29,7 +29,6 @@ Minimal solver (3 line pairs → 7 DOF = 3 rotation + 3 translation + 1 scale):
 """
 
 import numpy as np
-from sim3.ransac import model_estimate_sim3 as _minimal_sim3
 
 
 # ── Plücker utilities ─────────────────────────────────────────────────────────
@@ -253,6 +252,23 @@ def transform_lines(
     return np.vstack([m_out, d_out])
 
 
+# ── Minimal solver ───────────────────────────────────────────────────────────
+
+def _minimal_sim3(L1: np.ndarray, L2: np.ndarray):
+    """Minimal Sim(3) estimate from a small set of line correspondences.
+
+    Uses the sign-aware Procrustes rotation and the joint (t, s) LS solve
+    already defined in this module — no dependency on the old ransac.py.
+
+    Returns (s, R, t) or None if degenerate (s ≤ 0 or non-finite).
+    """
+    R = solve_rotation(L1[3:], L2[3:])
+    t, s = solve_translation_scale(L1, L2, R)
+    if s <= 0 or not np.isfinite(s):
+        return None
+    return s, R, t
+
+
 # ── RANSAC outer loop ─────────────────────────────────────────────────────────
 
 def solve_translation_fixed_scale(
@@ -314,7 +330,7 @@ def ransac_sim3(
     n_iter: int = 5000,
     inlier_threshold: float = 0.3,
     min_inliers: int = 6,
-    min_sample: int = 2,
+    min_sample: int = 3,
     seed: int = 42,
     s_prior: float = -1.0,
     lambda_s: float = 5.0,
