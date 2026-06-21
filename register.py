@@ -24,14 +24,35 @@ Output (stdout):
 import os, sys, argparse
 import numpy as np
 import torch
+import msgpack
 from easydict import EasyDict as edict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from lib.pair_generator import load_pool_from_db
 from lib.ransac_grassmannian import ransac_sim3
 from lib.utils import load_model
+
+
+def load_pool_from_db(db_path: str) -> np.ndarray:
+    """Load line landmarks from a Structure-PLP-SLAM map as Plücker [m, d] (K, 6)."""
+    with open(db_path, "rb") as f:
+        data = msgpack.unpack(f, raw=False)
+    pool = []
+    for lm in data.get("landmarks_line", {}).values():
+        pw = lm.get("pos_w") or lm.get("pos")
+        if pw is None or len(pw) < 6:
+            continue
+        p1 = np.array(pw[:3], np.float32)
+        p2 = np.array(pw[3:6], np.float32)
+        diff = p2 - p1
+        ln = float(np.linalg.norm(diff))
+        if ln < 0.01:
+            continue
+        d = diff / ln
+        m = np.cross((p1 + p2) * 0.5, d)
+        pool.append(np.concatenate([m, d]).astype(np.float32))
+    return np.array(pool, np.float32) if pool else np.zeros((0, 6), np.float32)
 
 
 def load_network(ckpt_path: str, device: torch.device):

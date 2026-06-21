@@ -15,23 +15,17 @@ import torch
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 
-from lib.utils import load_model
-from lib.file import ensure_dir
-from lib.timer import AverageMeter, Timer
+from lib.utils import load_model, ensure_dir, AverageMeter, Timer
 from lib.loss import TotalLoss
 from lib.ransac_grassmannian import ransac_sim3 as _ransac_g
-from lib.model_alternating import PluckerNetKnnAlt
 
 
 class Sim3Trainer:
 
     def __init__(self, config, data_loader, val_data_loader=None):
 
-        if getattr(config, 'model_type', 'knn') == 'alt':
-            self.model = PluckerNetKnnAlt(config)
-        else:
-            Model = load_model('PluckerNetKnn')
-            self.model = Model(config)
+        Model = load_model('PluckerNetKnn')
+        self.model = Model(config)
 
         logging.info(self.model)
 
@@ -88,11 +82,7 @@ class Sim3Trainer:
                     self.best_val_metric = state['best_val_metric']
             else:
                 raise ValueError(f"No checkpoint found at '{config.resume}'")
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-
+    
     def train(self):
         if self.test_valid:
             with torch.no_grad():
@@ -207,11 +197,7 @@ class Sim3Trainer:
                 )
                 data_meter.reset()
                 total_timer.reset()
-
-    # ------------------------------------------------------------------
-    # Validation loop (Sim(3) RANSAC)
-    # ------------------------------------------------------------------
-
+    
     def _valid_epoch(self):
         self.model.eval()
         num_data   = 0
@@ -312,11 +298,7 @@ class Sim3Trainer:
         )
 
         return stats
-
-    # ------------------------------------------------------------------
-    # Evaluation helpers
-    # ------------------------------------------------------------------
-
+    
     def _evaluate_R_t(self, R_est, t_est, R_gt, t_gt):
         """Compute rotation (rad) and translation errors.
 

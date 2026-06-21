@@ -1,6 +1,10 @@
 # ScalePluckerNet
 
-Extends [PlueckerNet](https://github.com/Liumouliu/PlueckerNet) (Liu et al., CVPR 2021) from **SE(3)** to **Sim(3)** — jointly recovering rotation R, translation t, *and scale s* from Plücker line correspondences. Typical use: matching monocular SLAM line landmarks (scale-ambiguous) to metric RGB-D map lines.
+Extends [PlueckerNet](https://github.com/Liumouliu/PlueckerNet) (Liu et al., CVPR 2021) from **SE(3)** to **Sim(3)** — jointly recovering rotation R, translation t, *and scale s* from Plücker line correspondences.
+
+**Problem:** when matching monocular SLAM line landmarks (scale-ambiguous) to metric RGB-D map lines, the SE(3) RANSAC structurally fails — it absorbs the unknown scale into a spurious translation, giving wrong pose estimates even when correspondences are correct.
+
+**Solution:** a minimal two-correspondence Sim(3) solver (SVD for rotation, joint LS for scale+translation) replacing the SE(3) backend. The PluckerNetKnn correspondence network is used without modification — scale enters only through moment magnitudes, which the Sinkhorn matcher learns to ignore.
 
 ---
 
@@ -326,19 +330,15 @@ python register.py --db_src mono.db --db_tgt metric.db \
 
 ---
 
-## SE(3) Pretrained Model Fails on Sim(3) Data
+## Results
 
-**Setup:** `scripts/make_sim3_from_se3.py` adds random scale s ∈ [0.1, 10] (log-uniform) to the original PlueckerNet validation splits. The pretrained checkpoints are then run on both the original SE3 and the new Sim3 versions of the same scenes via `scripts/eval.py`. Metric: `avg_inlier_ratio` (fraction of top-100 predicted correspondences that are GT matches, averaged over the validation set).
+See the [project page](https://rueyday.github.io/ScalePluckerNet/) for evaluation tables. Run `scripts/eval.py` to generate numbers with your checkpoint:
 
-| Model | Split | avg inlier ratio | med inlier ratio | n |
-|-------|-------|-----------------|-----------------|-----|
-| SE3-pretrained | semantic3D  SE3  (s=1, original) | **46.18%** | 42.50% | 298 |
-| SE3-pretrained | semantic3D  Sim3 (random s)      | **30.54%** | 23.50% | 298 |
-| se3sim3 (epoch 78) | semantic3D  Sim3 (random s)  | **40.68%** | 39.00% | 298 |
-| SE3-pretrained | structured3D SE3  (s=1, original) | **81.44%** | 85.00% | 525 |
-| SE3-pretrained | structured3D Sim3 (random s)      | **47.06%** | 49.00% | 525 |
-| se3sim3 (epoch 78) | structured3D Sim3 (random s) | **80.14%** | 83.00% | 525 |
+```bash
+python scripts/eval.py \
+    --checkpoint output/<run>/best_val_checkpoint.pth \
+    --dataset synthetic_valid \
+    --ransac grassmannian
+```
 
-**SE3-pretrained drop:** −15.6 pp on semantic3D, −34.4 pp on structured3D. The same GT matches exist in both versions — only a scale factor is added to plucker1 moments. The pretrained SE(3) model nearly halves its matching quality on structured3D under scale variation.
-
-**se3sim3 fix:** Training with random Sim(3) scales collapses the Sim3 drop to −1.1 pp (semantic3D) and −0.9 pp (structured3D) — essentially zero. SE(3) performance is preserved (41.81% / 81.01% on the s=1 splits), confirming that the model learns scale-invariant matching without sacrificing accuracy on unit-scale data.
+Key metrics: `recall_rot` (fraction of pairs with rot error < 5°), `avg_inlier_ratio`, `med_rot`, `med_scale_err`.

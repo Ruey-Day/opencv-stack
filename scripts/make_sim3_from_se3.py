@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Convert SE3 pkl dataset to Sim3 by applying a random scale to each sample.
 
@@ -7,17 +6,9 @@ Sim3 pair by rescaling plucker1's moments using R_gt and t_gt:
 
     m1_sim3 = s * (m1 - t×d1) + t×d1
 
-This is exact: if m1_se3 = R*m2 + t×d1, then m1_sim3 = s*(R*m2) + t×d1.
-Directions are unchanged (scale does not affect them).
 The scale s_gt is added as a new pkl file.
 
 Usage:
-    python scripts/make_sim3_from_se3.py --src dataset/structured3D_valid \
-                                          --dst dataset/structured3D_sim3_valid
-    python scripts/make_sim3_from_se3.py --src dataset/semantic3D_valid \
-                                          --dst dataset/semantic3D_sim3_valid
-    python scripts/make_sim3_from_se3.py --src dataset/structured3D_train \
-                                          --dst dataset/structured3D_sim3_train
     python scripts/make_sim3_from_se3.py --src dataset/semantic3D_train \
                                           --dst dataset/semantic3D_sim3_train
 """
@@ -35,7 +26,6 @@ sys.path.insert(0, str(_ROOT))
 SCALE_MIN = 0.1
 SCALE_MAX = 10.0
 
-
 def apply_sim3_scale(plucker1: np.ndarray, t: np.ndarray, s: float) -> np.ndarray:
     """
     Apply Sim3 scale to plucker1 moments given translation t and scale s.
@@ -51,7 +41,6 @@ def apply_sim3_scale(plucker1: np.ndarray, t: np.ndarray, s: float) -> np.ndarra
     t_cross_d1 = np.cross(t[None], d1)   # (N, 3)
     out[:, :3] = s * (m1 - t_cross_d1) + t_cross_d1
     return out.astype(np.float32)
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,

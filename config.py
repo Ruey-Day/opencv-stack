@@ -71,8 +71,6 @@ train_arg.add_argument('--val_num_thread', type=int, default=1)
 train_arg.add_argument('--test_num_thread', type=int, default=1)
 train_arg.add_argument("--print_freq", type=int, default=10, help="print fps")
 
-# -----------------------------------------------------------------------------
-# test
 test_arg = add_argument_group("Test")
 test_arg.add_argument("--test_flag", type=bool, default=False, help="Enable testing")
 test_arg.add_argument("--test_outlier_ratio", type=float, default=0.0, help="the outlier ratio in testing")
