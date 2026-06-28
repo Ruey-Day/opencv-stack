@@ -121,10 +121,11 @@ def register(db_src: str, db_tgt: str, ckpt_path: str,
 
     best_ic = -1
     best_s, best_R, best_t = None, None, None
-    for _ in range(n_runs):
+    for run_i in range(n_runs):
         R, t, s, _, ic = ransac_sim3(pl1, pl2,
                                       n_iter=n_iter,
-                                      inlier_threshold=threshold)
+                                      inlier_threshold=threshold,
+                                      seed=run_i)
         if ic > best_ic and s is not None and s > 0:
             best_ic, best_s, best_R, best_t = ic, s, R, t
 

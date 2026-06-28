@@ -88,7 +88,8 @@ class Sim3Trainer:
             with torch.no_grad():
                 val_dict = self._valid_epoch()
             for k, v in val_dict.items():
-                self.writer.add_scalar(f'val/{k}', v, 0)
+                if np.isfinite(v):
+                    self.writer.add_scalar(f'val/{k}', v, 0)
 
         for epoch in range(self.start_epoch, self.max_epoch + 1):
             lr = self.scheduler.get_last_lr()
@@ -102,7 +103,8 @@ class Sim3Trainer:
                     val_dict = self._valid_epoch()
                 self.curriculum_ir = val_dict.get('avg_inlier_ratio', 0.0)
                 for k, v in val_dict.items():
-                    self.writer.add_scalar(f'val/{k}', v, epoch)
+                    if np.isfinite(v):
+                        self.writer.add_scalar(f'val/{k}', v, epoch)
                 if self.best_val < val_dict[self.best_val_metric]:
                     logging.info(
                         f'Saving best val model — '
@@ -248,26 +250,6 @@ class Sim3Trainer:
             if k > 3:
                 inlier_inds  = matches[:, plucker1_indices, plucker2_indices].cpu().numpy()
                 inlier_ratio = np.sum(inlier_inds) / k * 100.0
-
-                # Use raw (un-normalized) Plücker coords so RANSAC recovers
-                # the true (s, R, t) rather than (s, R, t/α).
-                plucker1_topK = plucker1_raw[0, plucker1_indices[0, :k], :].cpu().numpy()
-                plucker2_topK = plucker2_raw[0, plucker2_indices[0, :k], :].cpu().numpy()
-
-                best_rot, best_trans, best_s, best_ic_mask, best_ic = _ransac_g(
-                    plucker1_topK.T, plucker2_topK.T,
-                    n_iter=750, inlier_threshold=0.3,
-                )
-                best_trans = best_trans.reshape(3, 1) if best_rot is not None else None
-
-                if best_rot is not None and best_trans is not None and best_s is not None:
-                    err_q, err_t = self._evaluate_R_t(
-                        best_rot, best_trans,
-                        R_gt[0, :, :].numpy(), t_gt.numpy()
-                    )
-                    s_gt_val = float(s_gt[0].item())
-                    if best_s > 0 and s_gt_val > 0:
-                        err_s = abs(np.log(best_s) - np.log(s_gt_val))
 
             num_data += 1
             torch.cuda.empty_cache()

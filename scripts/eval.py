@@ -260,7 +260,7 @@ def main():
         with open(out_f, 'w') as f:
             json.dump({'label': label, 'checkpoint': args.checkpoint,
                        'dataset': dataset, 'threshold': threshold,
-                       'ransac': args.ransac, 'metrics': m,
+                       'ransac': 'grassmannian', 'metrics': m,
                        'by_overlap': {b: {k: v for k, v in d.items() if k != 'n'}
                                       for b, d in buckets.items()}},
                       f, indent=2)

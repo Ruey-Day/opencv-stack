@@ -42,12 +42,17 @@ sys.path.insert(0, str(_ROOT))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_SCALE_RANGE      = (0.1, 10.0)
-_ROOM_SCALE_RANGE = (0.1,  5.0)
+_SCALE_RANGE      = (0.3, 8.0)   # tightened: avoids s_i > 3.3 to prevent moment explosion
+_ROOM_SCALE_RANGE = (0.3, 5.0)
 _MIN_INLIERS      = 20
 
-_SCENARIOS   = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse']
-_SCENARIO_P  = np.array([0.30, 0.10, 0.22, 0.28, 0.10])
+# v2 calibration: mono→metric SLAM pairs have s > 1 (metric larger than mono).
+# LogNormal(log(2.5), 1.0) → median s≈2.5, P25≈0.9, P75≈6.8; 75% of samples s > 1.
+_SCALE_LOG_CENTER = np.log(2.5)
+_SCALE_LOG_STD    = 1.0
+
+_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor']
+_SCENARIO_P = np.array([0.12, 0.09,  0.09,       0.11,  0.06,          0.14,        0.09,        0.09,         0.12,          0.09])
 
 
 # ── Plücker line primitives ───────────────────────────────────────────────────
@@ -181,8 +186,11 @@ def _make_staircase(n: int) -> np.ndarray:
     step_h = np.random.uniform(0.15, 0.30)
     step_d = np.random.uniform(0.25, 0.40)
     origin = np.random.uniform(-2.0, 2.0, 3)
+    # Cap at 15 steps so the staircase stays within ~3m displacement (bounded moments).
+    # n lines are sampled with replacement from these fixed steps.
+    n_steps = 15
     lines = []
-    for i in range(max(3, n // 2)):
+    for i in range(n_steps):
         o = (origin + i * (step_h * up_dir + step_d * depth_dir)).astype(np.float32)
         d = step_dir.astype(np.float32)
         lines.append(np.concatenate([np.cross(o, d), d]))
@@ -192,9 +200,169 @@ def _make_staircase(n: int) -> np.ndarray:
     return arr[np.random.choice(len(arr), n, replace=(n > len(arr)))]
 
 
-def _make_pool(n: int) -> np.ndarray:
+def _make_manhattan_world(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """Three orthogonal line families — mimics walls/floor/ceiling of real indoor rooms."""
     if n == 0:
         return np.zeros((0, 6), np.float32)
+    R = _random_rotation()
+    parts = []
+    for i in range(3):
+        ni = n // 3 + (1 if i < n % 3 else 0)
+        if ni == 0:
+            continue
+        base = R[:, i].astype(np.float32)
+        noise_std = float(np.random.uniform(0.0, 0.07))
+        d = base[None] + np.random.randn(ni, 3).astype(np.float32) * noise_std
+        d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+        p = np.random.uniform(-pos_range, pos_range, (ni, 3)).astype(np.float32)
+        parts.append(np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32))
+    return np.concatenate(parts).astype(np.float32)
+
+
+def _make_corridor_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """One or two dominant directions — mimics corridors, staircases, long hallways."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    R = _random_rotation()
+    n_dirs = np.random.randint(1, 3)
+    parts = []
+    splits = np.random.dirichlet(np.ones(n_dirs)) * n
+    for i, ni in enumerate(splits.astype(int)):
+        if ni == 0:
+            continue
+        base = R[:, i % 3].astype(np.float32)
+        noise_std = float(np.random.uniform(0.0, 0.10))
+        d = base[None] + np.random.randn(ni, 3).astype(np.float32) * noise_std
+        d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+        p = np.random.uniform(-pos_range, pos_range, (ni, 3)).astype(np.float32)
+        parts.append(np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32))
+    return np.concatenate(parts).astype(np.float32)
+
+
+def _make_adversarial_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """
+    Three tight direction-cluster families aligned to orthogonal axes of a random frame.
+    All clusters span the full spatial volume → the model must use moment context, not
+    direction alone, to distinguish correspondences (mirrors wall/floor/ceiling ambiguity
+    in structured indoor scenes).
+    """
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    R = _random_rotation()
+    parts = []
+    for i in range(3):
+        ni = n // 3 + (1 if i < n % 3 else 0)
+        if ni == 0:
+            continue
+        base = R[:, i].astype(np.float32)
+        spread = float(np.random.uniform(0.02, 0.09))   # tight cluster, but not perfectly parallel
+        d = base[None] + np.random.randn(ni, 3).astype(np.float32) * spread
+        d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+        p = np.random.uniform(-pos_range, pos_range, (ni, 3)).astype(np.float32)
+        parts.append(np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32))
+    pool = np.concatenate(parts, axis=0)
+    return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+
+def _make_large_scale_pool(n: int, pos_range: float = 12.0) -> np.ndarray:
+    """Building-scale outdoor pool: large planar facades + manhattan structures."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    n_mw = int(n * np.random.uniform(0.30, 0.65))
+    n_plane = n - n_mw
+    parts = []
+    if n_mw > 0:
+        parts.append(_make_manhattan_world(n_mw, pos_range=pos_range))
+    if n_plane > 0:
+        parts.append(_make_plane_patch(n_plane, pos_range=pos_range))
+    pool = np.concatenate(parts, axis=0)
+    return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+
+def _apply_drift(lines: np.ndarray, n_groups: int = 4, sigma: float = 0.10) -> np.ndarray:
+    """
+    Spatially correlated moment noise — simulates accumulated SLAM drift.
+    Lines are partitioned into n_groups random spatial buckets; each bucket
+    receives the same random moment offset δ ~ N(0, σ²I).
+    """
+    n = len(lines)
+    if n == 0:
+        return lines
+    out = lines.copy()
+    group_ids = np.random.randint(0, n_groups, n)
+    for g in range(n_groups):
+        mask = group_ids == g
+        if mask.sum() == 0:
+            continue
+        out[mask, :3] += np.random.randn(3).astype(np.float32) * sigma
+    return out
+
+
+def _make_confuser_lines(n: int, ref_lines: np.ndarray, spread: float = 0.08,
+                         pos_range: float = 3.0) -> np.ndarray:
+    """Outlier lines with directions near those in ref_lines — structurally confusing."""
+    if n == 0 or len(ref_lines) == 0:
+        return _make_outliers(n, pos_range=pos_range)
+    # Sample directions close to random reference directions + small noise
+    idx = np.random.randint(0, len(ref_lines), n)
+    d = ref_lines[idx, 3:].copy()
+    d += np.random.randn(n, 3).astype(np.float32) * spread
+    d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+    p = np.random.uniform(-pos_range, pos_range, (n, 3)).astype(np.float32)
+    return np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32)
+
+
+def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+
+    if pool_type == 'manhattan':
+        n_mw = int(n * np.random.uniform(0.55, 0.85))
+        n_misc = n - n_mw
+        parts = [_make_manhattan_world(n_mw)]
+        if n_misc > 0:
+            for maker, k in zip(
+                [_make_plane_patch, _make_wireframe, _make_outliers],
+                np.maximum(0, np.round(
+                    np.random.dirichlet(np.ones(3)) * n_misc
+                ).astype(int))
+            ):
+                if k > 0:
+                    parts.append(maker(k))
+        pool = np.concatenate(parts, axis=0)
+        return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+    if pool_type == 'corridor':
+        n_corr = int(n * np.random.uniform(0.55, 0.85))
+        n_misc = n - n_corr
+        parts = [_make_corridor_pool(n_corr)]
+        if n_misc > 0:
+            for maker, k in zip(
+                [_make_staircase, _make_parallel_group, _make_outliers],
+                np.maximum(0, np.round(
+                    np.random.dirichlet(np.ones(3)) * n_misc
+                ).astype(int))
+            ):
+                if k > 0:
+                    parts.append(maker(k))
+        pool = np.concatenate(parts, axis=0)
+        return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+    if pool_type == 'adversarial':
+        # Dominant adversarial clusters + small outlier fringe
+        n_adv  = int(n * np.random.uniform(0.65, 0.90))
+        n_misc = n - n_adv
+        parts  = [_make_adversarial_pool(n_adv)]
+        if n_misc > 0:
+            parts.append(_make_outliers(n_misc))
+        pool = np.concatenate(parts, axis=0)
+        return pool[np.random.permutation(len(pool))].astype(np.float32)
+
+    if pool_type == 'outdoor':
+        pos_range = float(np.random.uniform(8.0, 20.0))
+        return _make_large_scale_pool(n, pos_range=pos_range)
+
+    # Default 'mixed' pool
     n_planes     = np.random.randint(0, 5)
     n_boxes      = np.random.randint(0, 4)
     n_bundles    = np.random.randint(0, 3)
@@ -224,84 +392,166 @@ def _make_pool(n: int) -> np.ndarray:
 def _generate_pair() -> dict:
     scenario = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
 
-    if scenario == 'room':
-        s_lo, s_hi = np.log(_ROOM_SCALE_RANGE[0]), np.log(_ROOM_SCALE_RANGE[1])
-        t_range    = 1.5
-    else:
-        s_lo, s_hi = np.log(_SCALE_RANGE[0]), np.log(_SCALE_RANGE[1])
-        t_range    = 2.0
+    pool_type   = 'mixed'
+    use_confusers = False  # whether to add near-parallel confuser outliers
 
     if scenario == 'room':
         n2           = np.random.randint(80, 1100)
         n1           = max(30, min(int(n2 * np.random.uniform(0.3, 3.0)), 1100))
         overlap_frac = float(np.random.beta(3.0, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.08))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
     elif scenario == 'submap':
         n1           = np.random.randint(30, 150)
         n2           = np.random.randint(max(n1, 80), 700)
         overlap_frac = float(np.random.beta(2.5, 3.5))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.10))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.15))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
     elif scenario == 'relocalize':
         base         = int(np.exp(np.random.uniform(np.log(30), np.log(400))))
         r            = np.random.uniform(0.5, 2.0)
         n1           = max(30, int(base * r))
         n2           = max(30, int(base / r))
         overlap_frac = float(np.random.beta(2.5, 2.5))
-        noise1 = noise2 = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.08))))
+        noise1 = noise2 = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.10))))
     elif scenario == 'loop':
         n1 = n2      = np.random.randint(40, 500)
         overlap_frac = float(np.random.beta(5.0, 2.0))
         noise1 = noise2 = float(np.exp(np.random.uniform(np.log(0.003), np.log(0.06))))
-    else:  # dense_sparse
+    elif scenario == 'dense_sparse':
         n2           = np.random.randint(150, 700)
         n1           = max(30, int(n2 * np.random.uniform(0.10, 0.50)))
         overlap_frac = float(np.random.beta(2.5, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.10))))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
         noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
+    elif scenario == 'manhattan':
+        # Indoor manhattan world — 3 orthogonal line families, moderate noise
+        n2           = np.random.randint(80, 900)
+        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 2.5)), 900))
+        overlap_frac = float(np.random.beta(3.0, 2.5))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
+        pool_type    = 'manhattan'
+    elif scenario == 'hard_noise':
+        # Very few inliers (5-20%), high noise, confuser outliers near inlier directions.
+        # Models the worst-case SLAM drift / low-overlap scenario.
+        n2           = np.random.randint(80, 600)
+        n1           = max(30, int(n2 * np.random.uniform(0.3, 2.0)))
+        overlap_frac = float(np.random.beta(1.5, 6.0))   # mode ≈ 0.08, mean ≈ 0.20
+        noise1       = float(np.exp(np.random.uniform(np.log(0.05), np.log(0.50))))  # v3: raised ceiling 0.30→0.50
+        noise2       = float(np.exp(np.random.uniform(np.log(0.01), np.log(0.10))))
+        use_confusers = True
+        pool_type    = 'mixed'
+    elif scenario == 'adversarial':
+        # 3 tight orthogonal direction families, mixed positions — forces moment-based disambiguation.
+        # Directly targets the structured/indoor dense-overlap failure mode.
+        n2           = np.random.randint(80, 800)
+        n1           = max(30, min(int(n2 * np.random.uniform(0.3, 2.5)), 800))
+        overlap_frac = float(np.random.beta(3.0, 2.5))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
+        pool_type    = 'adversarial'
+        use_confusers = True
+    elif scenario == 'outdoor':
+        # Large-scale outdoor: building facades and structures at 8–20 m spatial range.
+        # Reference |m| ~ 10–20 m (metric LiDAR); query |m| ~ 4–8 m (mono drone / camera).
+        n2           = np.random.randint(60, 500)
+        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 2.0)), 500))
+        overlap_frac = float(np.random.beta(2.5, 2.0))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.02), np.log(0.60))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.20))))
+        pool_type    = 'outdoor'
+    else:  # corridor
+        # Corridor / stairwell — 1-2 dominant directions, higher noise
+        n2           = np.random.randint(50, 450)
+        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 1.8)), 450))
+        overlap_frac = float(np.random.beta(2.0, 3.0))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.15))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.002), np.log(0.05))))
+        pool_type    = 'corridor'
 
     k  = max(_MIN_INLIERS, int(overlap_frac * min(n1, n2)))
     n1 = max(n1, k)
     n2 = max(n2, k)
 
-    s   = float(np.exp(np.random.uniform(s_lo, s_hi)))
+    # v2 fix: sample scale from LogNormal biased toward s > 1 (mono→metric scenario).
+    # Clipped to _SCALE_RANGE; ~80% of samples have s > 1.
+    log_s = np.random.normal(_SCALE_LOG_CENTER, _SCALE_LOG_STD)
+    log_s = np.clip(log_s, np.log(_SCALE_RANGE[0]), np.log(_SCALE_RANGE[1]))
+    s   = float(np.exp(log_s))
     R   = _random_rotation()
-    t   = np.random.uniform(-t_range, t_range, 3).astype(np.float32)
+    # v2 fix: t_range_eff = 0.4 * s so that the inverse translation
+    # |t_i| = |t|/s ≤ 0.4m for ALL s (both s < 1 and s > 1).
+    # Prevents the t × d cross term from inflating query moments.
+    t_range_eff = 0.4 * s
+    t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 
-    n_out1  = max(0, n1 - k)
-    n_out2  = max(0, n2 - k)
+    n_out1    = max(0, n1 - k)
+    n_out2    = max(0, n2 - k)
     pool_size = k + n_out1 + n_out2 + max(k // 4, 8)
+    # Allow near-parallel configurations (lowered from 0.30 so the model
+    # sees the corridor/manhattan distributions it will face at test time).
+    _NONDEGEN_THR = 0.05
     for _attempt in range(10):
-        big_pool = _make_pool(pool_size)
+        big_pool = _make_pool(pool_size, pool_type=pool_type)
         dirs = big_pool[:, 3:]
         sv = np.linalg.svd(dirs - dirs.mean(0, keepdims=True), compute_uv=False)
-        if sv[-1] / (sv[0] + 1e-9) >= 0.30:
+        if sv[-1] / (sv[0] + 1e-9) >= _NONDEGEN_THR:
             break
 
     inliers_ref = big_pool[:k].copy()
     out_q_ref   = big_pool[k:k + n_out1]
     out_r       = big_pool[k + n_out1:k + n_out1 + n_out2]
 
+    # Direction noise: hard_noise uses up to 0.12 rad (~7°); others up to 0.04 rad.
+    dir_noise_q   = np.random.uniform(0.0, 0.12 if use_confusers else 0.04)
+    dir_noise_ref = np.random.uniform(0.0, 0.08 if use_confusers else 0.03)
+
     if k > 0:
         inliers_q = _apply_sim3(inliers_ref, s_i, R_i, t_i)
         inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
         inliers_ref[:, :3] += np.random.randn(k, 3).astype(np.float32) * noise2
-        inliers_q  [:, 3:] += np.random.randn(k, 3).astype(np.float32) * np.random.uniform(0.0, 0.03)
+        inliers_q  [:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise_q
         inliers_q  [:, 3:] /= np.linalg.norm(inliers_q  [:, 3:], axis=1, keepdims=True) + 1e-9
-        inliers_ref[:, 3:] += np.random.randn(k, 3).astype(np.float32) * np.random.uniform(0.0, 0.02)
+        inliers_ref[:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise_ref
         inliers_ref[:, 3:] /= np.linalg.norm(inliers_ref[:, 3:], axis=1, keepdims=True) + 1e-9
+
+        # Drift augmentation (20% of pairs): spatially correlated moment noise on query.
+        if np.random.random() < 0.20:
+            inliers_q = _apply_drift(
+                inliers_q,
+                n_groups=np.random.randint(2, 6),
+                sigma=float(np.random.uniform(0.05, 0.25)),
+            )
+
+        # Rare direction flips (15% of pairs): negate m and d on 2–8% of inliers,
+        # simulating ±180° orientation ambiguity in SLAM line extraction.
+        if k > 2 and np.random.random() < 0.15:
+            n_flip   = max(1, int(k * np.random.uniform(0.02, 0.08)))
+            flip_idx = np.random.choice(k, n_flip, replace=False)
+            inliers_q[flip_idx, :3] *= -1
+            inliers_q[flip_idx, 3:] *= -1
     else:
         inliers_q = inliers_ref = np.zeros((0, 6), np.float32)
 
-    out_q = (_apply_sim3(out_q_ref, s_i, R_i, t_i) if n_out1 > 0
-             else np.zeros((0, 6), np.float32))
+    if use_confusers and k > 0:
+        # Replace a fraction of regular outliers with confuser lines (near-parallel to inliers).
+        n_conf = max(0, int(n_out1 * np.random.uniform(0.3, 0.7)))
+        n_reg  = n_out1 - n_conf
+        out_q_reg  = (_apply_sim3(out_q_ref[:n_reg], s_i, R_i, t_i) if n_reg > 0
+                      else np.zeros((0, 6), np.float32))
+        out_q_conf = _make_confuser_lines(n_conf, inliers_q) if n_conf > 0 else np.zeros((0, 6), np.float32)
+        out_q_parts = [p for p in [out_q_reg, out_q_conf] if len(p) > 0]
+        out_q = np.concatenate(out_q_parts) if out_q_parts else np.zeros((0, 6), np.float32)
+    else:
+        out_q = (_apply_sim3(out_q_ref, s_i, R_i, t_i) if n_out1 > 0
+                 else np.zeros((0, 6), np.float32))
 
     q_parts = [p for p in [inliers_q, out_q]   if len(p) > 0]
     r_parts = [p for p in [inliers_ref, out_r] if len(p) > 0]
-    query_all = (np.concatenate(q_parts, axis=0) if q_parts else _make_pool(max(n1, 10)))
-    ref_all   = (np.concatenate(r_parts, axis=0) if r_parts else _make_pool(max(n2, 10)))
+    query_all = (np.concatenate(q_parts, axis=0) if q_parts else _make_pool(max(n1, 10), pool_type))
+    ref_all   = (np.concatenate(r_parts, axis=0) if r_parts else _make_pool(max(n2, 10), pool_type))
 
     i1 = np.random.permutation(len(query_all))
     i2 = np.random.permutation(len(ref_all))
@@ -399,6 +649,9 @@ def main():
     ap.add_argument('--n_train',    type=int, default=200_000)
     ap.add_argument('--n_valid',    type=int, default=2_000)
     ap.add_argument('--out_dir',    default=str(_ROOT / 'dataset'))
+    ap.add_argument('--name',       default='synthetic_v3',
+                    help='Dataset name prefix (default: synthetic_v3). '
+                         'Outputs to <out_dir>/<name>_train and <out_dir>/<name>_valid.')
     ap.add_argument('--chunk_size', type=int, default=2_000)
     ap.add_argument('--workers',    type=int,
                     default=max(1, (os.cpu_count() or 4) - 1))
@@ -408,17 +661,19 @@ def main():
     print(f'Generating synthetic dataset  '
           f'train={args.n_train:,}  valid={args.n_valid:,}  '
           f'workers={args.workers}  seed={args.seed}')
-    print(f'Output: {args.out_dir}')
+    print(f'Output: {args.out_dir}  name: {args.name}')
+    print(f'Scale distribution: LogNormal(log({np.exp(_SCALE_LOG_CENTER):.1f}), {_SCALE_LOG_STD}) '
+          f'clipped to {_SCALE_RANGE}')
 
     print('\n=== Training split ===')
     _save(generate_split(args.n_train, args.workers, args.chunk_size,
                          seed=args.seed, label='train'),
-          os.path.join(args.out_dir, 'synthetic_train'))
+          os.path.join(args.out_dir, f'{args.name}_train'))
 
     print('\n=== Validation split ===')
     _save(generate_split(args.n_valid, args.workers, args.chunk_size,
                          seed=args.seed + 999_983, label='valid'),
-          os.path.join(args.out_dir, 'synthetic_valid'))
+          os.path.join(args.out_dir, f'{args.name}_valid'))
 
     print('\nDone.')
 

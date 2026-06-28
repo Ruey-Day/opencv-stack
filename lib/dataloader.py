@@ -165,8 +165,8 @@ class Sim3PluckerData(Dataset):
 
     def __getitem__(self, index):
         matches_ind = self.data['matches'][index]     # (2, n_inliers)
-        plucker1    = self.data['plucker1'][index]    # (n_lines, 6)
-        plucker2    = self.data['plucker2'][index]
+        plucker1    = self.data['plucker1'][index].copy()    # (n_lines, 6)
+        plucker2    = self.data['plucker2'][index].copy()
         R_gt        = self.data['R_gt'][index]
         t_gt        = self.data['t_gt'][index]
         s_gt        = np.float32(self.data['s_gt'][index])
@@ -174,6 +174,15 @@ class Sim3PluckerData(Dataset):
         if self.in_channel is not None:
             plucker1 = plucker1[:, :self.in_channel]
             plucker2 = plucker2[:, :self.in_channel]
+
+        # Per-cloud moment normalisation: brings outdoor (±100 m) and indoor
+        # (±5 m) moments into the same activation range for the encoder.
+        # Directions (unit vectors) are unchanged.  The matching matrix is
+        # index-based so correctness is unaffected.
+        std1 = float(plucker1[:, :3].std()) + 1e-6
+        std2 = float(plucker2[:, :3].std()) + 1e-6
+        plucker1[:, :3] /= std1
+        plucker2[:, :3] /= std2
 
         n1, n2 = plucker1.shape[0], plucker2.shape[0]
         matches = np.zeros([n1, n2], dtype=np.float32)

@@ -202,7 +202,7 @@ def _minimal_sim3(L1: np.ndarray, L2: np.ndarray):
 
     Returns (s, R, t) or None if degenerate.
     """
-    R = solve_rotation_global(L1[3:], L2[3:])
+    R = solve_rotation_geodesic(L1[3:], L2[3:])
     t, s = solve_translation_scale(L1, L2, R)
     if s <= 0 or not np.isfinite(s):
         return None
