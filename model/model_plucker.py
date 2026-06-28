@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-
 def knn(x, k):
     """k-nearest neighbours by L2. x: (B, D, N) → idx: (B, N, k)."""
     dist = torch.cdist(x.transpose(1, 2), x.transpose(1, 2))  # (B, N, N)

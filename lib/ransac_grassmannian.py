@@ -12,15 +12,17 @@ SIM(3) line transformation
     moment:    m  →  s·R·m + t × (R·d)
 
 Minimal solver (3 line pairs → 7 DOF):
-    1. Rotation R  — Riemannian gradient descent minimising the geodesic cost
-                     Σ arccos²(|R·d1_i · d2_i|), warm-started from Procrustes.
+    1. Rotation R  — SVD Procrustes (L2) or IRLS weighted Procrustes (L1)
     2. Scale s and translation t — linear least squares given R:
            m2_i = s·R·m1_i + skew(t)·(R·d1_i)
        stacked as  [-skew(R·d1_i) | R·m1_i] · [t; s] = m2_i.
+
+Inlier refinement (refine_sim3):
+    Joint linear solve for P=s·R and t in one LS:
+        P·m1_i + skew(t)·(R·d1_i) = m2_i
+    Then extract s = det(P)^(1/3), R = P/s, projected to SO(3).
 """
 import numpy as np
-from scipy.optimize import differential_evolution
-from scipy.spatial.transform import Rotation as ScipyRot
 
 def plucker_from_endpoints(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     """Convert 3D line endpoints to Plücker coordinates [m; d], shape (6, N)."""
@@ -30,7 +32,6 @@ def plucker_from_endpoints(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     d = diff / (np.linalg.norm(diff, axis=1, keepdims=True) + 1e-12)
     m = np.cross(p1, d)
     return np.vstack([m.T, d.T])  # (6, N)
-
 
 
 def plucker_to_g24_basis(L: np.ndarray) -> np.ndarray:
@@ -85,10 +86,12 @@ def _skew(v: np.ndarray) -> np.ndarray:
     ])
 
 
-def solve_rotation(d1: np.ndarray, d2: np.ndarray) -> np.ndarray:
+def solve_rotation_l2(d1: np.ndarray, d2: np.ndarray) -> np.ndarray:
     """
-    Global optimum of Σ‖R·d1_i − d2_i‖² via SVD (Wahba / Procrustes).
-    Sign ambiguity handled by flipping d1_i when d1_i·d2_i < 0.
+    SVD Procrustes: global minimiser of Σ‖R·d1_i − d2_i‖² over SO(3).
+
+    Handles undirected lines by flipping d1_i when d1_i·d2_i < 0 before
+    building the cross-covariance.  O(N) — single SVD.
     """
     dots = (d1 * d2).sum(axis=0)
     d1_aligned = d1 * np.where(dots >= 0, 1.0, -1.0)[np.newaxis, :]
@@ -97,46 +100,38 @@ def solve_rotation(d1: np.ndarray, d2: np.ndarray) -> np.ndarray:
     return U @ np.diag([1.0, 1.0, float(det)]) @ Vt
 
 
-def solve_rotation_geodesic(
-    d1: np.ndarray, d2: np.ndarray,
-    n_steps: int = 20,
-    lr: float = 0.3,
+def solve_rotation_l1(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    n_iter: int = 20,
+    eps: float = 1e-6,
 ) -> np.ndarray:
     """
-    Global optimum of Σ arccos²(|R·d1_i · d2_i|) via Riemannian gradient descent.
+    IRLS: minimises Σ‖R·d1_i − d2_i‖₁ via iteratively reweighted Procrustes.
 
-    Warm-started from Procrustes.  For 3 generic non-parallel lines the cost has
-    a unique global minimum, so the warm start is guaranteed to be in its basin
-    of attraction and gradient descent converges to the global solution.
+    Each iteration:
+      1. Compute residuals r_i = ‖R·d1_i_signed − d2_i‖ with sign-alignment.
+      2. Set weights w_i = 1 / max(r_i, eps).
+      3. Solve weighted Procrustes via SVD of Σ w_i · d2_i · d1_i_signed^T.
 
-    Lie-algebra gradient:
-        ∂f/∂ω = −2 Σ_i  (θ_i / sin θ_i) · sign(c_i) · (u_i × d2_i)
-    where u_i = R·d1_i,  c_i = u_i · d2_i,  θ_i = arccos(|c_i|).
+    Warm-started from the L2 Procrustes solution.  Converges in ~10 iterations.
     """
-    R = solve_rotation(d1, d2)
-
-    d1n = d1 / (np.linalg.norm(d1, axis=0, keepdims=True) + 1e-12)
-    d2n = d2 / (np.linalg.norm(d2, axis=0, keepdims=True) + 1e-12)
-
-    for _ in range(n_steps):
-        u     = R @ d1n
-        c     = np.clip((u * d2n).sum(axis=0), -1 + 1e-9, 1 - 1e-9)
-        theta = np.arccos(np.abs(c))
-        sin_t = np.sin(theta)
-        w     = np.where(sin_t < 1e-7, 1.0, theta / sin_t)   # θ/sinθ → 1 near 0
-
-        grad  = -2.0 * (np.cross(u.T, d2n.T).T * (w * np.sign(c))).sum(axis=1)
-
-        omega = -lr * grad
-        angle = np.linalg.norm(omega)
-        if angle < 1e-10:
+    R = solve_rotation_l2(d1, d2)
+    for _ in range(n_iter):
+        u = R @ d1
+        signs = np.where((u * d2).sum(axis=0) >= 0, 1.0, -1.0)
+        u_signed = u * signs
+        residuals = np.linalg.norm(u_signed - d2, axis=0)
+        w = 1.0 / np.maximum(residuals, eps)
+        d1_signed = d1 * signs
+        H = (d2 * w) @ d1_signed.T
+        U, _, Vt = np.linalg.svd(H)
+        det = np.linalg.det(U @ Vt)
+        R_new = U @ np.diag([1.0, 1.0, float(det)]) @ Vt
+        if np.linalg.norm(R_new - R) < 1e-8:
             break
-        K  = _skew(omega / angle)
-        R  = (np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)) @ R
-
-    U, _, Vt = np.linalg.svd(R)
-    det = np.linalg.det(U @ Vt)
-    return U @ np.diag([1.0, 1.0, float(det)]) @ Vt
+        R = R_new
+    return R
 
 
 def solve_translation_scale(L1: np.ndarray, L2: np.ndarray, R: np.ndarray) -> tuple:
@@ -165,6 +160,67 @@ def solve_translation_scale(L1: np.ndarray, L2: np.ndarray, R: np.ndarray) -> tu
     return x[:3], float(x[3])
 
 
+def refine_sim3(
+    L1: np.ndarray,
+    L2: np.ndarray,
+    R_init: np.ndarray,
+    t_init: np.ndarray,
+    s_init: float,
+) -> tuple:
+    """
+    Joint linear refinement of (R, t, s) on a set of inlier line pairs.
+
+    Instead of solving R and (t, s) sequentially, this writes a single
+    linear system in P = s·R (3×3 free matrix) and t:
+
+        P·m1_i + skew(t)·(R_cur·d1_i) = m2_i          (3N × 12 LS)
+
+    where R_cur·d1_i is approximated using the current rotation estimate.
+    After solving, s and R are recovered from P:
+
+        s = det(P)^(1/3),   R = P / s  → projected to SO(3) via SVD.
+
+    This is tighter than sequential solving because the moment residuals
+    jointly constrain the scale, rotation, and translation rather than
+    accumulating errors from the direction-only stage.
+
+    Args:
+        L1, L2:  (6, N) Plücker [m; d] inlier pairs
+        R_init, t_init, s_init: initial estimate (from RANSAC best hypothesis)
+
+    Returns:
+        R: (3,3), t: (3,), s: float
+    """
+    m1, d1, m2 = L1[:3], L1[3:], L2[:3]
+    N = L1.shape[1]
+    Rd1 = R_init @ d1  # (3, N) — current direction estimate
+
+    # Build 3N × 12 system:  [m1_i^T ⊗ I₃ | -skew(Rd1_i)] · [vec(P); t] = m2_i
+    A = np.zeros((3 * N, 12))
+    b = np.zeros(3 * N)
+    for i in range(N):
+        row = 3 * i
+        # columns 0-8: vec(P) contribution — P·m1_i = [m1_i^T ⊗ I₃] · vec(P)
+        A[row:row + 3, :9] = np.kron(m1[:, i], np.eye(3))
+        # columns 9-11: t contribution — skew(t)·Rd1_i = -skew(Rd1_i)·t
+        A[row:row + 3, 9:] = -_skew(Rd1[:, i])
+        b[row:row + 3]     =  m2[:, i]
+
+    x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    P = x[:9].reshape(3, 3)
+    t = x[9:]
+
+    # Extract s and R from P = s·R
+    s = float(np.cbrt(np.linalg.det(P)))
+    if s <= 0 or not np.isfinite(s):
+        return R_init, t_init, s_init
+
+    U, _, Vt = np.linalg.svd(P / s)
+    det = np.linalg.det(U @ Vt)
+    R = U @ np.diag([1.0, 1.0, float(det)]) @ Vt
+    return R, t, s
+
+
 def transform_lines(L: np.ndarray, R: np.ndarray, t: np.ndarray, s: float) -> np.ndarray:
     """Apply SIM(3) to Plücker lines: d' = R·d,  m' = s·R·m + skew(t)·(R·d)."""
     d_out = R @ L[3:]
@@ -172,37 +228,25 @@ def transform_lines(L: np.ndarray, R: np.ndarray, t: np.ndarray, s: float) -> np
     return np.vstack([m_out, d_out])
 
 
-def solve_rotation_global(d1: np.ndarray, d2: np.ndarray) -> np.ndarray:
-    """
-    Global minimisation of Σ arccos²(|R·d1_i · d2_i|) via differential evolution
-    over the axis-angle ball of radius π (covers all of SO(3)).
-    No warm start — pure global search followed by L-BFGS-B polish.
-    """
-    d1n = d1 / (np.linalg.norm(d1, axis=0, keepdims=True) + 1e-12)
-    d2n = d2 / (np.linalg.norm(d2, axis=0, keepdims=True) + 1e-12)
-
-    def cost(rotvec):
-        R = ScipyRot.from_rotvec(rotvec).as_matrix()
-        u = R @ d1n
-        c = np.clip((u * d2n).sum(axis=0), -1 + 1e-9, 1 - 1e-9)
-        return float(np.sum(np.arccos(np.abs(c)) ** 2))
-
-    bounds = [(-np.pi, np.pi)] * 3
-    result = differential_evolution(cost, bounds, seed=0, tol=1e-10, polish=True)
-    return ScipyRot.from_rotvec(result.x).as_matrix()
-
-
-def _minimal_sim3(L1: np.ndarray, L2: np.ndarray):
+def _minimal_sim3(
+    L1: np.ndarray,
+    L2: np.ndarray,
+    rotation_mode: str = 'l2',
+):
     """
     Minimal SIM(3) estimate from a small set of line correspondences.
 
-    Rotation is solved by globally minimising the geodesic cost
-    Σ arccos²(|R·d1_i · d2_i|) via differential evolution (no warm start).
-    Then (t, s) are recovered via linear least squares given R.
+    Args:
+        rotation_mode: 'l2' — SVD Procrustes (fastest, global L2 optimum);
+                       'l1' — IRLS weighted Procrustes (robust to direction outliers).
 
     Returns (s, R, t) or None if degenerate.
     """
-    R = solve_rotation_geodesic(L1[3:], L2[3:])
+    if rotation_mode == 'l1':
+        R = solve_rotation_l1(L1[3:], L2[3:])
+    else:
+        R = solve_rotation_l2(L1[3:], L2[3:])
+
     t, s = solve_translation_scale(L1, L2, R)
     if s <= 0 or not np.isfinite(s):
         return None
@@ -244,6 +288,8 @@ def ransac_sim3(
     min_sample: int = 3,
     seed: int = 42,
     early_exit_iters: int = 200,
+    rotation_mode: str = 'l2',
+    refine: bool = True,
 ) -> tuple:
     """
     Inlier metric: G(2,4) max principal angle (Shin et al. ICCV 2025).
@@ -256,9 +302,10 @@ def ransac_sim3(
       1. Sample ``min_sample`` lines, preferring one per direction quadrant bin
          (stratified) to avoid degenerate near-parallel samples. Falls back to
          uniform random when fewer distinct bins exist than min_sample.
-      2. Solve R by globally minimising the geodesic cost, then (t, s) via LS.
+      2. Solve R (L2 SVD or L1 IRLS), then (t, s) via LS.
       3. Count G(2,4) inliers below inlier_threshold.
       4. Keep the hypothesis with the most inliers.
+    After the loop, optionally refine on all inliers via joint linear solve.
 
     Args:
         L1, L2:           (6, N) Plücker [m; d] source and target lines
@@ -267,6 +314,9 @@ def ransac_sim3(
         min_sample:       minimal sample size (default 3)
         seed:             RNG seed
         early_exit_iters: quit early if best inlier count is still 0
+        rotation_mode:    'l2' (SVD Procrustes) or 'l1' (IRLS, slower per iter)
+        refine:           if True, polish best hypothesis via joint linear solve
+                          on all inliers before returning
 
     Returns:
         R: (3,3), t: (3,), s: float, inlier_mask: (N,) bool, n_inliers: int
@@ -306,7 +356,7 @@ def ransac_sim3(
         idx = _sample()
 
         try:
-            result = _minimal_sim3(L1[:, idx], L2[:, idx])
+            result = _minimal_sim3(L1[:, idx], L2[:, idx], rotation_mode=rotation_mode)
             if result is None:
                 continue
             s_cand, R_cand, t_cand = result
@@ -317,5 +367,14 @@ def ransac_sim3(
         mask, ic = _evaluate(R_cand, t_cand, s_cand)
         if ic > best_ic:
             best_ic, best_mask, best_R, best_t, best_s = ic, mask, R_cand, t_cand, s_cand
+
+    if refine and best_ic >= 4:
+        inlier_idx = np.where(best_mask)[0]
+        R_ref, t_ref, s_ref = refine_sim3(
+            L1[:, inlier_idx], L2[:, inlier_idx], best_R, best_t, best_s)
+        # re-evaluate on all lines with refined estimate
+        mask_ref, ic_ref = _evaluate(R_ref, t_ref, s_ref)
+        if ic_ref >= best_ic:
+            best_R, best_t, best_s, best_mask, best_ic = R_ref, t_ref, s_ref, mask_ref, ic_ref
 
     return best_R, best_t, best_s, best_mask, best_ic

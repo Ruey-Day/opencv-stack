@@ -1,8 +1,5 @@
 """
 Extends the original PlueckerNet trainer to Sim(3):
-  - Data batches include s_gt (ground-truth scale).
-  - Validation uses the Grassmannian RANSAC solver.
-  - Validation reports scale error (log-ratio) in addition to R, t errors.
 """
 import os
 import os.path as osp
@@ -17,8 +14,6 @@ from tensorboardX import SummaryWriter
 
 from lib.utils import load_model, ensure_dir, AverageMeter, Timer
 from lib.loss import TotalLoss
-from lib.ransac_grassmannian import ransac_sim3 as _ransac_g
-
 
 class Sim3Trainer:
 
@@ -280,31 +275,3 @@ class Sim3Trainer:
         )
 
         return stats
-    
-    def _evaluate_R_t(self, R_est, t_est, R_gt, t_gt):
-        """Compute rotation (rad) and translation errors.
-
-        Argument order mirrors the original trainer (estimated first, gt last).
-        Uses the trace formula for rotation error to avoid quaternion_from_matrix,
-        which is broken under NumPy 2.x (copy=False semantics changed).
-        """
-        # Rotation error: angle of the relative rotation R_est^T @ R_gt
-        cos_angle = (np.trace(R_est.T @ R_gt) - 1.0) / 2.0
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        err_q = np.arccos(cos_angle)
-        err_t = np.linalg.norm(t_est.flatten() - t_gt.flatten())
-
-        if np.isnan(err_q) or np.isnan(err_t):
-            return np.pi, np.inf
-        return err_q, err_t
-
-    def _summarise(self, eval_res):
-        """Compute summary statistics over the validation set."""
-        cur_err_q = np.array(eval_res['err_q']) * 180.0 / np.pi
-        finite_s  = eval_res['err_s'][np.isfinite(eval_res['err_s'])]
-        return {
-            'med_rot':          float(np.median(cur_err_q)),
-            'med_trans':        float(np.median(eval_res['err_t'])),
-            'med_scale_err':    float(np.median(finite_s)) if len(finite_s) > 0 else float('inf'),
-            'avg_inlier_ratio': float(np.mean(eval_res['inlier_ratio'])),
-        }

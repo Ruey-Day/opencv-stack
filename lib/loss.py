@@ -2,12 +2,6 @@
 import torch
 import torch.nn.functional as F
 
-def correspondenceProbabilityDistances(P, C):
-    """ Difference between the probability mass assigned to inlier and
-        outlier correspondences
-    """
-    return ((1.0 - 2.0 * C) * P).sum(dim=(-2, -1))
-
 def correspondenceProbabilityBCE(P, C):
     num_pos = F.relu(C.sum(dim=(-2,-1))-1.0) + 1.0
     num_neg = F.relu((1.0- C).sum(dim=(-2,-1)) -1.0) + 1.0
@@ -16,7 +10,6 @@ def correspondenceProbabilityBCE(P, C):
     loss += ((1.0 - P + 1e-20 ).log() * (1.0 - C)).sum(dim=(-2,-1)) * 0.5 / num_neg
 
     return -loss
-
 
 def correspondenceLoss(P, C_gt):
     # Using precomputed C_gt

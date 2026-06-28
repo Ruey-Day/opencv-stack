@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Generate kitti_train / kitti_valid datasets for ScalePluckerNet.
 

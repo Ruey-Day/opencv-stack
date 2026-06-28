@@ -1,12 +1,5 @@
 """
-Sim3PluckerData        — static .pkl files (pre-generated offline)
-SyntheticLiveData      — on-the-fly infinite pair generation (no disk needed)
-SyntheticValData       — fixed val set generated once at startup with a seed
-
-Variable-length batching
-    Pairs have different N lines per side depending on pool size and overlap.
-    Use variable_collate as the DataLoader collate_fn (any batch size), or
-    set batch_size=1 to use PyTorch's default collate with no changes.
+Sim3PluckerData — static .pkl files (pre-generated offline)
 
 Expected .pkl layout:
     <data_dir>/<dataset>_train/
@@ -18,83 +11,10 @@ Expected .pkl layout:
         s_gt.pkl        list of float32 scalars
 """
 import os
-import sys
 import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-# Lazy import so the repo root doesn't need to be on sys.path at import time
-def _get_generate_pair():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from scripts.generate_synthetic import _generate_pair
-    return _generate_pair
-
-
-def worker_seed_init(worker_id: int) -> None:
-    """Give each DataLoader worker a unique numpy seed derived from PyTorch's seed."""
-    seed = (torch.initial_seed() + worker_id * 7919) % (2 ** 32)
-    np.random.seed(seed)
-
-
-def _pair_to_tuple(p: dict):
-    """Convert _generate_pair() dict → (matches, p1, p2, R, t, s) numpy tuple."""
-    n1, n2 = p['plucker1'].shape[0], p['plucker2'].shape[0]
-    matches = np.zeros((n1, n2), np.float32)
-    if p['matches'].shape[1] > 0:
-        matches[p['matches'][0], p['matches'][1]] = 1.0
-    return (
-        matches,
-        p['plucker1'].astype(np.float32),
-        p['plucker2'].astype(np.float32),
-        p['R_gt'].astype(np.float32),
-        p['t_gt'].astype(np.float32),
-        np.float32(p['s_gt']),
-    )
-
-
-class SyntheticLiveData(Dataset):
-    """Infinite on-the-fly synthetic dataset.
-
-    Each call to __getitem__ generates a fresh unique pair regardless of index.
-    Use with worker_seed_init as worker_init_fn to ensure each worker draws
-    from a different random stream.
-    """
-
-    def __init__(self, epoch_size: int):
-        self._generate = _get_generate_pair()
-        self.epoch_size = epoch_size
-
-    def __len__(self):
-        return self.epoch_size
-
-    def __getitem__(self, idx):
-        return _pair_to_tuple(self._generate())
-
-
-class SyntheticValData(Dataset):
-    """Fixed validation set generated once at construction with a fixed seed.
-
-    Reproducible across runs; the seed is decoupled from training RNG state
-    so training randomness doesn't affect the val set.
-    """
-
-    def __init__(self, n_pairs: int = 5000, seed: int = 0):
-        generate = _get_generate_pair()
-        rng_state = np.random.get_state()
-        np.random.seed(seed)
-        import time; t0 = time.time()
-        self._data = [_pair_to_tuple(generate()) for _ in range(n_pairs)]
-        np.random.set_state(rng_state)
-        print(f'[SyntheticValData] generated {n_pairs} pairs in {time.time()-t0:.1f}s (seed={seed})')
-
-    def __len__(self):
-        return len(self._data)
-
-    def __getitem__(self, idx):
-        return self._data[idx]
 
 def variable_collate(batch):
     """

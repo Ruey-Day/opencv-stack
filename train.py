@@ -29,9 +29,7 @@ from easydict import EasyDict as edict
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import get_config
-from lib.dataloader import (Sim3PluckerData, variable_collate,
-                            SyntheticLiveData, SyntheticValData, worker_seed_init)
+from lib.dataloader import Sim3PluckerData, variable_collate
 from lib.trainer import Sim3Trainer
 
 logging.basicConfig(
@@ -56,13 +54,6 @@ def parse_args():
                    help='Lines per scene after subsampling.')
     p.add_argument('--n_inliers',   type=int, default=490,
                    help='GT inliers per scene.')
-
-    # Live on-the-fly generation
-    p.add_argument('--live', action='store_true',
-                   help='Generate training pairs on-the-fly (infinite unique pairs, no pkl files). '
-                        'Validation uses a fixed 5000-pair set generated at startup with seed=0.')
-    p.add_argument('--val_pairs', type=int, default=5000,
-                   help='Number of validation pairs to generate at startup (--live only).')
 
     # Training
     p.add_argument('--train_epoch_size', type=int, default=0,
@@ -110,34 +101,41 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # get_config() re-parses sys.argv via PlueckerNet's argparse — strip our
-    # custom flags so it doesn't choke on unknown arguments.
-    import sys as _sys
-    _sys.argv = _sys.argv[:1]
-
-    configs = get_config()
-
     val_dataset = args.val_dataset or args.dataset
 
-    configs.dataset          = args.dataset
-    configs.data_dir         = args.data_dir
-    configs.gpu_inds         = args.gpu
-    configs.model_nb         = args.name if args.name else str(date.today())
-    configs.train_batch_size = args.batch
-    configs.iter_size        = args.iter_size
-    configs.train_lr         = args.lr
-    configs.exp_gamma        = args.gamma
-    configs.train_epoches    = args.epochs
-    configs.best_val_metric  = args.metric
-    configs.ransac_type      = args.ransac
-    configs.val_max_iter     = args.val_max_iter
-    configs.resume_dir       = None
-    configs.in_channel       = 6
-    configs.pose_loss_weight = args.pose_loss
-
-    dconfig = vars(configs)
-    dconfig['resume'] = args.resume
-    configs = edict(dconfig)
+    configs = edict(
+        # Network
+        net_nchannel       = 128,
+        GNN_layers         = ['self', 'cross'] * 6,
+        net_lambda         = 0.1,
+        net_maxiter        = 30,
+        # Training
+        out_dir            = 'output',
+        optimizer          = 'Adam',
+        train_start_epoch  = 0,
+        train_save_freq_epoch = 1,
+        val_epoch_freq     = 1,
+        use_gpu            = True,
+        print_freq         = 10,
+        train_seed         = 0,
+        # Set from args
+        dataset            = args.dataset,
+        data_dir           = args.data_dir,
+        gpu_inds           = args.gpu,
+        model_nb           = args.name if args.name else str(date.today()),
+        train_batch_size   = args.batch,
+        iter_size          = args.iter_size,
+        train_lr           = args.lr,
+        exp_gamma          = args.gamma,
+        train_epoches      = args.epochs,
+        best_val_metric    = args.metric,
+        ransac_type        = args.ransac,
+        val_max_iter       = args.val_max_iter,
+        resume_dir         = None,
+        in_channel         = 6,
+        pose_loss_weight   = args.pose_loss,
+        resume             = args.resume,
+    )
 
     if configs.train_seed is not None:
         random.seed(configs.train_seed)
@@ -146,7 +144,6 @@ def main():
         cudnn.deterministic = True
 
     logging.info('===> ScalePlueckerNet Training')
-    logging.info(f'  live        : {args.live}')
     logging.info(f'  dataset     : {args.dataset}')
     logging.info(f'  val_dataset : {val_dataset}')
     logging.info(f'  cosine_lr   : {args.cosine_lr}')
@@ -159,58 +156,38 @@ def main():
     # ── Build data loaders ────────────────────────────────────────────────────
     collate = variable_collate if args.batch > 1 else None
 
-    if args.live:
-        epoch_size = args.train_epoch_size if args.train_epoch_size > 0 else 19200
-        logging.info(f'  [live] epoch_size={epoch_size}  val_pairs={args.val_pairs}')
-        train_dataset = SyntheticLiveData(epoch_size=epoch_size)
+    train_dataset = Sim3PluckerData(phase='train', config=configs)
+
+    if args.train_epoch_size > 0:
+        train_sampler = RandomSampler(train_dataset,
+                                      replacement=True,
+                                      num_samples=args.train_epoch_size)
+        logging.info(f'  train_epoch_size: {args.train_epoch_size} '
+                     f'(dataset has {len(train_dataset)} pairs)')
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=configs.train_batch_size,
+            sampler=train_sampler, drop_last=True,
+            num_workers=args.workers, pin_memory=(args.batch > 1),
+            collate_fn=collate,
+        )
+    else:
         train_loader = DataLoader(
             train_dataset,
             batch_size=configs.train_batch_size,
             shuffle=True, drop_last=True,
             num_workers=args.workers, pin_memory=(args.batch > 1),
             collate_fn=collate,
-            worker_init_fn=worker_seed_init,
         )
-        logging.info('  [live] Generating validation set...')
-        val_dataset_obj = SyntheticValData(n_pairs=args.val_pairs, seed=0)
-        val_loader = DataLoader(
-            val_dataset_obj,
-            batch_size=1, shuffle=False, drop_last=False,
-            num_workers=2, worker_init_fn=worker_seed_init,
-        )
-    else:
-        train_dataset = Sim3PluckerData(phase='train', config=configs)
 
-        if args.train_epoch_size > 0:
-            train_sampler = RandomSampler(train_dataset,
-                                          replacement=True,
-                                          num_samples=args.train_epoch_size)
-            logging.info(f'  train_epoch_size: {args.train_epoch_size} '
-                         f'(dataset has {len(train_dataset)} pairs)')
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=configs.train_batch_size,
-                sampler=train_sampler, drop_last=True,
-                num_workers=args.workers, pin_memory=(args.batch > 1),
-                collate_fn=collate,
-            )
-        else:
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=configs.train_batch_size,
-                shuffle=True, drop_last=True,
-                num_workers=args.workers, pin_memory=(args.batch > 1),
-                collate_fn=collate,
-            )
-
-        val_cfg = edict(dict(configs))
-        val_cfg.dataset = val_dataset
-        val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
-        val_loader = DataLoader(
-            val_dataset_obj,
-            batch_size=1, shuffle=False, drop_last=False,
-            num_workers=2,
-        )
+    val_cfg = edict(dict(configs))
+    val_cfg.dataset = val_dataset
+    val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
+    val_loader = DataLoader(
+        val_dataset_obj,
+        batch_size=1, shuffle=False, drop_last=False,
+        num_workers=2,
+    )
 
     # ── Build trainer ─────────────────────────────────────────────────────────
     trainer = Sim3Trainer(configs, train_loader, val_loader)

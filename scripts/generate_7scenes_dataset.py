@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Generate 7scenes_train and 7scenes_valid datasets from mesh.db line clouds.
 
