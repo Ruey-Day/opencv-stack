@@ -61,6 +61,14 @@ class Sim3Trainer:
         self.test_valid      = val_data_loader is not None
 
         self.model = self.model.to(self.device)
+        # Compiled handle used for forward passes only (~1.5x on this
+        # launch-overhead-bound model). Checkpoints are always saved from
+        # self.model so state_dict keys stay free of the _orig_mod. prefix.
+        try:
+            self.net = torch.compile(self.model, dynamic=True)
+        except Exception as e:
+            logging.warning(f'torch.compile unavailable, running eager: {e}')
+            self.net = self.model
         self.writer = SummaryWriter(logdir=self.checkpoint_dir)
 
         if config.resume is not None:
@@ -141,11 +149,13 @@ class Sim3Trainer:
         iter_size  = self.iter_size
         start_iter = (epoch - 1) * (len(self.data_loader) // iter_size)
         data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
+        loss_fn = TotalLoss().to(self.device)
 
         for curr_iter in range(len(self.data_loader) // iter_size):
             self.optimizer.zero_grad()
-            batch_total_loss = 0.0
-            batch_prob_loss  = 0.0
+            # accumulate logging stats on-device; sync once per iteration
+            batch_total_loss = torch.zeros((), device=self.device)
+            batch_prob_loss  = torch.zeros((), device=self.device)
             data_time = 0.0
             total_timer.tic()
 
@@ -154,29 +164,27 @@ class Sim3Trainer:
                 matches, plucker1, plucker2, *_ = next(data_loader_iter)
                 data_time += data_timer.toc(average=False)
 
-                matches  = matches.to(self.device)
-                plucker1 = plucker1.to(self.device)
-                plucker2 = plucker2.to(self.device)
+                matches  = matches.to(self.device, non_blocking=True)
+                plucker1 = plucker1.to(self.device, non_blocking=True)
+                plucker2 = plucker2.to(self.device, non_blocking=True)
 
-                prob_matrix, prior1, prior2 = self.model(plucker1, plucker2)
+                prob_matrix, prior1, prior2 = self.net(plucker1, plucker2)
 
-                MatchLoss = TotalLoss().to(self.device)
-                bce_loss  = MatchLoss(prob_matrix, matches)
-
-                loss = bce_loss
+                loss = loss_fn(prob_matrix, matches)
 
                 if not torch.isnan(loss).any():
                     loss.backward()
 
-                batch_total_loss += loss.item()
+                batch_total_loss += loss.detach().sum()
                 batch_prob_loss  += (
-                    (1.0 - 2.0 * matches) * prob_matrix
+                    (1.0 - 2.0 * matches) * prob_matrix.detach()
                 ).sum(dim=(-2, -1)).mean()
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
-            torch.cuda.empty_cache()
 
+            batch_total_loss = batch_total_loss.item()
+            batch_prob_loss  = batch_prob_loss.item()
             total_loss += batch_total_loss
             total_num  += 1.0
             total_timer.toc()
@@ -224,7 +232,7 @@ class Sim3Trainer:
             plucker2_raw = plucker2.to(self.device)
 
             match_timer.tic()
-            prob_matrix, prior1, prior2 = self.model(plucker1_raw, plucker2_raw)
+            prob_matrix, prior1, prior2 = self.net(plucker1_raw, plucker2_raw)
             match_timer.toc()
 
             k = min(100, round(plucker1.size(1) * plucker2.size(1)))
@@ -240,29 +248,24 @@ class Sim3Trainer:
             err_s        = np.inf
             inlier_ratio = 0.0
 
-            nb_inliers_gt = np.where(matches[0, :].cpu().numpy() > 0)[0].shape[0]
-
             if k > 3:
                 inlier_inds  = matches[:, plucker1_indices, plucker2_indices].cpu().numpy()
                 inlier_ratio = np.sum(inlier_inds) / k * 100.0
 
             num_data += 1
-            torch.cuda.empty_cache()
 
             eval_res['err_q'][batch_idx]        = err_q
             eval_res['err_t'][batch_idx]        = err_t
             eval_res['err_s'][batch_idx]        = err_s
             eval_res['inlier_ratio'][batch_idx] = inlier_ratio
 
-            logging.info(
-                f'Val {num_data}/{tot_num_data} '
-                f'DataT: {data_timer.avg:.3f}  MatchT: {match_timer.avg:.3f} '
-                f'err_rot: {err_q * 180/np.pi:.2f}°  '
-                f'err_t: {err_t:.3f}  '
-                f'err_s(log): {err_s:.3f}  '
-                f'inlier_ratio: {inlier_ratio:.1f}%  '
-                f'nb_matches: {k}  nb_inliers_gt: {nb_inliers_gt}'
-            )
+            if num_data % 100 == 0 or num_data == tot_num_data:
+                logging.info(
+                    f'Val {num_data}/{tot_num_data} '
+                    f'DataT: {data_timer.avg:.3f}  MatchT: {match_timer.avg:.3f} '
+                    f'running_avg_inlier_ratio: '
+                    f'{eval_res["inlier_ratio"][:batch_idx + 1].mean():.1f}%'
+                )
             data_timer.reset()
 
         stats = self._summarise(eval_res)

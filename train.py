@@ -101,6 +101,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # TF32 matmuls: free throughput on Ampere+ GPUs, safe for training
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     val_dataset = args.val_dataset or args.dataset
 
     configs = edict(
@@ -168,7 +172,8 @@ def main():
             train_dataset,
             batch_size=configs.train_batch_size,
             sampler=train_sampler, drop_last=True,
-            num_workers=args.workers, pin_memory=(args.batch > 1),
+            num_workers=args.workers, pin_memory=True,
+            persistent_workers=(args.workers > 0),
             collate_fn=collate,
         )
     else:
@@ -176,7 +181,8 @@ def main():
             train_dataset,
             batch_size=configs.train_batch_size,
             shuffle=True, drop_last=True,
-            num_workers=args.workers, pin_memory=(args.batch > 1),
+            num_workers=args.workers, pin_memory=True,
+            persistent_workers=(args.workers > 0),
             collate_fn=collate,
         )
 
@@ -186,7 +192,7 @@ def main():
     val_loader = DataLoader(
         val_dataset_obj,
         batch_size=1, shuffle=False, drop_last=False,
-        num_workers=2,
+        num_workers=2, pin_memory=True, persistent_workers=True,
     )
 
     # ── Build trainer ─────────────────────────────────────────────────────────
