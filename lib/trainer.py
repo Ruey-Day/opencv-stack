@@ -275,3 +275,15 @@ class Sim3Trainer:
         )
 
         return stats
+
+    def _summarise(self, eval_res: dict) -> dict:
+        """Aggregate per-sample eval results into epoch-level stats."""
+        n = max(1, (eval_res['inlier_ratio'] > 0).sum())
+        return {
+            'med_rot':         float(np.median(eval_res['err_q']) * 180 / np.pi),
+            'med_trans':       float(np.median(eval_res['err_t'][np.isfinite(eval_res['err_t'])])
+                                     if np.any(np.isfinite(eval_res['err_t'])) else np.inf),
+            'med_scale_err':   float(np.median(eval_res['err_s'][np.isfinite(eval_res['err_s'])])
+                                     if np.any(np.isfinite(eval_res['err_s'])) else np.inf),
+            'avg_inlier_ratio': float(np.mean(eval_res['inlier_ratio'])),
+        }

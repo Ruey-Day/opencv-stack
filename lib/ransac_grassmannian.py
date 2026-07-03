@@ -90,12 +90,18 @@ def solve_rotation_l2(d1: np.ndarray, d2: np.ndarray) -> np.ndarray:
     """
     SVD Procrustes: global minimiser of Σ‖R·d1_i − d2_i‖² over SO(3).
 
-    Handles undirected lines by flipping d1_i when d1_i·d2_i < 0 before
-    building the cross-covariance.  O(N) — single SVD.
+    No sign pre-alignment.  When both line clouds share a consistent direction
+    convention (the same physical line yields the same sign in both maps), the
+    raw cross-covariance H = Σ d2_i d1_i^T = R * Σ d1_i d1_i^T converges to
+    c·R for a full-rank direction set, and SVD recovers R exactly.
+
+    Raw-dot sign alignment ("flip d1 if d1·d2 < 0") is *harmful* here: for
+    large rotation angles, ~60% of GT-matched direction pairs have negative
+    raw dots even though d2 = R @ d1 exactly.  Flipping those directions
+    inverts the cross-covariance and produces ~180° rotation errors.  See the
+    "Rotation Estimation Metric Analysis" section in README for the evaluation.
     """
-    dots = (d1 * d2).sum(axis=0)
-    d1_aligned = d1 * np.where(dots >= 0, 1.0, -1.0)[np.newaxis, :]
-    U, _, Vt = np.linalg.svd(d2 @ d1_aligned.T)
+    U, _, Vt = np.linalg.svd(d2 @ d1.T)
     det = np.linalg.det(U @ Vt)
     return U @ np.diag([1.0, 1.0, float(det)]) @ Vt
 
@@ -110,11 +116,14 @@ def solve_rotation_l1(
     IRLS: minimises Σ‖R·d1_i − d2_i‖₁ via iteratively reweighted Procrustes.
 
     Each iteration:
-      1. Compute residuals r_i = ‖R·d1_i_signed − d2_i‖ with sign-alignment.
-      2. Set weights w_i = 1 / max(r_i, eps).
-      3. Solve weighted Procrustes via SVD of Σ w_i · d2_i · d1_i_signed^T.
+      1. Predict d2 as R @ d1; set sign ε_i = sign((R @ d1_i) · d2_i).
+      2. Set weights w_i = 1 / max(‖ε_i R d1_i − d2_i‖, eps).
+      3. Solve weighted Procrustes via SVD of Σ w_i · d2_i · (ε_i d1_i)^T.
 
-    Warm-started from the L2 Procrustes solution.  Converges in ~10 iterations.
+    Warm-started from L2 Procrustes (raw, no sign pre-alignment).
+    Sign alignment inside the loop is EM-style (based on current R, not raw
+    dots) so it is correct regardless of the rotation magnitude.
+    Converges in ~10 iterations.
     """
     R = solve_rotation_l2(d1, d2)
     for _ in range(n_iter):

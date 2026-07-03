@@ -95,13 +95,14 @@ class Sim3PluckerData(Dataset):
             plucker1 = plucker1[:, :self.in_channel]
             plucker2 = plucker2[:, :self.in_channel]
 
-        # Per-cloud moment normalisation: brings outdoor (±100 m) and indoor
-        # (±5 m) moments into the same activation range for the encoder.
-        # Directions (unit vectors) are unchanged.  The matching matrix is
-        # index-based so correctness is unaffected.
-        std1 = float(plucker1[:, :3].std()) + 1e-6
+        # Moment normalisation: divide BOTH clouds by plucker2 (query) std.
+        # This preserves the scale ratio p1_inlier/p2 ≈ s_gt, which is the
+        # key matching signal, while keeping moments in a manageable range.
+        # Using p2 std (not p1) avoids contamination by background lines in
+        # the KITTI reference cloud which would otherwise compress inlier
+        # moments to near-zero, destroying the correspondence signal.
         std2 = float(plucker2[:, :3].std()) + 1e-6
-        plucker1[:, :3] /= std1
+        plucker1[:, :3] /= std2
         plucker2[:, :3] /= std2
 
         n1, n2 = plucker1.shape[0], plucker2.shape[0]

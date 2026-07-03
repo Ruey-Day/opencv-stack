@@ -251,12 +251,86 @@ The sole checkpoint-selection metric is **`avg_inlier_ratio`** — the fraction 
 
 ---
 
+## Rotation Estimation Metric Analysis
+
+We evaluated three rotation estimation approaches on ground-truth matched
+Plücker pairs from `7scenes_valid` (500 scenes, 20–73 GT matches per scene).
+Script: `scripts/eval_rotation_metric.py`.
+
+### Results on GT matches (500 scenes, `7scenes_valid`)
+
+Solver applied directly to GT matched pairs (no RANSAC, upper bound):
+
+| Method | Med err | Mean err | <1° | <5° | <10° |
+|--------|---------|---------|-----|-----|------|
+| **L2 Procrustes (no sign align)** | **1.43°** | **1.62°** | 0.35 | **0.99** | **1.00** |
+| L1 IRLS (no sign align) | 1.63° | 1.85° | 0.30 | 0.98 | 1.00 |
+| L2 Procrustes (raw-dot sign align) | 179.0° | 174.5° | 0.00 | 0.01 | 0.01 |
+| L1 IRLS (raw-dot sign align) | 179.1° | 174.6° | 0.01 | 0.02 | 0.02 |
+
+RANSAC with GT-only correspondences (tests hypothesis generation quality):
+
+| Rotation solver in minimal sampler | Med err | Catastrophic failures (>90°) |
+|-------------------------------------|---------|-------------------------------|
+| L2 aligned (old default) | 6.27° | 5/20 scenes |
+| **L2 raw (no sign align)** | **2.81°** | **0/20 scenes** |
+
+**L2 Procrustes without sign alignment is the clear winner in both settings.**
+Applied in `lib/ransac_grassmannian.py` via `solve_rotation_l2_raw`.
+
+### Why L2 > L1
+
+L2 Procrustes is the maximum-likelihood estimator when direction noise is
+Gaussian — which it approximately is for line fitting in both SLAM map
+sources. L1 IRLS is designed to be robust against outliers, but RANSAC
+already filters outliers before any refinement step: the residual inlier set
+has small, near-Gaussian direction errors. L1 therefore adds unnecessary
+variance (median 1.63° vs 1.43°) without any benefit. L2 also has a
+closed-form global optimum (single SVD), while L1 requires iterative
+convergence with sensitivity to the starting point.
+
+### Why we do not use the geodesic distance on SO(3)
+
+The geodesic distance on SO(3) between two rotations R₁ and R₂ applied to a
+direction d is `∠(R₁d, R₂d) = arccos(d^T R₁^T R₂ d)`. For small angular
+residuals θ ≪ 1:
+
+```
+arccos(cos θ) ≈ θ   and   ||R₁d - R₂d||² ≈ 2(1 - cos θ) ≈ θ²
+```
+
+Minimising the L2 direction residuals is therefore equivalent to minimising
+the geodesic distance for small residuals. RANSAC enforces this regime: only
+line pairs whose G(2,4) principal angle falls below the inlier threshold
+(default 0.3 rad) are used for refinement. Pairs with large angular errors
+are already excluded as outliers. Using the geodesic distance explicitly
+would add computational overhead with no accuracy gain over L2 in this
+low-residual regime.
+
+### Sign alignment pitfall
+
+63% of GT matched direction pairs have a negative raw dot product
+(`d_mono · d_metric < 0`). This does **not** indicate antiparallel directions:
+it simply means the rotation maps `d_mono` to the opposite hemisphere of
+`d_metric`, which is normal for large rotation angles. The raw-dot sign
+alignment heuristic ("flip d₁ if d₁·d₂ < 0") incorrectly treats this as an
+antiparallel correspondence and flips 63% of source directions, inverting the
+cross-covariance sum and producing ~180° rotation errors.
+
+Our implementation avoids this by not applying sign alignment when both line
+clouds share a consistent direction convention (both derived from the same
+mesh source). For maps with independent direction signs, use the iterative
+EM alignment (`solve_rotation_l2_robust`), which re-aligns signs under the
+current R estimate rather than the raw dot product.
+
+---
+
 ## Sim(3) RANSAC Backends
 
 Two interchangeable backends; select with `--ransac sim3` or `--ransac grassmannian`.
 
 **Minimal solver (shared by both):**
-1. Estimate R from direction pairs via SVD (Wahba problem)
+1. Estimate R from direction pairs via SVD (Wahba problem — L2 Procrustes, no sign alignment)
 2. Solve for (s, t) jointly from moment equations via 3n×4 least-squares
 
 **`sim3` backend** (`sim3/ransac.py`): plain RANSAC, 2-correspondence minimal sets.
