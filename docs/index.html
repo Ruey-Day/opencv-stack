@@ -198,7 +198,7 @@
     }
   </style>
   <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-  <script src="demo_real_7scenes.js"></script>
+  <script src="demo_real.js"></script>
 </head>
 <body>
 
@@ -240,19 +240,14 @@
   <div class="viz-wrap">
     <div style="display:flex;align-items:center;gap:0.75rem;padding:1.2rem 0 0.8rem;flex-wrap:wrap;border-bottom:1px solid var(--border);">
       <div id="scene-tabs" class="viz-tabs" style="padding:0;flex:1;min-width:0;">
-        <button class="viz-tab" onclick="showScene(0)">Source Cloud</button>
-        <button class="viz-tab active" onclick="showScene(1)">Before Reg.</button>
-        <button class="viz-tab" onclick="showScene(2)">Correspondences</button>
-        <button class="viz-tab" onclick="showScene(3)">After Reg.</button>
+        <button class="viz-tab active" onclick="showScene(0)">Before Reg.</button>
+        <button class="viz-tab" onclick="showScene(1)">Correspondences</button>
+        <button class="viz-tab" onclick="showScene(2)">After Reg.</button>
       </div>
       <select id="scene-select" onchange="regenScene()" style="background:var(--bg3);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.7rem;font-size:0.78rem;font-family:inherit;cursor:pointer;">
-        <option value="real" selected>Real: 7-Scenes heads (mono &rarr; RGB-D)</option>
-        <option value="loop">Synthetic: Loop Closure</option>
-        <option value="submap">Synthetic: Submap</option>
-        <option value="relocalize">Synthetic: Relocalize</option>
-        <option value="wireframe">Synthetic: Wireframe Box</option>
+        <option value="heads" selected>7-Scenes heads: mono &rarr; RGB-D (indoor)</option>
+        <option value="kitti07">KITTI 07: camera &rarr; LiDAR (street, 240&times;240 m)</option>
       </select>
-      <button onclick="regenScene()" style="background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.9rem;font-size:0.78rem;font-family:inherit;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.borderColor='rgba(99,102,241,0.5)';this.style.color='#fff'" onmouseout="this.style.borderColor='';this.style.color=''">&#8635; New scene</button>
     </div>
     <div style="width:100%;height:52vh;border:1px solid rgba(99,102,241,0.35);border-radius:0 6px 6px 6px;overflow:hidden;background:#0a0a0f;">
       <div id="synth-plot" style="width:100%;height:100%;"></div>
@@ -277,7 +272,7 @@
       The visualization above shows a <strong>real registration</strong> from our benchmark: a monocular
       SLAM line map (unknown scale) aligned to an RGB-D reference map of the 7-Scenes
       <span class="eq">heads</span> scene by the shipped pipeline — 3.5&deg; rotation error, 4% scale
-      error, 2&nbsp;cm translation error. The synthetic scenes illustrate the training distribution.
+      error, 2&nbsp;cm translation error. The second scene in the selector is the cross-modal KITTI result: a camera line map registered onto a LiDAR line map of a 240&times;240&nbsp;m street loop from matched correspondences alone &mdash; 1.5&deg; rotation, 5.4% scale, 2.4&nbsp;m translation.
     </div>
 
     <h3>The problem</h3>
@@ -605,57 +600,7 @@ Best hypothesis refined on all inliers via overdetermined least squares.</div>
 <script>
 (function(){
 'use strict';
-const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
-const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
-const sc=(v,s)=>[v[0]*s,v[1]*s,v[2]*s];
-const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
-const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-const len=(v)=>Math.sqrt(dot(v,v));
-const unit=(v)=>{const n=len(v);return n>1e-9?sc(v,1/n):[0,0,1];};
-const rn=()=>Math.sqrt(-2*Math.log(1-Math.random()+1e-12))*Math.cos(2*Math.PI*Math.random());
-const rn3=()=>[rn(),rn(),rn()];
-const runit=()=>unit(rn3());
 const mv=(R,v)=>[R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2],R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2],R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2]];
-const tr=(R)=>[[R[0][0],R[1][0],R[2][0]],[R[0][1],R[1][1],R[2][1]],[R[0][2],R[1][2],R[2][2]]];
-function rrot(){
-  const u1=Math.random(),u2=Math.random(),u3=Math.random();
-  const x=Math.sqrt(1-u1)*Math.sin(2*Math.PI*u2),y=Math.sqrt(1-u1)*Math.cos(2*Math.PI*u2);
-  const z=Math.sqrt(u1)*Math.sin(2*Math.PI*u3),w=Math.sqrt(u1)*Math.cos(2*Math.PI*u3);
-  return[[1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y)],[2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x)],[2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)]];
-}
-function sim3(lines,s,R,t){
-  return lines.map(l=>{
-    const m=l.slice(0,3),d=l.slice(3,6),dp=mv(R,d),mp=add(sc(mv(R,m),s),cross(t,dp));
-    return[...mp,...dp];
-  });
-}
-const plkSeg=(l,hl=0.45)=>{const d=unit(l.slice(3,6)),m=l.slice(0,3),p0=cross(d,m),h=sc(d,hl);return[sub(p0,h),add(p0,h)];};
-const plkC=(l)=>cross(unit(l.slice(3,6)),l.slice(0,3));
-function shuf(a){for(let i=a.length-1;i>0;i--){const j=0|Math.random()*(i+1);[a[i],a[j]]=[a[j],a[i]];} return a;}
-
-// Line generators
-function wireframe(n){
-  const R=rrot(),hw=0.6+Math.random()*0.9,hd=0.6+Math.random()*0.9,hh=0.5+Math.random()*0.7,o=sc(rn3(),0.4);
-  const raw=[[-hw,-hh,-hd],[-hw,-hh,hd],[-hw,hh,-hd],[-hw,hh,hd],[hw,-hh,-hd],[hw,-hh,hd],[hw,hh,-hd],[hw,hh,hd]];
-  const corners=raw.map(c=>add(mv(R,c),o));
-  const ep=[[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
-  const edges=ep.map(([a,b])=>{const diff=sub(corners[b],corners[a]),ln=len(diff);if(ln<1e-9)return null;const d=sc(diff,1/ln),p=sc(add(corners[a],corners[b]),0.5);return[...cross(p,d),...d];}).filter(Boolean);
-  return Array.from({length:n},(_,i)=>edges[i%edges.length].slice());
-}
-function planePatch(n,pr=1.8){
-  const normal=runit(),u=unit(sub(rn3(),sc(normal,dot(rn3(),normal)))),v=cross(normal,u);
-  return Array.from({length:n},()=>{const ang=Math.random()*2*Math.PI,d=unit(add(sc(u,Math.cos(ang)),sc(v,Math.sin(ang)))),a=(Math.random()*2-1)*pr,b=(Math.random()*2-1)*pr,p=add(sc(u,a),sc(v,b));return[...cross(p,d),...d];});
-}
-function parallelGroup(n,pr=1.8){
-  const anchor=runit();
-  return Array.from({length:n},()=>{const d=unit(add(anchor,sc(rn3(),0.06))),p=[(Math.random()*2-1)*pr,(Math.random()*2-1)*pr,(Math.random()*2-1)*pr];return[...cross(p,d),...d];});
-}
-function makePool(n,type){
-  if(type==='wireframe'){const nb=2+0|Math.random()*2,pb=Math.ceil(n/nb),all=[];for(let i=0;i<nb;i++)all.push(...wireframe(pb));return shuf(all).slice(0,n);}
-  const n1=0|n*0.40,n2=0|n*0.32,n3=n-n1-n2;
-  return shuf([...wireframe(n1),...planePatch(n2),...parallelGroup(n3)]).slice(0,n);
-}
-
 function segTrEP(segs,color,width,opacity,name){
   const x=[],y=[],z=[];
   for(const s of segs){x.push(s[0],s[3],null);y.push(s[1],s[4],null);z.push(s[2],s[5],null);}
@@ -666,97 +611,40 @@ function sim3EP(segs,s,R,t){
   const tp=(p)=>{const q=mv(R,p);return[s*q[0]+t[0],s*q[1]+t[1],s*q[2]+t[2]];};
   return segs.map(g=>{const a=tp(g.slice(0,3)),b=tp(g.slice(3,6));return[...a,...b];});
 }
-function realPair(){
-  const D=window.REAL_DEMO;
-  if(!D)return null;
-  return{real:true,q:D.q,r:D.r,corr:D.corr,s:D.s,R:D.R,t:D.t,label:D.label,err:D.err,sgt:D.s_gt};
-}
-function genPair(scenario){
-  let k,n1,n2,s,nm;
-  if(scenario==='wireframe'){n1=n2=36+0|Math.random()*24;k=0|n1*0.75;s=1.5+Math.random()*1.5;nm=0.01;}
-  else if(scenario==='loop'){n1=n2=45+0|Math.random()*45;k=0|n1*(0.55+Math.random()*0.35);s=Math.exp((Math.random()*2-1)*0.7);nm=0.02;}
-  else if(scenario==='submap'){n1=25+0|Math.random()*35;n2=80+0|Math.random()*80;k=Math.max(10,0|n1*(0.15+Math.random()*0.3));s=Math.exp((Math.random()*2-1)*1.5);nm=0.04;}
-  else{const base=40+0|Math.random()*40;n1=Math.max(20,0|base*(0.5+Math.random()));n2=Math.max(20,0|base*(0.5+Math.random()));k=Math.max(10,0|Math.min(n1,n2)*(0.3+Math.random()*0.4));s=Math.exp((Math.random()*2-1)*1.0);nm=0.025;}
-  k=Math.min(k,Math.min(n1,n2));
-  const pt=scenario==='wireframe'?'wireframe':'mixed';
-  const pool=makePool(n1+n2+20,pt);shuf(pool);
-  const inlRef=pool.slice(0,k),out1=pool.slice(k,k+Math.max(0,n1-k)),out2=pool.slice(k+Math.max(0,n1-k),k+Math.max(0,n1-k)+Math.max(0,n2-k));
-  const R=rrot(),t=sc(rn3(),0.6),si=1/s,Ri=tr(R),ti=sc(mv(Ri,t),-si);
-  const inlQ=sim3(inlRef,si,Ri,ti).map(l=>[l[0]+rn()*nm,l[1]+rn()*nm,l[2]+rn()*nm,...unit(add(l.slice(3,6),sc(rn3(),0.015)))]);
-  const out1Q=sim3(out1,si,Ri,ti);
-  const p1=shuf([...inlQ,...out1Q]),p2=shuf([...inlRef,...out2]);
-  const correct=[],wrong=[];
-  const nc=0|k*0.88;for(let i=0;i<nc;i++)correct.push([inlQ[i],inlRef[i]]);
-  const nf=Math.min(0|k*0.06,out1Q.length,out2.length);for(let i=0;i<nf;i++)wrong.push([out1Q[i],out2[i]]);
-  return{p1,p2,inlQ,inlRef,correct,wrong,R,t,s,Ri,ti,si};
-}
-
-// Trace builders
-function segTr(lines,color,width,opacity,name,hl=0.45){
-  const x=[],y=[],z=[];
-  for(const l of lines){if(!l)continue;const[p1,p2]=plkSeg(l,hl);x.push(p1[0],p2[0],null);y.push(p1[1],p2[1],null);z.push(p1[2],p2[2],null);}
-  return{type:'scatter3d',mode:'lines',x,y,z,line:{color,width},opacity,name,hoverinfo:'skip',showlegend:!!name};
-}
-function connTr(pairs,color,width,name){
-  const x=[],y=[],z=[];
-  for(const[a,b]of pairs){const ca=plkC(a),cb=plkC(b);x.push(ca[0],cb[0],null);y.push(ca[1],cb[1],null);z.push(ca[2],cb[2],null);}
-  return{type:'scatter3d',mode:'lines',x,y,z,line:{color,width},name,hoverinfo:'skip',showlegend:!!name};
-}
 const BASE_LAYOUT={margin:{l:0,r:0,t:32,b:0},paper_bgcolor:'#0a0a0f',plot_bgcolor:'#0a0a0f',font:{color:'#94a3b8'},
   legend:{bgcolor:'rgba(0,0,0,0)',bordercolor:'rgba(255,255,255,0.07)',borderwidth:1,font:{size:11,color:'#94a3b8'}},
-  scene:{bgcolor:'#0a0a0f',xaxis:{visible:false},yaxis:{visible:false},zaxis:{visible:false},aspectmode:'auto'}};
+  scene:{bgcolor:'#0a0a0f',xaxis:{visible:false},yaxis:{visible:false},zaxis:{visible:false},aspectmode:'data'}};
 
-let _p=null,_tab=1;
+let _p=null,_tab=0;
+function realPair(key){
+  const D=window.REAL_DEMO;
+  if(!D||!D[key])return null;
+  const d=D[key];
+  return{q:d.q,r:d.r,corr:d.corr,s:d.s,R:d.R,t:d.t,label:d.label,err:d.err,sgt:d.s_gt,
+         names:key==='kitti07'?['Camera map (query)','LiDAR map (reference)']:['Mono SLAM map (query)','RGB-D map (reference)']};
+}
 function render(tab){
   _tab=tab;
   document.querySelectorAll('#scene-tabs .viz-tab').forEach((b,i)=>b.classList.toggle('active',i===tab));
   const p=_p;if(!p)return;
-  if(p.real){
-    let traces=[],title='';
-    if(tab===0){
-      traces=[segTrEP(p.q,'#60a5fa',2,0.9,'Mono SLAM map (query)')];
-      title=p.label+' — query map (arbitrary scale)';
-    }else if(tab===1){
-      traces=[segTrEP(p.q,'#60a5fa',2,0.85,'Mono (query)'),segTrEP(p.r,'#f97316',2,0.85,'RGB-D (reference)')];
-      title='Before registration — real maps, scale mismatch '+(1/p.sgt).toFixed(2)+'x';
-    }else if(tab===2){
-      const x=[],y=[],z=[];
-      for(const[qi,ri]of p.corr){const a=segMid(p.q[qi]),bseg=p.r[ri],b=segMid(bseg);x.push(a[0],b[0],null);y.push(a[1],b[1],null);z.push(a[2],b[2],null);}
-      traces=[segTrEP(p.q,'#93c5fd',1,0.25,''),segTrEP(p.r,'#fdba74',1,0.25,''),
-        {type:'scatter3d',mode:'lines',x,y,z,line:{color:'#4ade80',width:1.5},name:'GT correspondences',hoverinfo:'skip',showlegend:true}];
-      title='Ground-truth correspondences (subsampled) — note the scale gap';
-    }else{
-      traces=[segTrEP(p.r,'#f97316',2,0.8,'RGB-D (reference)'),segTrEP(sim3EP(p.q,p.s,p.R,p.t),'#4ade80',2,0.9,'Mono (aligned by SCALAR)')];
-      title='After SCALAR Sim(3) — '+p.err.rot+'\u00b0 rot, '+p.err.s_pct+'% scale, '+p.err.t_m+' m trans error';
-    }
-    Plotly.react(document.getElementById('synth-plot'),traces,Object.assign({},BASE_LAYOUT,{title:{text:title,font:{color:'#cbd5e1',size:12}}}),{responsive:true,displayModeBar:false});
-    return;
-  }
   let traces=[],title='';
   if(tab===0){
-    traces=[segTr(p.p1,'#60a5fa',2,0.9,'Source cloud')];
-    title='Source cloud — query frame (arbitrary scale)';
+    traces=[segTrEP(p.q,'#60a5fa',2,0.85,p.names[0]),segTrEP(p.r,'#f97316',2,0.85,p.names[1])];
+    title=p.label;
   }else if(tab===1){
-    traces=[segTr(p.p1,'#60a5fa',2,0.85,'Source'),segTr(p.p2,'#f97316',2,0.85,'Target')];
-    title='Before registration — source and target misaligned';
-  }else if(tab===2){
-    traces=[
-      segTr(p.p1,'#93c5fd',1,0.28,''),segTr(p.p2,'#fdba74',1,0.28,''),
-      segTr(p.correct.map(([q])=>q),'#38bdf8',3,1,'Source inliers'),
-      segTr(p.correct.map(([,r])=>r),'#f97316',3,1,'Target inliers'),
-      connTr(p.correct,'#4ade80',1.5,'Correct matches'),
-      ...(p.wrong.length?[connTr(p.wrong,'#ef4444',1.5,'False matches')]:[]),
-    ];
-    title='Correspondences identified by ScalePluckerNet';
+    const x=[],y=[],z=[];
+    for(const[qi,ri]of p.corr){const a=segMid(p.q[qi]),b=segMid(p.r[ri]);x.push(a[0],b[0],null);y.push(a[1],b[1],null);z.push(a[2],b[2],null);}
+    traces=[segTrEP(p.q,'#93c5fd',1,0.25,''),segTrEP(p.r,'#fdba74',1,0.25,''),
+      {type:'scatter3d',mode:'lines',x,y,z,line:{color:'#4ade80',width:1.5},name:'GT correspondences',hoverinfo:'skip',showlegend:true}];
+    title='Ground-truth correspondences (subsampled)';
   }else{
-    const al=sim3(p.p1,p.s,p.R,p.t);
-    traces=[segTr(p.p2,'#f97316',2,0.8,'Target'),segTr(al,'#4ade80',2,0.9,'Source (aligned)')];
-    title='After Sim(3) registration — source aligned to target';
+    traces=[segTrEP(p.r,'#f97316',2,0.8,p.names[1]),segTrEP(sim3EP(p.q,p.s,p.R,p.t),'#4ade80',2,0.9,p.names[0]+' — aligned by SCALAR')];
+    title='After SCALAR Sim(3) — '+p.err.rot+'\u00b0 rot, '+p.err.s_pct+'% scale, '+p.err.t_m+' m translation error';
   }
   Plotly.react(document.getElementById('synth-plot'),traces,Object.assign({},BASE_LAYOUT,{title:{text:title,font:{color:'#cbd5e1',size:12}}}),{responsive:true,displayModeBar:false});
 }
 window.showScene=(n)=>render(n);
-window.regenScene=()=>{const sel=document.getElementById('scene-select');const v=sel?sel.value:'real';_p=(v==='real'?realPair():genPair(v))||genPair('loop');render(_tab);};
+window.regenScene=()=>{const sel=document.getElementById('scene-select');_p=realPair(sel?sel.value:'heads');render(_tab);};
 window.regenScene();
 })();
 </script>
