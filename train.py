@@ -212,10 +212,26 @@ def main():
         logging.warning(f'Pretrain not found: {args.pretrain}')
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
+    # On resume, trainer.start_epoch already reflects the checkpoint's epoch
+    # (set in Sim3Trainer.__init__), but a freshly constructed ExponentialLR
+    # does NOT retroactively recompute lr from `last_epoch` at __init__ time
+    # in this torch build (get_lr() returns the current, unmultiplied lr on
+    # the initial step) — so the resumed lr must be set explicitly, or every
+    # resume silently kicks the LR back up to args.lr instead of continuing
+    # to anneal from wherever it had decayed to.
+    resume_last_epoch = trainer.start_epoch - 1 if args.resume else -1
+    resumed_lr = (args.lr * (trainer.config.exp_gamma ** trainer.start_epoch)
+                 if args.resume else args.lr)
     for pg in trainer.optimizer.param_groups:
-        pg['lr'] = args.lr
+        pg['lr'] = resumed_lr
+        pg['initial_lr'] = args.lr
     trainer.scheduler = lr_sched.ExponentialLR(trainer.optimizer,
-                                               gamma=trainer.config.exp_gamma)
+                                               gamma=trainer.config.exp_gamma,
+                                               last_epoch=resume_last_epoch)
+    if resume_last_epoch >= 0:
+        logging.info(f'Resumed ExponentialLR at epoch {trainer.start_epoch}: '
+                     f'lr={resumed_lr:.3e} (= {args.lr:.1e} * '
+                     f'{trainer.config.exp_gamma}^{trainer.start_epoch})')
 
     if args.cosine_lr:
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(

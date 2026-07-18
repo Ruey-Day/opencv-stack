@@ -46,13 +46,33 @@ _SCALE_RANGE      = (0.3, 8.0)   # tightened: avoids s_i > 3.3 to prevent moment
 _ROOM_SCALE_RANGE = (0.3, 5.0)
 _MIN_INLIERS      = 20
 
-# v2 calibration: mono→metric SLAM pairs have s > 1 (metric larger than mono).
-# LogNormal(log(2.5), 1.0) → median s≈2.5, P25≈0.9, P75≈6.8; 75% of samples s > 1.
-_SCALE_LOG_CENTER = np.log(2.5)
-_SCALE_LOG_STD    = 1.0
+# v4 calibration: match measured GT scale of real mono→metric pairs
+# (tools/analyze_real_noise.py 2026-07-03: median 2.1, P25–P95 = 1.7–3.4).
+# v5: wider spread/clip — the 33-seq GT benchmark (2026-07-07) observed GT
+# scales 0.74–10.65 (heads at the old lower clip 0.7, stairs OUTSIDE the old
+# upper clip 7.0); cover them with margin while keeping the same median.
+_SCALE_LOG_CENTER = np.log(2.2)
+_SCALE_LOG_STD    = 0.60
+_SCALE_CLIP       = (0.4, 13.0)
 
-_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor']
-_SCENARIO_P = np.array([0.12, 0.09,  0.09,       0.11,  0.06,          0.14,        0.09,        0.09,         0.12,          0.09])
+# v4 real-structure noise (calibrated against tools/analyze_real_noise.py):
+# physical perturbation of (foot point, direction) with m recomputed, so the
+# Plücker constraint m·d = 0 holds — Gaussian noise directly on m violates it
+# and real/test lines never do.
+_V4_DIR_SIGMA_DEG = 5.2      # Rayleigh → median ~6.1°, P90 ~11.2°
+_V4_DIR_CAP_DEG   = 25.0
+_V4_PERP_SIGMA_M  = 0.07     # Rayleigh, in the METRIC frame
+_V4_SEVERITY      = (0.6, 1.5)   # per-pair multiplier (clean vs drifty run)
+_V4_REF_DIR_DEG   = 1.5
+_V4_REF_PERP_M    = 0.02
+_V4_FRAG_P        = (0.65, 0.25, 0.10)  # P(1|2|3 query fragments per real edge)
+_V4_SIGN_FLIP     = 0.5      # SLAM endpoint order is arbitrary → ~50% flipped
+
+_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street']
+# v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
+# distribution otherwise unchanged for retention when fine-tuning from v5)
+_SCENARIO_P = np.array([0.1032, 0.0774, 0.0774, 0.0946, 0.0516, 0.1204,
+                        0.0774, 0.0774, 0.1032, 0.0774, 0.14])
 
 
 # ── Plücker line primitives ───────────────────────────────────────────────────
@@ -70,6 +90,30 @@ def _apply_sim3(L6: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) -> np.nd
     m, d  = L6[:, :3], L6[:, 3:]
     d_new = (R @ d.T).T
     m_new = s * (R @ m.T).T + np.cross(t[None], d_new)
+    return np.concatenate([m_new, d_new], axis=1).astype(np.float32)
+
+
+def _physical_noise(L: np.ndarray, dir_sigma_deg: float, perp_sigma_m: float,
+                    dir_cap_deg: float = 90.0) -> np.ndarray:
+    """Perturb lines physically: Rayleigh rotation of the direction plus a
+    Rayleigh perpendicular offset of the foot point, then recompute m.
+    Preserves m·d = 0 (unlike additive Gaussian noise on m)."""
+    if len(L) == 0:
+        return L
+    m, d = L[:, :3], L[:, 3:]
+    n = len(L)
+    p0 = np.cross(d, m)                                   # foot of perpendicular
+    ax = np.cross(d, np.random.randn(n, 3))
+    ax /= np.linalg.norm(ax, axis=1, keepdims=True) + 1e-9
+    ang = np.radians(np.minimum(np.random.rayleigh(dir_sigma_deg, n), dir_cap_deg))
+    ca, sa = np.cos(ang)[:, None], np.sin(ang)[:, None]
+    d_new = ca * d + sa * np.cross(ax, d) + (1 - ca) * (ax * d).sum(1, keepdims=True) * ax
+    d_new /= np.linalg.norm(d_new, axis=1, keepdims=True) + 1e-9
+    off = np.random.randn(n, 3)
+    off -= (off * d_new).sum(1, keepdims=True) * d_new
+    off *= (np.random.rayleigh(perp_sigma_m, n)
+            / (np.linalg.norm(off, axis=1) + 1e-9))[:, None]
+    m_new = np.cross(p0 + off, d_new)
     return np.concatenate([m_new, d_new], axis=1).astype(np.float32)
 
 
@@ -279,11 +323,92 @@ def _make_large_scale_pool(n: int, pos_range: float = 12.0) -> np.ndarray:
     return pool[np.random.permutation(len(pool))].astype(np.float32)
 
 
+def _make_street_pool(n: int) -> np.ndarray:
+    """v6 street-canyon pool, calibrated to the measured KITTI camera/LiDAR
+    line maps (2026-07-16: extent ~(80-520) x (8-12) x (5-10) m slab,
+    60-75% street-axis horizontal directions, 13-28% verticals, periodic
+    facade repetition = the 180-deg flip alias, s_gt ~ 1.0).
+
+    The returned order is a weighted shuffle with verticals and ground
+    edges first: the inlier slice big_pool[:k] is therefore rich in the
+    structures both sensors genuinely share as infinite lines (wall
+    corners, curbs), while facade horizontals — whose height bands differ
+    between LiDAR (bottom metres) and camera (full height) — land mostly
+    in the outlier slices. This models the height-band disjointness that
+    caps real cross-modal overlap at 18-24%."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    # 1-3 chained street segments (straight run, L-corner, U/Z route —
+    # KITTI 06 is a ~520 m straight, 07 a 240x240 m loop). Corners spread
+    # the foot points of street-axis lines across the plane, matching the
+    # measured 20-60:1 in-plane slab anisotropy.
+    n_seg = np.random.randint(1, 4)
+    W = float(np.random.uniform(3.0, 8.0))        # half-width
+    H = float(np.random.uniform(4.0, 10.0))       # facade height
+    period = float(np.random.uniform(5.0, 15.0))  # facade repetition
+    ez = np.array([0.0, 0.0, 1.0])
+    lines, wts = [], []
+
+    def add(p, d, w, Ryaw, org):
+        d = Ryaw @ (np.asarray(d, np.float64) + np.random.randn(3) * 0.05)
+        d /= np.linalg.norm(d) + 1e-9
+        p = Ryaw @ np.asarray(p, np.float64) + org
+        lines.append(np.concatenate([np.cross(p, d), d]))
+        wts.append(w)
+
+    org = np.zeros(3)
+    yaw = 0.0
+    per_seg = (2 * n) // n_seg + 1
+    for _seg in range(n_seg):
+        L = float(np.random.uniform(40.0, 250.0))
+        c, si = np.cos(yaw), np.sin(yaw)
+        Ryaw = np.array([[c, -si, 0.0], [si, c, 0.0], [0.0, 0.0, 1.0]])
+        ex = np.array([1.0, 0.0, 0.0])
+        made = 0
+        while made < per_seg:
+            r = np.random.random()
+            side = -1.0 if np.random.random() < 0.5 else 1.0
+            xg = (np.round(np.random.uniform(0.0, L) / period) * period
+                  + np.random.randn() * 0.4)
+            if r < 0.20:    # vertical wall corner / pole (shared cross-modally)
+                add([xg, side * W * np.random.uniform(0.9, 1.1), 0.0],
+                    ez, 1.0, Ryaw, org)
+            elif r < 0.60:  # facade horizontal along the street axis
+                add([np.random.uniform(0.0, L), side * W,
+                     np.random.uniform(0.3, H)], ex, 0.35, Ryaw, org)
+            elif r < 0.74:  # ground / curb / lane edges (shared)
+                add([np.random.uniform(0.0, L),
+                     np.random.uniform(-W, W), 0.0], ex, 0.8, Ryaw, org)
+            elif r < 0.82:  # cross-street horizontal (facade returns, gates)
+                add([xg, side * W, np.random.uniform(0.3, H)],
+                    [0.0, 1.0, 0.0], 0.5, Ryaw, org)
+            else:           # oblique clutter (vegetation, vehicles, LiDAR
+                            # curvature edges) — real maps measure only
+                            # 0.15-0.21 dominant-direction concentration
+                add([np.random.uniform(0.0, L), np.random.uniform(-W, W),
+                     np.random.uniform(0.0, 0.6 * H)],
+                    np.random.randn(3), 0.4, Ryaw, org)
+            made += 1
+        # chain: advance to segment end, turn ~90 deg either way
+        org = org + Ryaw @ np.array([L, 0.0, 0.0])
+        yaw += np.deg2rad(np.random.uniform(70.0, 110.0)
+                          * (1 if np.random.random() < 0.5 else -1))
+    A = np.stack(lines).astype(np.float32)
+    # recentre so moments stay O(extent), like a SLAM map's local frame
+    p0 = np.cross(A[:, :3], A[:, 3:])
+    shift = -np.median(p0, axis=0)
+    A[:, :3] += np.cross(shift[None].astype(np.float32), A[:, 3:])
+    w = np.asarray(wts, np.float64)
+    order = np.random.choice(len(A), size=n, replace=False, p=w / w.sum())
+    return A[order]
+
+
 def _apply_drift(lines: np.ndarray, n_groups: int = 4, sigma: float = 0.10) -> np.ndarray:
     """
-    Spatially correlated moment noise — simulates accumulated SLAM drift.
+    Spatially correlated drift — simulates accumulated SLAM drift.
     Lines are partitioned into n_groups random spatial buckets; each bucket
-    receives the same random moment offset δ ~ N(0, σ²I).
+    is rigidly translated by δ ~ N(0, σ²I), i.e. m += δ × d, which is the
+    exact Plücker transform of a translation and preserves m·d = 0.
     """
     n = len(lines)
     if n == 0:
@@ -294,7 +419,8 @@ def _apply_drift(lines: np.ndarray, n_groups: int = 4, sigma: float = 0.10) -> n
         mask = group_ids == g
         if mask.sum() == 0:
             continue
-        out[mask, :3] += np.random.randn(3).astype(np.float32) * sigma
+        delta = np.random.randn(3).astype(np.float32) * sigma
+        out[mask, :3] += np.cross(delta[None], out[mask, 3:])
     return out
 
 
@@ -315,6 +441,11 @@ def _make_confuser_lines(n: int, ref_lines: np.ndarray, spread: float = 0.08,
 def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     if n == 0:
         return np.zeros((0, 6), np.float32)
+
+    if pool_type == 'street':
+        # v6: no shuffle here — _make_street_pool's weighted order IS the
+        # inlier-selection bias (verticals/ground first)
+        return _make_street_pool(n)
 
     if pool_type == 'manhattan':
         n_mw = int(n * np.random.uniform(0.55, 0.85))
@@ -461,6 +592,20 @@ def _generate_pair() -> dict:
         noise1       = float(np.exp(np.random.uniform(np.log(0.02), np.log(0.60))))
         noise2       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.20))))
         pool_type    = 'outdoor'
+    elif scenario == 'street':
+        # v6 KITTI-calibrated street canyon: metric-metric scale, large
+        # elongated clouds (real: query 1.3-2.6k, ref 1.8-2.3k lines),
+        # low overlap (measured 18-24% matched query fraction), periodic
+        # facades whose repetitions ARE the confuser structure — no
+        # synthetic confusers needed; the pool aliases itself under
+        # 180-deg flips and street-axis translations.
+        n2           = np.random.randint(600, 2200)
+        n1           = max(200, min(int(n2 * np.random.uniform(0.4, 1.6)),
+                                    2200))
+        overlap_frac = float(np.random.beta(2.0, 7.0))   # mean ~0.22
+        noise1       = 0.3
+        noise2       = 0.1
+        pool_type    = 'street'
     else:  # corridor
         # Corridor / stairwell — 1-2 dominant directions, higher noise
         n2           = np.random.randint(50, 450)
@@ -474,16 +619,22 @@ def _generate_pair() -> dict:
     n1 = max(n1, k)
     n2 = max(n2, k)
 
-    # v2 fix: sample scale from LogNormal biased toward s > 1 (mono→metric scenario).
-    # Clipped to _SCALE_RANGE; ~80% of samples have s > 1.
+    # v4: scale distribution matched to measured real pairs (median 2.1).
     log_s = np.random.normal(_SCALE_LOG_CENTER, _SCALE_LOG_STD)
-    log_s = np.clip(log_s, np.log(_SCALE_RANGE[0]), np.log(_SCALE_RANGE[1]))
+    log_s = np.clip(log_s, np.log(_SCALE_CLIP[0]), np.log(_SCALE_CLIP[1]))
     s   = float(np.exp(log_s))
     R   = _random_rotation()
     # v2 fix: t_range_eff = 0.4 * s so that the inverse translation
     # |t_i| = |t|/s ≤ 0.4m for ALL s (both s < 1 and s > 1).
     # Prevents the t × d cross term from inflating query moments.
     t_range_eff = 0.4 * s
+    if scenario == 'street':
+        # v6: both maps are metric (LiDAR GT frame vs depth-lifted camera
+        # map) — s_gt measured 0.999/1.003 on KITTI. Translation offsets
+        # are tens of metres at street scale.
+        s = float(np.exp(np.clip(np.random.normal(0.0, 0.12),
+                                 np.log(0.7), np.log(1.4))))
+        t_range_eff = 20.0 * s
     t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 
@@ -504,36 +655,44 @@ def _generate_pair() -> dict:
     out_q_ref   = big_pool[k:k + n_out1]
     out_r       = big_pool[k + n_out1:k + n_out1 + n_out2]
 
-    # Direction noise: hard_noise uses up to 0.12 rad (~7°); others up to 0.04 rad.
-    dir_noise_q   = np.random.uniform(0.0, 0.12 if use_confusers else 0.04)
-    dir_noise_ref = np.random.uniform(0.0, 0.08 if use_confusers else 0.03)
+    # v4: per-pair severity replaces the per-scenario Gaussian noise levels;
+    # hard scenarios are drifty runs (higher severity), not a different model.
+    severity = np.random.uniform(*_V4_SEVERITY) * (2.0 if scenario == 'hard_noise' else 1.0)
+    # v6: street positional noise is measured in street metres (KITTI GT
+    # correspondences: perp median 0.32-0.35 m -> Rayleigh sigma ~0.28;
+    # LiDAR reference edges are range-noisy too). Direction noise keeps the
+    # v4 calibration (measured 5.4-6.0 deg median on KITTI — same as indoor).
+    perp_q_sigma = 0.28 if scenario == 'street' else _V4_PERP_SIGMA_M
+    perp_r_sigma = 0.08 if scenario == 'street' else _V4_REF_PERP_M
+    drift_scale  = 6.0 if scenario == 'street' else 1.0
 
     if k > 0:
-        inliers_q = _apply_sim3(inliers_ref, s_i, R_i, t_i)
-        inliers_q  [:, :3] += np.random.randn(k, 3).astype(np.float32) * noise1
-        inliers_ref[:, :3] += np.random.randn(k, 3).astype(np.float32) * noise2
-        inliers_q  [:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise_q
-        inliers_q  [:, 3:] /= np.linalg.norm(inliers_q  [:, 3:], axis=1, keepdims=True) + 1e-9
-        inliers_ref[:, 3:] += np.random.randn(k, 3).astype(np.float32) * dir_noise_ref
-        inliers_ref[:, 3:] /= np.linalg.norm(inliers_ref[:, 3:], axis=1, keepdims=True) + 1e-9
+        # v4 fragmentation: each reference edge appears as 1–3 query fragments
+        # with independent noise draws → many-to-one matches + near-duplicate
+        # query lines, matching real LSD mono maps.
+        n_frag = np.random.choice([1, 2, 3], size=k, p=_V4_FRAG_P)
+        frag_src = np.repeat(np.arange(k), n_frag)      # fragment -> ref inlier
+        inliers_q = _apply_sim3(inliers_ref[frag_src], s_i, R_i, t_i)
+        # noise in the query frame; perpendicular noise is measured in the
+        # METRIC frame, so divide by s
+        inliers_q = _physical_noise(inliers_q,
+                                    _V4_DIR_SIGMA_DEG * severity,
+                                    perp_q_sigma * severity / s,
+                                    _V4_DIR_CAP_DEG)
+        inliers_ref = _physical_noise(inliers_ref, _V4_REF_DIR_DEG,
+                                      perp_r_sigma)
 
         # Drift augmentation (20% of pairs): spatially correlated moment noise on query.
         if np.random.random() < 0.20:
             inliers_q = _apply_drift(
                 inliers_q,
                 n_groups=np.random.randint(2, 6),
-                sigma=float(np.random.uniform(0.05, 0.25)),
+                sigma=float(np.random.uniform(0.05, 0.25)) * drift_scale,
             )
-
-        # Rare direction flips (15% of pairs): negate m and d on 2–8% of inliers,
-        # simulating ±180° orientation ambiguity in SLAM line extraction.
-        if k > 2 and np.random.random() < 0.15:
-            n_flip   = max(1, int(k * np.random.uniform(0.02, 0.08)))
-            flip_idx = np.random.choice(k, n_flip, replace=False)
-            inliers_q[flip_idx, :3] *= -1
-            inliers_q[flip_idx, 3:] *= -1
     else:
         inliers_q = inliers_ref = np.zeros((0, 6), np.float32)
+        frag_src = np.zeros(0, np.int64)
+    k_q = len(frag_src)
 
     if use_confusers and k > 0:
         # Replace a fraction of regular outliers with confuser lines (near-parallel to inliers).
@@ -547,22 +706,38 @@ def _generate_pair() -> dict:
     else:
         out_q = (_apply_sim3(out_q_ref, s_i, R_i, t_i) if n_out1 > 0
                  else np.zeros((0, 6), np.float32))
+    # v4: outliers are real scene lines too — same physical noise as inliers
+    out_q = _physical_noise(out_q, _V4_DIR_SIGMA_DEG * severity,
+                            perp_q_sigma * severity / s, _V4_DIR_CAP_DEG)
 
     q_parts = [p for p in [inliers_q, out_q]   if len(p) > 0]
     r_parts = [p for p in [inliers_ref, out_r] if len(p) > 0]
     query_all = (np.concatenate(q_parts, axis=0) if q_parts else _make_pool(max(n1, 10), pool_type))
     ref_all   = (np.concatenate(r_parts, axis=0) if r_parts else _make_pool(max(n2, 10), pool_type))
 
-    i1 = np.random.permutation(len(query_all))
-    i2 = np.random.permutation(len(ref_all))
-    query_all, ref_all = query_all[i1], ref_all[i2]
-    m1 = np.argsort(i1)[:k].astype(np.int32)
-    m2 = np.argsort(i2)[:k].astype(np.int32)
+    # v4: ~50% Plücker sign flips on BOTH clouds (endpoint order is arbitrary
+    # in SLAM; a flipped [m,d] is the same line, so labels are unaffected)
+    for arr in (query_all, ref_all):
+        flip = np.random.random(len(arr)) < _V4_SIGN_FLIP
+        arr[flip] *= -1.0
+
+    i_q = np.random.permutation(len(query_all))
+    i_r = np.random.permutation(len(ref_all))
+    query_all, ref_all = query_all[i_q], ref_all[i_r]
+    q_pos = np.argsort(i_q)[:k_q]          # fragment j -> row in query_all
+    r_pos = np.argsort(i_r)[:k]            # ref inlier i -> row in ref_all
+
+    # v4 convention swap: plucker1 = REFERENCE (metric), plucker2 = QUERY —
+    # same as the 7scenes_mesh / real generators, so datasets mix cleanly and
+    # the dataloader's "normalize by plucker2 (query) std" stays correct.
+    # (s, R, t) maps query -> reference, i.e. plucker2 -> plucker1.
+    m_ref = r_pos[frag_src].astype(np.int32)
+    m_qry = q_pos.astype(np.int32)
 
     return dict(
-        plucker1 = query_all.astype(np.float32),
-        plucker2 = ref_all.astype(np.float32),
-        matches  = np.stack([m1, m2], 0) if k > 0 else np.zeros((2, 0), np.int32),
+        plucker1 = ref_all.astype(np.float32),
+        plucker2 = query_all.astype(np.float32),
+        matches  = np.stack([m_ref, m_qry], 0) if k_q > 0 else np.zeros((2, 0), np.int32),
         R_gt     = R.astype(np.float32),
         t_gt     = t.reshape(3, 1).astype(np.float32),
         s_gt     = np.float32(s),
