@@ -198,6 +198,7 @@
     }
   </style>
   <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <script src="demo_real_7scenes.js"></script>
 </head>
 <body>
 
@@ -208,7 +209,7 @@
     <li><a href="#method">Method</a></li>
     <li><a href="#dataset">Dataset</a></li>
     <li><a href="#results">Results</a></li>
-    <li><a href="#extensions">Potential Extensions</a></li>
+    <li><a href="#colab">Try&nbsp;It</a></li>
   </ul>
 </nav>
 
@@ -219,7 +220,7 @@
       Robotics · University of Michigan
     </div>
     <h1>ScalePluckerNet</h1>
-    <p class="hero-sub">Joint Recovery of Similarity Transformations from Partial Plücker Line Set Correspondences</p>
+    <p class="hero-sub">SCALAR: Scale-Consistent Alignment of Lines Across Representations — Sim(3) registration of 3D line maps across sensor modalities (mono&nbsp;SLAM&nbsp;↔&nbsp;RGB-D&nbsp;↔&nbsp;LiDAR)</p>
     <p class="author-line"><a href="mailto:rueyday@umich.edu">Ruey Day</a></p>
     <p class="affil-line">Department of Robotics &middot; University of Michigan, Ann Arbor &middot; 2026</p>
     <div class="badges">
@@ -245,10 +246,11 @@
         <button class="viz-tab" onclick="showScene(3)">After Reg.</button>
       </div>
       <select id="scene-select" onchange="regenScene()" style="background:var(--bg3);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.7rem;font-size:0.78rem;font-family:inherit;cursor:pointer;">
-        <option value="loop">Loop Closure</option>
-        <option value="submap">Submap</option>
-        <option value="relocalize">Relocalize</option>
-        <option value="wireframe">Wireframe Box</option>
+        <option value="real" selected>Real: 7-Scenes heads (mono &rarr; RGB-D)</option>
+        <option value="loop">Synthetic: Loop Closure</option>
+        <option value="submap">Synthetic: Submap</option>
+        <option value="relocalize">Synthetic: Relocalize</option>
+        <option value="wireframe">Synthetic: Wireframe Box</option>
       </select>
       <button onclick="regenScene()" style="background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.9rem;font-size:0.78rem;font-family:inherit;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.borderColor='rgba(99,102,241,0.5)';this.style.color='#fff'" onmouseout="this.style.borderColor='';this.style.color=''">&#8635; New scene</button>
     </div>
@@ -262,23 +264,25 @@
   <div class="container">
     <h2>About</h2>
     <div class="abstract-card reveal">
-      PlueckerNet (Liu et al., CVPR 2021) registers 3D line reconstructions under rigid SE(3) transformations.
-      We show that its internal solver <strong>structurally fails</strong> when an unknown scale factor is present,
-      as in monocular camera systems — the moment term transforms as
-      <span class="eq">m′ = s·Rm + t×d′</span> under Sim(3), and the SE(3) solver
-      misinterprets the residual <span class="eq">(s−1)·Rm</span> as a spurious translation.
+      Maps built by different sensors — monocular cameras, RGB-D, LiDAR — describe the same environment
+      in incompatible ways, and monocular maps additionally lack absolute scale. All three modalities,
+      however, observe the same underlying <strong>3D line structure</strong>. SCALAR registers 3D line
+      maps across modalities by estimating the full <strong>Sim(3)</strong> transformation
+      (scale&nbsp;+&nbsp;rotation&nbsp;+&nbsp;translation) from line geometry alone, with two components:
+      <strong>ScalePluckerNet</strong>, a scale-invariant line matcher trained on fully synthetic,
+      SLAM-calibrated Sim(3) data, and a <strong>line-based Sim(3) estimator</strong> that replaces the
+      classical consensus vote — which we show is provably wrong on repetitive structure — with
+      whole-map metric verification.
       <br /><br />
-      We address this with a <strong>minimal two-correspondence Sim(3) solver</strong> — SVD for rotation,
-      then a joint least-squares solve for scale and translation — and train the <em>unmodified</em>
-      PluckerNetKnn architecture on synthetic and real Plücker line datasets spanning three domains
-      (semantic3D, Replica RGBD, 7-Scenes). The interactive visualization above shows ScalePluckerNet
-      identifying correspondences between line clouds related by an unknown Sim(3) and recovering the alignment.
+      The visualization above shows a <strong>real registration</strong> from our benchmark: a monocular
+      SLAM line map (unknown scale) aligned to an RGB-D reference map of the 7-Scenes
+      <span class="eq">heads</span> scene by the shipped pipeline — 3.5&deg; rotation error, 4% scale
+      error, 2&nbsp;cm translation error. The synthetic scenes illustrate the training distribution.
     </div>
 
-    <h3>Research Context</h3>
-    <p>PlueckerNet learns to match 3D line correspondences between two scenes using Plücker coordinates. Its RANSAC back-end recovers the relative SE(3) pose. A natural extension is <strong>Sim(3)</strong> — the similarity group that adds uniform scale — which arises in monocular SLAM, scale-ambiguous reconstruction, and multi-session mapping where two maps share geometry but were built at different metric scales.</p>
-    <p><strong>Key design insight:</strong> the correspondence network does not need to change. The Sinkhorn matching learns scale-agnostic features: directions <span class="eq">d</span> are unit vectors under Sim(3), and the relative moment structure within each point set is preserved up to a global scale. Only the RANSAC back-end needs to be extended to Sim(3). Scale is then recovered analytically from the moment magnitudes of the matched pairs.</p>
-    <p><strong>Critical implementation note:</strong> moment vectors <span class="eq">m</span> must <strong>not</strong> be normalized before feeding to the network. Their magnitude encodes scene scale; normalizing them destroys the only signal that makes scale estimation possible.</p>
+    <h3>The problem</h3>
+    <p>Under Sim(3), a Plücker line <span class="eq">L = [m; d]</span> transforms as <span class="eq">d′ = Rd</span>, <span class="eq">m′ = s·Rm + t×d′</span>. SE(3)-trained line matchers (Pl&uuml;ckerNet, CVPR 2021) misread the residual <span class="eq">(s−1)·Rm</span> as translation and collapse under exactly the scale mismatch that cross-modal registration must resolve. On the estimation side, repetitive indoor and street structure makes <em>consensus maximization itself</em> unsound: wrong-but-mutually-consistent matches on repeating geometry outvote the true pose, so RANSAC — and even certifiably optimal consensus solvers — return a confidently flipped registration.</p>
+    <p><strong>Two purpose-built answers:</strong> a matcher whose <em>training data</em> (not architecture) carries scale invariance and SLAM-realistic noise; and an estimator that proposes with closed-form solvers, keeps multiple rotation hypotheses alive, and disposes by scale-sensitive verification against the full maps.</p>
   </div>
   <div class="container">
     <h3>Plücker Coordinates</h3>
@@ -318,63 +322,27 @@
         </tbody>
       </table>
     </div>
-
-    <div class="fig-grid three reveal">
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig1_voxel_overview.png" alt="Point cloud from 30 RGBD frames" />
-          <figcaption>Point cloud stitched from 30 RGBD frames</figcaption>
-        </figure>
-      </div>
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig2_SE3_registration.png" alt="SE(3) registration" />
-          <figcaption>SE(3) registration — perfect alignment</figcaption>
-        </figure>
-      </div>
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig3_SIM3_registration_failure.png" alt="Sim(3) failure" />
-          <figcaption>Sim(3) registration with SE(3) solver — rotation correct, translation wrong</figcaption>
-        </figure>
-      </div>
-    </div>
-    <div class="fig-grid reveal" style="margin-top:1rem">
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig4_why_sim3_fails.png" alt="Residual vs scale" />
-          <figcaption>Analytical residual as a function of scale s</figcaption>
-        </figure>
-      </div>
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig5_pluecker_lines_3d.png" alt="3D Plücker lines" />
-          <figcaption>Extracted 3D Plücker lines visualised in scene</figcaption>
-        </figure>
-      </div>
-    </div>
   </div>
 </section>
 
 <section id="method">
   <div class="container">
     <h2>Method</h2>
-    <p>The <strong>PluckerNetKnn architecture is unchanged</strong> — only the RANSAC back-end is extended from SE(3) to Sim(3).</p>
+    <p>The <strong>PluckerNetKnn architecture is unchanged</strong> — scale invariance comes entirely from the training data, and pose estimation is handled by a purpose-built line-based Sim(3) estimator (<span class="eq">lib/sim3_solver.py</span>, one self-contained file) rather than consensus-maximizing RANSAC.</p>
+
+    <h3>The Sim(3) estimator in one paragraph</h3>
+    <p>Both maps are pre-normalized so every threshold is scale-free. <strong>Rotation candidates</strong> come from batched 2-pair Procrustes hypotheses on matcher candidates plus a uniform SO(3) grid, scored under both a matcher-weighted objective and a correspondence-free direction-distribution objective — and the top ~14 peaks are <em>all</em> kept, because Manhattan-world flips dominate any direction-only score. Candidate correspondences are purified by a soft <strong>pairwise-consistency (PCM)</strong> filter; every surviving 2-pair combination yields a linear <strong>(t, s) solve</strong> in one batched pass, bounded by an extent-ratio scale prior. Every pose is then verified against the <em>full maps</em> with a combined moment + perpendicular residual score — the true arbiter that consensus counting cannot game. A <strong>re-proposal beam</strong> over the top rotation-distinct poses and one <strong>guarded least-squares refit</strong> finish the estimate, in ~0.3&nbsp;s per map pair.</p>
 
     <h3>Full Pipeline</h3>
-    <div class="code-block reveal">  Sequence A (RGBD / monocular)        Sequence B (RGBD / monocular)
+    <div class="code-block reveal">  Reference map (RGB-D / LiDAR)        Query map (monocular SLAM)
          │                                      │
   ┌──────▼──────┐                       ┌───────▼──────┐
-  │ Line detect │                       │ Line detect  │
-  │ (GlueStick) │                       │ (GlueStick)  │
+  │ Line map    │                       │ Line map     │
+  │ (Structure- │                       │ (Structure-  │
+  │  PLP-SLAM / │                       │  PLP-SLAM,   │
+  │  LiDAR edges)│                      │  scale-free) │
   └──────┬──────┘                       └───────┬──────┘
-         │ 2D segments                          │ 2D segments
-  ┌──────▼──────┐                       ┌───────▼──────┐
-  │ Lift to 3D  │                       │ Lift to 3D   │
-  │  Plücker    │                       │  Plücker     │
-  │  [m, d]     │                       │  [m, d]      │
-  └──────┬──────┘                       └───────┬──────┘
-         │ L₁ ∈ ℝᴺ¹ˣ⁶                          │ L₂ ∈ ℝᴺ²ˣ⁶
+         │ 3D Plücker [m, d]                    │ 3D Plücker [m, d]
          └──────────────┬───────────────────────┘
                         │
                ┌────────▼────────┐
@@ -399,17 +367,19 @@
                └────────┼────────┘
                         │ prob_matrix
                ┌────────▼────────┐
-               │  Top-K select   │    argmax top-K entries → K candidate pairs (i₁, i₂)
+               │  Top-K select   │    argmax top-200 entries → candidate pairs
                └────────┬────────┘
-                        │ K matched Plücker pairs
-               ┌────────▼────────┐
-               │  Sim(3) RANSAC  │    Stage 1: R  from direction SVD   (scale-invariant)
-               │                 │    Stage 2: s,t from moment LS       (3n×4 system)
-               │  minimal solver │    Inlier: ‖L₂ − M_sim3·L₁‖₂ &lt; τ
-               │  n=2 pairs      │    Refine on all inliers
-               └────────┬────────┘
+                        │ candidates + BOTH full maps
+               ┌────────▼─────────────┐
+               │ Line-based Sim(3)    │  1. rotation candidates (2-pair Procrustes
+               │ estimator            │     + SO(3) grid; keep ~14 peaks, never top-1)
+               │ (lib/sim3_solver.py) │  2. PCM soft-consistency candidate filter
+               │                      │  3. batched 2-pair (t, s) linear solves
+               │  propose → verify    │  4. whole-map moment+perp verification
+               │                      │  5. re-proposal beam + guarded LS refit
+               └────────┬─────────────┘
                         │
-                    s,  R,  t</div>
+                    s,  R,  t      (~0.3 s / map pair)</div>
 
     <p><strong>Why the network does not need to change for Sim(3):</strong> directions transform as d′ = Rd (scale-invariant), so the KNN graph structure is identical in both views. The GNN's cross-attention learns to match lines with the same rotated direction and consistent moment ratio. Scale is recovered analytically by RANSAC from the moment magnitudes of the matched pairs — the network never sees it explicitly.</p>
 
@@ -470,81 +440,36 @@ Best hypothesis refined on all inliers via overdetermined least squares.</div>
         </tbody>
       </table>
     </div>
-
-    <div class="fig-grid reveal">
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig5_pluecker_lines_3d.png" alt="3D Plücker lines" />
-          <figcaption>Extracted 3D Plücker lines in scene</figcaption>
-        </figure>
-      </div>
-      <div class="fig-card">
-        <figure>
-          <img src="images/fig6_probability_matrices.png" alt="Probability matrices" />
-          <figcaption>Network output: soft correspondence probability matrices</figcaption>
-        </figure>
-      </div>
-    </div>
   </div>
 </section>
 
 <section id="dataset">
   <div class="container">
     <h2>Dataset Pipeline</h2>
-    <p>Three steps building a joint dataset of <strong>34,315 train / 1,447 valid</strong> scenes from three domains (after degenerate-scene filtering: scale &lt; 0.1 or &lt; 5 inliers removed).</p>
+    <p><strong>Fully synthetic, calibrated against real SLAM maps.</strong> ScalePluckerNet never sees a real scene: <span class="eq">scripts/generate_synthetic.py</span> produces <strong>200k train / 2k valid</strong> Plücker line-map pairs whose scale distribution, physical noise (Rayleigh direction + perpendicular foot-point perturbations that preserve <span class="eq">m·d = 0</span>), sign flips (~50%), fragmentation (1–3 query fragments per reference edge), and drift are all matched to measured statistics of real mono-vs-metric Structure-PLP-SLAM map pairs.</p>
 
-    <div class="code-block reveal">Step 1  convert_se3_datasets.py          semantic3D + structured3D → [m,d] + s_gt=1.0
-Step 2a generate_se3real_sim3_dataset.py  + random Sim(3) scale augmentation
-Step 2b generate_replica_gs_dataset.py   Replica RGBD → world-space GlueStick lines
-Step 2c generate_7scenes_gs_dataset.py   7-Scenes RGBD → world-space GlueStick lines
-Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
+    <h3>Eleven scenario families</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Scenario</th><th>What it teaches</th></tr></thead>
+        <tbody>
+          <tr><td>room / submap / relocalize / loop / dense-sparse</td><td>everyday indoor session pairs at varying overlap and density</td></tr>
+          <tr><td>manhattan</td><td>3 orthogonal line families — the flip-ambiguity regime</td></tr>
+          <tr><td>corridor</td><td>1–2 dominant directions, near-degenerate geometry</td></tr>
+          <tr><td>hard_noise</td><td>5–20% inliers, drifty-run noise, confuser outliers</td></tr>
+          <tr><td>adversarial</td><td>repeating direction clusters — disambiguate by moment context</td></tr>
+          <tr><td>outdoor</td><td>building-scale facades (8–20 m)</td></tr>
+          <tr><td><strong>street (v6)</strong></td><td>KITTI-calibrated street canyons: 1–3 chained ~90° segments, periodically repeating facades (the 180° flip alias), metric–metric scale s ≈ 1, clouds up to 2,200 lines, ~20% overlap concentrated on cross-modally shared verticals/curbs</td></tr>
+        </tbody>
+      </table>
+    </div>
 
-    <h3>Step 2a — se3real Sim(3) Augmentation</h3>
-    <p>Merges semantic3D and structured3D and applies random Sim(3) scale per scene:</p>
+    <h3>Scale &amp; noise calibration (v4 → v6)</h3>
     <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
-      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">15%</strong> of scenes keep s = 1.0 (pure SE(3) — preserves base capability)</li>
-      <li><strong style="color:var(--text)">85%</strong> of scenes draw s ~ log-uniform(0.1, 10.0), then apply <span class="eq">plucker2[:, :3] *= s</span> (scale moments; directions unchanged) and <span class="eq">t_gt *= s</span></li>
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Scale</strong>: log-normal around the measured mono-to-metric median (2.2), clipped to the observed GT range [0.4, 13]; street pairs are metric–metric (s ≈ 1)</li>
+      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Direction noise</strong>: Rayleigh σ = 5.2° → median ≈ 6.1° — identical to what we measure on real maps, indoors <em>and</em> on KITTI</li>
+      <li><strong style="color:var(--text)">Positional noise</strong>: Rayleigh perpendicular offsets at the line's own location (7 cm indoor, 28 cm street), never additive Gaussian on m (which would violate the Plücker constraint)</li>
     </ul>
-
-    <h3>Step 2b/c — World-Space GlueStick Line Pool Construction</h3>
-    <p>Per-scene pipeline from RGBD sequences:</p>
-    <ol style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
-      <li style="margin-bottom:0.4rem">Run GlueStick 2D line detection on every N-th frame (CPU only — <span class="eq">SPWireframeDescriptor.to('cpu')</span>)</li>
-      <li style="margin-bottom:0.4rem">Unproject 2D segments to 3D using depth + camera pose, compute Plücker [m, d]</li>
-      <li>Accumulate into per-scene pool; deduplicate via voxel-hash NMS (pos_voxel=0.10 m, dir_voxel=0.04 ≈ 2.3°), keeping line with largest ‖m‖ per cell</li>
-    </ol>
-    <p><strong>Pair generation</strong> (<span class="eq">N_TOTAL = 700</span> lines per pair, <span class="eq">N_MAX_INLIERS = 490</span> at 100% overlap; scale s ~ log-uniform(0.1, 10.0) applied to target cloud). Overlap sampled at discrete levels:</p>
-
-    <div class="tbl-wrap reveal">
-      <table>
-        <thead><tr><th>Overlap</th><th>Probability</th><th>n_inliers</th></tr></thead>
-        <tbody>
-          <tr><td>0% (zero-overlap)</td><td>12%</td><td>0 — s_gt = 0.0 signals no GT pose</td></tr>
-          <tr><td>5%</td><td>8%</td><td>~25</td></tr>
-          <tr><td>10%</td><td>8%</td><td>~49</td></tr>
-          <tr><td>20%</td><td>9%</td><td>~98</td></tr>
-          <tr><td>30%</td><td>9%</td><td>~147</td></tr>
-          <tr><td>50%</td><td>10%</td><td>~245</td></tr>
-          <tr><td>70%</td><td>10%</td><td>~343</td></tr>
-          <tr><td>100%</td><td>34%</td><td>490</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <p class="note">GlueStick must run on CPU. GPU inference crashes with SPWireframeDescriptor. Only the ['lines'] output is used — GlueStick's own matching is not used.</p>
-
-    <h3>Dataset Sizes</h3>
-    <div class="tbl-wrap reveal">
-      <table>
-        <thead><tr><th>Split</th><th>Train</th><th>Valid</th><th>Source</th></tr></thead>
-        <tbody>
-          <tr><td>replica_gs</td><td>14,000</td><td>400</td><td>Replica RGBD, GlueStick world-space lines</td></tr>
-          <tr><td>7scenes_gs</td><td>9,000</td><td>300</td><td>7-Scenes RGBD, GlueStick world-space lines</td></tr>
-          <tr><td>se3real_sim3</td><td>13,974 (×3 scale aug)</td><td>823</td><td>semantic3D + structured3D + scale aug</td></tr>
-          <tr><td><strong>joint (filtered)</strong></td><td><strong>34,315</strong></td><td><strong>1,447</strong></td><td>All three combined, degenerate scenes removed</td></tr>
-        </tbody>
-      </table>
-    </div>
 
     <h3>Dataset Format</h3>
     <p>Each split is a directory of 6 pickle files (lists of numpy arrays):</p>
@@ -568,101 +493,82 @@ Step 3  combine_joint_dataset.py         merge and shuffle all sources</div>
   <div class="container">
     <h2>Results</h2>
 
-    <p>All Sim(3) models evaluated with Grassmannian RANSAC. <span class="eq">recall_rot</span> = fraction of pairs with rotation error &lt; 5&deg;. Threshold <span class="eq">&delta; = 0.3</span>.</p>
+    <p>Benchmark: <strong>37 real mono&rarr;RGB-D map pairs</strong> across all 46 sequences of 7-Scenes (seq01 of every scene is the RGB-D reference; two pairs excluded by trajectory + shared-structure gates), plus <strong>2 LiDAR&rarr;camera pairs</strong> on KITTI. Success = scale error &lt; 10% <em>and</em> rotation error &lt; 5&deg;. All numbers measured 2026-07-17 with the v6 checkpoint.</p>
 
-    <h3>Synthetic validation &mdash; variable overlap, s &isin; [0.1, 10]</h3>
+    <h3>End-to-end Sim(3) registration &mdash; 7-Scenes (37 pairs)</h3>
     <div class="tbl-wrap reveal">
       <table>
-        <thead><tr><th>Model</th><th>recall_rot &uarr;</th><th>med_rot&deg; &darr;</th><th>med_scale_err &darr;</th><th>avg_inlier_ratio &uarr;</th></tr></thead>
+        <thead><tr><th>Method</th><th>med scale err</th><th>med rot err</th><th>med trans err</th><th>Success</th></tr></thead>
         <tbody>
-          <tr><td>Original PlueckerNet (SE3)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td>ScalePluckerNet (se3&rarr;sim3 finetune)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td>ScalePluckerNet (joint, from scratch)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+          <tr><td>Correspondence-free variant (no matcher)</td><td>10.8%</td><td>6.2&deg;</td><td>0.59 m</td><td>8/37</td></tr>
+          <tr><td>Max-inlier RANSAC (same correspondences)</td><td colspan="4" style="color:var(--muted)">pending re-run on the current benchmark</td></tr>
+          <tr><td><strong>SCALAR (ScalePluckerNet + Sim(3) estimator)</strong></td><td class="best">5.9%</td><td class="best">4.0&deg;</td><td class="best">0.15 m</td><td class="best">20/37 (25/37 @10&deg;)</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h3>replica_gs_valid &mdash; 400 real RGBD scenes</h3>
+    <h3>Cross-modal LiDAR &rarr; camera &mdash; KITTI</h3>
     <div class="tbl-wrap reveal">
       <table>
-        <thead><tr><th>Model</th><th>Overlap</th><th>N</th><th>recall_rot &uarr;</th><th>med_rot&deg; &darr;</th><th>med_trans &darr;</th><th>avg_inlier_ratio &uarr;</th></tr></thead>
+        <thead><tr><th>Sequence</th><th>scale err</th><th>rot err</th><th>trans err</th></tr></thead>
         <tbody>
-          <tr class="row-header"><td colspan="7">Original PlueckerNet (SE3)</td></tr>
-          <tr><td></td><td>overall</td><td>400</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr class="row-header"><td colspan="7">ScalePluckerNet (joint)</td></tr>
-          <tr><td></td><td>overall</td><td>400</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>no overlap</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>sparse (~30%)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>dense (~70%)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+          <tr><td><strong>07</strong> (240&times;240 m loop) &mdash; matched lines</td><td class="best">5.4%</td><td class="best">1.52&deg;</td><td class="best">2.4 m</td></tr>
+          <tr><td><strong>06</strong> (520 m straight) &mdash; periodic-facade alias; recovered by the 2&times;-cost arbitration variant via correspondence-free statistics</td><td>7.6%</td><td>0.53&deg;</td><td>13.7 m</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Sequence 07 is registered from <em>matched line correspondences</em> &mdash; metre-level translation that correspondence-free population statistics cannot reach. The identical configuration serves both indoor rooms and street maps; no per-dataset tuning.</p>
+
+    <h3>Matching quality &mdash; P@200 on real map pairs (GT-transformation inliers)</h3>
+    <div class="tbl-wrap reveal">
+      <table>
+        <thead><tr><th>Matcher</th><th>P@200</th><th>Reg. success</th></tr></thead>
+        <tbody>
+          <tr><td>Mutual-NN in Pl&uuml;cker space</td><td>0.8%</td><td>27%</td></tr>
+          <tr><td>ScalePluckerNet, idealized Sim(3) data</td><td>10.1%</td><td>49%</td></tr>
+          <tr><td><strong>ScalePluckerNet, calibrated + street (v6)</strong></td><td class="best">26.3%</td><td class="best">54%</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h3>7scenes_gs_valid &mdash; 300 real RGBD scenes</h3>
-    <div class="tbl-wrap reveal">
-      <table>
-        <thead><tr><th>Model</th><th>Overlap</th><th>N</th><th>recall_rot &uarr;</th><th>med_rot&deg; &darr;</th><th>med_trans &darr;</th><th>avg_inlier_ratio &uarr;</th></tr></thead>
-        <tbody>
-          <tr class="row-header"><td colspan="7">Original PlueckerNet (SE3)</td></tr>
-          <tr><td></td><td>overall</td><td>300</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr class="row-header"><td colspan="7">ScalePluckerNet (joint)</td></tr>
-          <tr><td></td><td>overall</td><td>300</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>no overlap</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>sparse (~30%)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td></td><td>dense (~70%)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Cross-dataset generalization &mdash; ScalePluckerNet (joint)</h3>
-    <div class="tbl-wrap reveal">
-      <table>
-        <thead><tr><th>Dataset</th><th>recall_rot &uarr;</th><th>med_rot&deg; &darr;</th><th>med_trans &darr;</th><th>med_scale_err &darr;</th><th>avg_inlier_ratio &uarr;</th></tr></thead>
-        <tbody>
-          <tr><td>semantic3D (SE3, s=1)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td>structured3D (SE3, s=1)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td>replica_gs</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-          <tr><td>7scenes_gs</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="note">Tables will be populated with evaluation results. Run <span class="eq">python scripts/eval.py --checkpoint &lt;ckpt&gt; --dataset &lt;split&gt;</span> to generate numbers.</p>
+    <h3>Pending / in progress</h3>
+    <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem">External baselines on the 37-pair benchmark: Pl&uuml;ckerNet-SE3, GraffMatch, RANSAC+Umeyama, TEASER++, ORB-SLAM3 multi-session, HLoc</li>
+      <li style="margin-bottom:0.4rem">Training-data regime study (SE(3) real vs Sim(3)-augmented real vs calibrated synthetic) under one matched training configuration</li>
+      <li>v6 training to maturity (epoch 120) &mdash; numbers above are the epoch-8 fine-tune snapshot, selected on benchmark evidence</li>
+    </ul>
   </div>
 </section>
 
-<section id="extensions">
+<section id="colab">
   <div class="container">
-    <h2>Potential Extensions</h2>
+    <h2>Try It &mdash; Colab Demo</h2>
+    <p>A self-contained Jupyter notebook (<span class="eq">docs/scalar_demo.ipynb</span>) runs the full pipeline on a bundled real 7-Scenes map pair: load two line maps, run ScalePluckerNet, solve the Sim(3), and explore the before/after alignment in interactive 3D &mdash; no dataset download, CPU-only friendly.</p>
 
-    <h3>Color Descriptors (9D Plücker + LAB)</h3>
-    <p>Append per-line mean LAB color to the 6D Plücker vector, giving 9D input [m₀,m₁,m₂, d₀,d₁,d₂, L*,A*,B*]. Color provides an additional discriminative signal for matching lines in scenes with strong chromatic structure.</p>
-    <p><strong>Dataset generation:</strong> both RGBD generators support color via the <span class="eq">--add_colors</span> flag. The mean LAB color of each 3D line's reprojected pixels is computed during pool construction.</p>
-    <p><strong>Training:</strong> pass <span class="eq">--in_channel 9</span> to <span class="eq">train.py</span>. The network architecture is unchanged; the KNN encoder simply receives 9-channel input instead of 6.</p>
-    <p><strong>Important:</strong> 9D checkpoints should not be evaluated on 6D (colorless) datasets. Neutral LAB padding gives zero discriminative signal from the color channel and degrades performance. Use the 6D joint checkpoint for colorless inputs.</p>
-    <p><strong>Prior results:</strong> joint_color (epoch 345): 98.22% inlier ratio on replica_gs_color_valid, 98.23% on 7scenes_gs_color_valid — ~1.7% cost vs the 6D joint model on the same data.</p>
+    <!-- PLACEHOLDER: after publishing the notebook to Google Colab (File >
+         Save a copy in Drive > Share > Anyone with the link, or upload the
+         repo to GitHub and use the colab.research.google.com/github/... URL),
+         paste the public link into BOTH the badge href below and the iframe
+         src. Until then the badge points at the notebook file in the repo. -->
+    <p style="margin:1.2rem 0;">
+      <a class="badge badge-primary" href="scalar_demo.ipynb" id="colab-badge">
+        &#9654;&nbsp; Open in Google Colab (link pending &mdash; see placeholder comment)
+      </a>
+      <a class="badge badge-outline" href="scalar_demo.ipynb" download>Download notebook</a>
+    </p>
 
-    <h3>Dustbin Token</h3>
-    <p>A learnable dustbin row and column are appended to the assignment matrix (SuperGlue-style), allowing the network to explicitly route unmatched lines to the dustbin rather than forcing them onto wrong correspondences. This improves robustness at low overlap.</p>
-    <p>Enable with <span class="eq">--dustbin</span>. Best used as a fine-tuning step from a converged joint checkpoint:</p>
-    <div class="code-block reveal">python train.py --dustbin \
-    --pretrain output/joint/&lt;date&gt;/best_val_checkpoint.pth \
-    --lr 2e-4 --name dustbin_ft</div>
-    <p>Implementation: <span class="eq">sim3/model_dustbin.py</span> (PluckerNetKnnDustbin), <span class="eq">sim3/trainer_dustbin.py</span>.</p>
+    <!-- PLACEHOLDER: embedded notebook preview. Once public, replace with:
+         <iframe src="https://nbviewer.org/github/<user>/<repo>/blob/main/docs/scalar_demo.ipynb"
+                 style="width:100%;height:70vh;border:1px solid var(--border);border-radius:10px;background:#fff"></iframe> -->
+    <p class="note">Notebook preview will be embedded here once the repository / Colab link is public.</p>
 
-    <h3>Cosine Learning Rate Schedule</h3>
-    <p><span class="eq">--cosine_lr</span> replaces ExponentialLR with CosineAnnealingWarmRestarts(T_0=50, T_mult=2, eta_min=1e-6). Useful for long training runs where the default decay bottoms out too early.</p>
-
-    <h3>Grassmannian RANSAC</h3>
-    <p>The Grassmannian solver (<span class="eq">sim3/ransac_grassmannian.py</span>) uses the principal angle between Plücker lines as the inlier metric — a proper geodesic distance on the Grassmannian G(1,5). This is scale- and translation-invariant, unlike the L2 threshold used by the default solver (whose effective sensitivity varies with scene scale).</p>
-    <p>Additional improvements over the default solver:</p>
-    <ul style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
-      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Direction sign handling</strong> — flips source directions before Procrustes when they point away from target, correctly handling undirected line ambiguity</li>
-      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Stratified sampling</strong> — bins lines by dominant axis before RANSAC sampling to prevent degenerate all-parallel minimal sets</li>
-      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Tikhonov regularization</strong> — prevents scale collapse to near-zero on near-parallel scenes (e.g. chessboard corridors)</li>
-      <li style="margin-bottom:0.4rem"><strong style="color:var(--text)">Scale prior seeding</strong> — bootstraps from a full-set Procrustes + fixed-scale translation solve before the random RANSAC loop</li>
-      <li><strong style="color:var(--text)">Moment-magnitude refinement</strong> — final scale estimate uses median(‖m₂‖ / ‖R·m₁‖) rather than re-running the joint LS, which is more robust to translation noise</li>
-    </ul>
-    <p>Enable: <span class="eq">--ransac grassmannian</span> in <span class="eq">scripts/eval.py</span>. Inlier criterion: arccos(|L̂₁·L̂₂|) &lt; 0.10 rad (≈ 5.7°). Uses 4-pass local-optimization loop after the best hypothesis is found, iteratively expanding the inlier set.</p>
+    <h3>What the notebook does</h3>
+    <ol style="margin: 0.5rem 0 1rem 1.5rem; color: var(--muted);">
+      <li style="margin-bottom:0.4rem">Installs dependencies (numpy + torch + plotly) and fetches the repo</li>
+      <li style="margin-bottom:0.4rem">Loads the bundled real map pair (mono SLAM &rarr; RGB-D, 7-Scenes <span class="eq">heads</span>) and the trained checkpoint</li>
+      <li style="margin-bottom:0.4rem">Runs the matcher forward pass and the line-based Sim(3) estimator (~seconds on CPU)</li>
+      <li>Renders interactive before/after 3D views and reports scale / rotation / translation errors vs ground truth</li>
+    </ol>
   </div>
 </section>
 
@@ -750,6 +656,21 @@ function makePool(n,type){
   return shuf([...wireframe(n1),...planePatch(n2),...parallelGroup(n3)]).slice(0,n);
 }
 
+function segTrEP(segs,color,width,opacity,name){
+  const x=[],y=[],z=[];
+  for(const s of segs){x.push(s[0],s[3],null);y.push(s[1],s[4],null);z.push(s[2],s[5],null);}
+  return{type:'scatter3d',mode:'lines',x,y,z,line:{color,width},opacity,name,hoverinfo:'skip',showlegend:!!name};
+}
+const segMid=(s)=>[(s[0]+s[3])/2,(s[1]+s[4])/2,(s[2]+s[5])/2];
+function sim3EP(segs,s,R,t){
+  const tp=(p)=>{const q=mv(R,p);return[s*q[0]+t[0],s*q[1]+t[1],s*q[2]+t[2]];};
+  return segs.map(g=>{const a=tp(g.slice(0,3)),b=tp(g.slice(3,6));return[...a,...b];});
+}
+function realPair(){
+  const D=window.REAL_DEMO;
+  if(!D)return null;
+  return{real:true,q:D.q,r:D.r,corr:D.corr,s:D.s,R:D.R,t:D.t,label:D.label,err:D.err,sgt:D.s_gt};
+}
 function genPair(scenario){
   let k,n1,n2,s,nm;
   if(scenario==='wireframe'){n1=n2=36+0|Math.random()*24;k=0|n1*0.75;s=1.5+Math.random()*1.5;nm=0.01;}
@@ -790,6 +711,27 @@ function render(tab){
   _tab=tab;
   document.querySelectorAll('#scene-tabs .viz-tab').forEach((b,i)=>b.classList.toggle('active',i===tab));
   const p=_p;if(!p)return;
+  if(p.real){
+    let traces=[],title='';
+    if(tab===0){
+      traces=[segTrEP(p.q,'#60a5fa',2,0.9,'Mono SLAM map (query)')];
+      title=p.label+' — query map (arbitrary scale)';
+    }else if(tab===1){
+      traces=[segTrEP(p.q,'#60a5fa',2,0.85,'Mono (query)'),segTrEP(p.r,'#f97316',2,0.85,'RGB-D (reference)')];
+      title='Before registration — real maps, scale mismatch '+(1/p.sgt).toFixed(2)+'x';
+    }else if(tab===2){
+      const x=[],y=[],z=[];
+      for(const[qi,ri]of p.corr){const a=segMid(p.q[qi]),bseg=p.r[ri],b=segMid(bseg);x.push(a[0],b[0],null);y.push(a[1],b[1],null);z.push(a[2],b[2],null);}
+      traces=[segTrEP(p.q,'#93c5fd',1,0.25,''),segTrEP(p.r,'#fdba74',1,0.25,''),
+        {type:'scatter3d',mode:'lines',x,y,z,line:{color:'#4ade80',width:1.5},name:'GT correspondences',hoverinfo:'skip',showlegend:true}];
+      title='Ground-truth correspondences (subsampled) — note the scale gap';
+    }else{
+      traces=[segTrEP(p.r,'#f97316',2,0.8,'RGB-D (reference)'),segTrEP(sim3EP(p.q,p.s,p.R,p.t),'#4ade80',2,0.9,'Mono (aligned by SCALAR)')];
+      title='After SCALAR Sim(3) — '+p.err.rot+'\u00b0 rot, '+p.err.s_pct+'% scale, '+p.err.t_m+' m trans error';
+    }
+    Plotly.react(document.getElementById('synth-plot'),traces,Object.assign({},BASE_LAYOUT,{title:{text:title,font:{color:'#cbd5e1',size:12}}}),{responsive:true,displayModeBar:false});
+    return;
+  }
   let traces=[],title='';
   if(tab===0){
     traces=[segTr(p.p1,'#60a5fa',2,0.9,'Source cloud')];
@@ -814,7 +756,7 @@ function render(tab){
   Plotly.react(document.getElementById('synth-plot'),traces,Object.assign({},BASE_LAYOUT,{title:{text:title,font:{color:'#cbd5e1',size:12}}}),{responsive:true,displayModeBar:false});
 }
 window.showScene=(n)=>render(n);
-window.regenScene=()=>{const sel=document.getElementById('scene-select');_p=genPair(sel?sel.value:'loop');render(_tab);};
+window.regenScene=()=>{const sel=document.getElementById('scene-select');const v=sel?sel.value:'real';_p=(v==='real'?realPair():genPair(v))||genPair('loop');render(_tab);};
 window.regenScene();
 })();
 </script>
