@@ -245,7 +245,8 @@
         <button class="viz-tab" onclick="showScene(2)">After Reg.</button>
       </div>
       <select id="scene-select" onchange="regenScene()" style="background:var(--bg3);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.7rem;font-size:0.78rem;font-family:inherit;cursor:pointer;">
-        <option value="heads" selected>7-Scenes heads: mono &rarr; RGB-D (indoor)</option>
+        <option value="redkitchen13" selected>7-Scenes redkitchen: mono at 2.6&times; wrong scale &rarr; RGB-D</option>
+        <option value="heads">7-Scenes heads: mono &rarr; RGB-D (mild scale)</option>
         <option value="kitti07">KITTI 07: camera &rarr; LiDAR (street, 240&times;240 m)</option>
       </select>
     </div>
@@ -269,9 +270,7 @@
       classical consensus vote — which we show is provably wrong on repetitive structure — with
       whole-map metric verification.
       <br /><br />
-      The visualization above shows a <strong>real registration</strong> from our benchmark: a monocular
-      SLAM line map (unknown scale) aligned to an RGB-D reference map of the 7-Scenes
-      <span class="eq">heads</span> scene by the shipped pipeline — 3.5&deg; rotation error, 4% scale
+      The visualization above shows a <strong>real registration</strong> from our benchmark: a monocular SLAM line map — built at <strong>2.6&times; the wrong scale</strong>, the inherent ambiguity of monocular SLAM — aligned to an RGB-D reference map of the 7-Scenes <span class="eq">redkitchen</span> scene by the shipped pipeline: 1.8&deg; rotation, 6% scale, 10&nbsp;cm translation error. Toggle Before/After to watch the scale correction being applied; the <span class="eq">heads</span> scene (mild scale offset) and the cross-modal KITTI street scene are in the selector.5&deg; rotation error, 4% scale
       error, 2&nbsp;cm translation error. The second scene in the selector is the cross-modal KITTI result: a camera line map registered onto a LiDAR line map of a 240&times;240&nbsp;m street loop from matched correspondences alone &mdash; 1.5&deg; rotation, 5.4% scale, 2.4&nbsp;m translation.
     </div>
 
@@ -630,7 +629,8 @@ function render(tab){
   let traces=[],title='';
   if(tab===0){
     traces=[segTrEP(p.q,'#60a5fa',2,0.85,p.names[0]),segTrEP(p.r,'#f97316',2,0.85,p.names[1])];
-    title=p.label;
+    {const f=p.sgt>=1?p.sgt:1/p.sgt;
+     title=f>1.15?p.label+' — before: query is '+f.toFixed(2)+'\u00d7 too '+(p.sgt>=1?'small':'large')+' (scale is part of the unknown Sim(3))':p.label;}
   }else if(tab===1){
     const x=[],y=[],z=[];
     for(const[qi,ri]of p.corr){const a=segMid(p.q[qi]),b=segMid(p.r[ri]);x.push(a[0],b[0],null);y.push(a[1],b[1],null);z.push(a[2],b[2],null);}
@@ -644,7 +644,7 @@ function render(tab){
   Plotly.react(document.getElementById('synth-plot'),traces,Object.assign({},BASE_LAYOUT,{title:{text:title,font:{color:'#cbd5e1',size:12}}}),{responsive:true,displayModeBar:false});
 }
 window.showScene=(n)=>render(n);
-window.regenScene=()=>{const sel=document.getElementById('scene-select');_p=realPair(sel?sel.value:'heads');render(_tab);};
+window.regenScene=()=>{const sel=document.getElementById('scene-select');_p=realPair(sel?sel.value:'redkitchen13');render(_tab);};
 window.regenScene();
 })();
 </script>

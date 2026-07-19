@@ -68,11 +68,18 @@ _V4_REF_PERP_M    = 0.02
 _V4_FRAG_P        = (0.65, 0.25, 0.10)  # P(1|2|3 query fragments per real edge)
 _V4_SIGN_FLIP     = 0.5      # SLAM endpoint order is arbitrary → ~50% flipped
 
-_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street']
+_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'flip_room']
 # v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
-# distribution otherwise unchanged for retention when fine-tuning from v5)
-_SCENARIO_P = np.array([0.1032, 0.0774, 0.0774, 0.0946, 0.0516, 0.1204,
-                        0.0774, 0.0774, 0.1032, 0.0774, 0.14])
+# distribution otherwise unchanged for retention when fine-tuning from v5).
+# v7: add 'street_submap' at 0.12 (asymmetric spatial coverage — the KITTI
+# submap-localization test showed v6 never saw a query covering only a
+# fraction of the reference's AREA); previous weights scaled by 0.88.
+# v8: add 'flip_room' at 0.10 (repetitive-room flip alias — the measured
+# chess/seq05-class matcher blindness), previous weights scaled by 0.90.
+_SCENARIO_P = np.array([0.0817, 0.0613, 0.0613, 0.0749, 0.0409, 0.0954,
+                        0.0613, 0.0613, 0.0817, 0.0613, 0.1109, 0.108,
+                        0.10])
+_SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()   # exact normalization
 
 
 # ── Plücker line primitives ───────────────────────────────────────────────────
@@ -438,11 +445,49 @@ def _make_confuser_lines(n: int, ref_lines: np.ndarray, spread: float = 0.08,
     return np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32)
 
 
+def _make_flip_room_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """v8 repetitive room: a Manhattan-world room containing a COPY of a
+    large fraction of its own structure rotated by 90/180 deg about the
+    vertical axis (with jitter) — the internal symmetry that makes real
+    rooms like 7-Scenes chess flip-alias. A matcher that relies on local
+    direction/moment patterns scores ZERO here (every line has a
+    convincing rotated twin); disambiguation requires the asymmetric
+    minority + global moment context. Targets the measured chess/seq05 /
+    stairs failure mode (matcher P@200 = 0 despite 1,000 GT pairs)."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    n_base = max(8, int(n * np.random.uniform(0.40, 0.55)))
+    base = _make_manhattan_world(n_base, pos_range=pos_range)
+    ang = np.deg2rad(np.random.choice([90.0, 180.0, 270.0]))
+    c, s = np.cos(ang), np.sin(ang)
+    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+                  dtype=np.float32)
+    # rotate the copy about the room centre (origin) + small jitter so the
+    # twin is convincing but not identical
+    m, d = base[:, :3], base[:, 3:]
+    d2 = (Rz @ d.T).T
+    m2 = (Rz @ m.T).T
+    twin = np.concatenate([m2, d2], axis=1).astype(np.float32)
+    twin = _physical_noise(twin, 2.0, 0.05)
+    n_copy = int(len(twin) * np.random.uniform(0.6, 0.95))
+    twin = twin[np.random.choice(len(twin), n_copy, replace=False)]
+    # asymmetric minority: unique clutter that breaks the symmetry
+    n_rest = max(0, n - len(base) - len(twin))
+    parts = [base, twin]
+    if n_rest > 0:
+        parts.append(_make_outliers(n_rest, pos_range=pos_range))
+    pool = np.concatenate(parts, axis=0)
+    return pool[np.random.permutation(len(pool))].astype(np.float32)[:n]
+
+
 def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     if n == 0:
         return np.zeros((0, 6), np.float32)
 
-    if pool_type == 'street':
+    if pool_type == 'flip_room':
+        return _make_flip_room_pool(n)
+
+    if pool_type in ('street', 'street_submap'):
         # v6: no shuffle here — _make_street_pool's weighted order IS the
         # inlier-selection bias (verticals/ground first)
         return _make_street_pool(n)
@@ -606,6 +651,32 @@ def _generate_pair() -> dict:
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street'
+    elif scenario == 'street_submap':
+        # v7: submap localization — the query covers only a contiguous
+        # 15-35% WINDOW of the reference street's area (a short mono drive
+        # inside a full prior LiDAR map), at mono-ambiguous scale. The
+        # reference keeps the whole street; query inliers AND outliers are
+        # confined to the window (asymmetric spatial coverage — the
+        # distribution v6 lacked). Overlap is the shared fraction WITHIN
+        # the window (same height-band logic as 'street').
+        n2           = np.random.randint(800, 2200)
+        n1           = np.random.randint(150, 600)
+        overlap_frac = float(np.random.beta(2.0, 6.0))   # mean ~0.25 of window
+        noise1       = 0.3
+        noise2       = 0.1
+        pool_type    = 'street_submap'
+    elif scenario == 'flip_room':
+        # v8: repetitive room (see _make_flip_room_pool). Sizes/noise like
+        # 'room'; confusers OFF (the pool IS its own confuser).
+        n2           = np.random.randint(150, 900)
+        n1           = max(50, min(int(n2 * np.random.uniform(0.4, 2.0)),
+                                   900))
+        overlap_frac = float(np.random.beta(3.0, 2.5))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005),
+                                                      np.log(0.12))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001),
+                                                      np.log(0.04))))
+        pool_type    = 'flip_room'
     else:  # corridor
         # Corridor / stairwell — 1-2 dominant directions, higher noise
         n2           = np.random.randint(50, 450)
@@ -635,6 +706,12 @@ def _generate_pair() -> dict:
         s = float(np.exp(np.clip(np.random.normal(0.0, 0.12),
                                  np.log(0.7), np.log(1.4))))
         t_range_eff = 20.0 * s
+    elif scenario == 'street_submap':
+        # v7: a standalone mono submap has ARBITRARY scale (unlike the
+        # depth-lifted full camera maps) and lives in its own local frame
+        s = float(np.exp(np.clip(np.random.normal(0.0, 0.45),
+                                 np.log(1 / 3.0), np.log(3.0))))
+        t_range_eff = 20.0 * s
     t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 
@@ -651,6 +728,31 @@ def _generate_pair() -> dict:
         if sv[-1] / (sv[0] + 1e-9) >= _NONDEGEN_THR:
             break
 
+    if pool_type == 'street_submap':
+        # v7: confine ALL query material (inliers + outliers) to one
+        # contiguous spatial window of the street; the reference keeps the
+        # whole route. A ball around a route point is a segment of the 1-D
+        # street corridor. Partition order: [window | non-window | leftover
+        # window] so the query slice is pure window and the ref-outlier
+        # slice is dominated by the rest of the street.
+        p0 = np.cross(big_pool[:, :3], big_pool[:, 3:])
+        ctr = np.median(p0, axis=0)
+        ext = float(np.linalg.norm(p0 - ctr, axis=1).max()) + 1e-6
+        anchor = p0[np.random.randint(len(p0))]
+        rho = np.random.uniform(0.12, 0.30) * ext
+        win = np.linalg.norm(p0 - anchor, axis=1) < rho
+        while win.sum() < 3 * _MIN_INLIERS and rho < 2.5 * ext:
+            rho *= 1.4
+            win = np.linalg.norm(p0 - anchor, axis=1) < rho
+        n_win = int(win.sum())
+        k = max(_MIN_INLIERS, min(k, int(0.7 * n_win)))
+        n_out1 = min(n_out1, max(0, n_win - k))
+        wi = np.where(win)[0]
+        ni = np.where(~win)[0]
+        big_pool = big_pool[np.concatenate([wi[:k + n_out1], ni,
+                                            wi[k + n_out1:]])]
+        n_out2 = min(n_out2, len(big_pool) - k - n_out1)
+
     inliers_ref = big_pool[:k].copy()
     out_q_ref   = big_pool[k:k + n_out1]
     out_r       = big_pool[k + n_out1:k + n_out1 + n_out2]
@@ -662,9 +764,10 @@ def _generate_pair() -> dict:
     # correspondences: perp median 0.32-0.35 m -> Rayleigh sigma ~0.28;
     # LiDAR reference edges are range-noisy too). Direction noise keeps the
     # v4 calibration (measured 5.4-6.0 deg median on KITTI — same as indoor).
-    perp_q_sigma = 0.28 if scenario == 'street' else _V4_PERP_SIGMA_M
-    perp_r_sigma = 0.08 if scenario == 'street' else _V4_REF_PERP_M
-    drift_scale  = 6.0 if scenario == 'street' else 1.0
+    _street = scenario in ('street', 'street_submap')
+    perp_q_sigma = 0.28 if _street else _V4_PERP_SIGMA_M
+    perp_r_sigma = 0.08 if _street else _V4_REF_PERP_M
+    drift_scale  = 6.0 if _street else 1.0
 
     if k > 0:
         # v4 fragmentation: each reference edge appears as 1–3 query fragments

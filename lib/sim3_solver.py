@@ -283,7 +283,8 @@ class Sim3Solver:
     def __init__(self, q_ends, r_ends,
                  prenorm_radius=2.5, scale_band=1.8,
                  seg_tau_m=(0.5, 1.0), seg_ang_deg=20.0,
-                 n_scale_starts=6, sigma_log_prior=0.6, device=None):
+                 n_scale_starts=6, sigma_log_prior=0.6, device=None,
+                 q_traj=None, r_traj=None):
         self.dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         q1, q2 = (np.asarray(a, float) for a in q_ends)
         r1, r2 = (np.asarray(a, float) for a in r_ends)
@@ -309,6 +310,13 @@ class Sim3Solver:
             return np.median(np.linalg.norm(p0 - np.median(p0, 0), axis=1))
         self.s0 = _spread(self.p0_r) / (_spread(self.p0_q) + 1e-12)
         self.s_lo, self.s_hi = self.s0 / scale_band, self.s0 * scale_band
+        self._scale_band = scale_band
+        self._s_lo0, self._s_hi0 = self.s_lo, self.s_hi
+        # additional prior centers (see pcm_scale_band in register): the
+        # extent-ratio prior assumes both maps cover the same AREA and is
+        # biased for submap queries; the PCM graph-median pairwise scale of
+        # matcher candidates is coverage-robust when the matcher is right.
+        self._s_centers = [self.s0]
         self.sigma_log = sigma_log_prior
         self.n_scale_starts = n_scale_starts
 
@@ -346,6 +354,21 @@ class Sim3Solver:
                                          device=self.dev)
         self._t_ref_d = torch.as_tensor(self.p_r[:, 3:], dtype=torch.float32,
                                         device=self.dev)
+        # optional keyframe trajectories (K,3): an independent witness that
+        # breaks the flip symmetry of repetitive line structure — under a
+        # room/facade flip the transformed query trajectory lands in space
+        # the reference camera never visited (measured on the benchmark:
+        # truth-pose agreement 0.35-0.70 vs 0.00-0.12 at flip poses)
+        self._traj_w = 0.0
+        self._t_q_traj = self._t_r_traj = None
+        if q_traj is not None and r_traj is not None \
+                and len(q_traj) >= 5 and len(r_traj) >= 5:
+            self._t_q_traj = torch.as_tensor(
+                np.asarray(q_traj, float) * self.alpha,
+                dtype=torch.float32, device=self.dev)
+            self._t_r_traj = torch.as_tensor(
+                np.asarray(r_traj, float) * self.alpha,
+                dtype=torch.float32, device=self.dev)
 
     @staticmethod
     def _canon6(L):
@@ -381,8 +404,18 @@ class Sim3Solver:
         return float((self.q_len * inl).sum() / (self.q_len.sum() + 1e-9))
 
     def prior(self, s):
-        return float(np.exp(-np.log(s / self.s0) ** 2
-                            / (2 * self.sigma_log ** 2)))
+        return float(self._sprior(np.asarray([s]))[0])
+
+    def _sprior(self, ss):
+        """Log-normal scale prior, max over the active centers (vectorized).
+        With the default single center this is the classic extent-ratio
+        prior; pcm_scale_band adds the candidate-pairwise-scale center."""
+        ss = np.asarray(ss, float)
+        out = np.zeros_like(ss)
+        for c in self._s_centers:
+            np.maximum(out, np.exp(-np.log(ss / c) ** 2
+                                   / (2 * self.sigma_log ** 2)), out=out)
+        return out
 
     def moment_score(self, R, t, s, tau_m, ang_deg=20.0, k=8):
         """Single-pose wrapper over moment_scores_batch (one tau)."""
@@ -481,6 +514,74 @@ class Sim3Solver:
             out[lo:lo + chunk] = sc
         return out.cpu().numpy()
 
+    def _traj_rot_candidates(self, n_grid=32768, n_peaks=12,
+                             taus=(0.2, 0.4, 0.8)):
+        """Trajectory-scored rotation candidates: score a uniform SO(3)
+        grid by directed trajectory chamfer (query keyframes transformed
+        with candidate R, scale s0-band sweep, centroid-aligned
+        translation) and refine the top peaks. Repetitive line structure
+        defeats the direction-population objectives (flips dominate), but
+        session trajectories are asymmetric — this recovers rotations the
+        line objectives never propose. No planarity/gravity assumption."""
+        if self._t_q_traj is None:
+            return []
+        dev = self.dev
+        qc = self._t_q_traj - self._t_q_traj.mean(0, keepdim=True)
+        rc = self._t_r_traj - self._t_r_traj.mean(0, keepdim=True)
+        scales = torch.as_tensor([self.s0 / 1.3, self.s0, self.s0 * 1.3],
+                                 dtype=torch.float32, device=dev)
+
+        def score_fn(Rs_t):
+            out = torch.zeros(len(Rs_t), device=dev)
+            for lo in range(0, len(Rs_t), 2048):
+                R_ = Rs_t[lo:lo + 2048]
+                tk = torch.einsum('pij,kj->pki', R_, qc)     # (p, K, 3)
+                best = None
+                for s_ in scales:
+                    d = torch.cdist(s_ * tk, rc[None].expand(len(R_), -1, -1)
+                                    ).min(-1).values
+                    sc = torch.zeros(len(R_), device=dev)
+                    for tau in taus:
+                        sc += (d < tau).float().mean(-1)
+                    best = sc if best is None else torch.maximum(best, sc)
+                out[lo:lo + 2048] = best
+            return out
+
+        Rs = torch.as_tensor(quat_to_mat(super_fibonacci(n_grid)),
+                             dtype=torch.float32, device=dev)
+        peaks = _t_peaks_and_refine(Rs, score_fn(Rs), score_fn, n_peaks,
+                                    dev)
+        return [(R_.cpu().numpy().astype(float), 'trajgrid', float(s))
+                for R_, s in peaks]
+
+    def traj_scores_batch(self, Rs, ts, ss, taus=(0.2, 0.4, 0.8),
+                          chunk=256):
+        """Trajectory-agreement term: sum over taus of the fraction of
+        transformed query keyframe centres within tau (normalized) of the
+        reference keyframe trajectory (directed chamfer). Requires both
+        trajectories (see __init__); returns zeros otherwise."""
+        P = len(Rs)
+        if self._t_q_traj is None:
+            return np.zeros(P)
+        Rt = torch.as_tensor(np.asarray(Rs), dtype=torch.float32,
+                             device=self.dev)
+        tt = torch.as_tensor(np.asarray(ts, np.float32).reshape(P, 3),
+                             device=self.dev)
+        st = torch.as_tensor(np.asarray(ss, np.float32), device=self.dev)
+        out = torch.zeros(P, device=self.dev)
+        for lo in range(0, P, chunk):
+            R_, t_, s_ = Rt[lo:lo + chunk], tt[lo:lo + chunk], st[lo:lo + chunk]
+            tk = (s_[:, None, None]
+                  * torch.einsum('pij,kj->pki', R_, self._t_q_traj)
+                  + t_[:, None, :])                       # (p, K, 3)
+            d = torch.cdist(tk, self._t_r_traj[None].expand(len(R_), -1, -1)
+                            ).min(-1).values              # (p, K)
+            sc = torch.zeros(len(R_), device=self.dev)
+            for tau in taus:
+                sc += (d < tau).float().mean(-1)
+            out[lo:lo + chunk] = sc
+        return out.cpu().numpy()
+
     def _verify_batch(self, Rs, ts, ss, verify, tau_ms, ang_deg):
         if verify == 'both':
             # one scale-free rule for indoor AND street maps: the moment
@@ -488,13 +589,17 @@ class Sim3Solver:
             # (indoors) but is arm-amplified into saturation outdoors;
             # the perp residual is arm-free. Their SUM lets whichever is
             # informative at the scene's scale dominate.
-            return (self.moment_scores_batch(Rs, ts, ss, tau_ms=tau_ms,
+            base = (self.moment_scores_batch(Rs, ts, ss, tau_ms=tau_ms,
                                              ang_deg=ang_deg)
                     + self.perp_scores_batch(Rs, ts, ss, tau_ms=tau_ms,
                                              ang_deg=ang_deg))
-        fn = (self.perp_scores_batch if verify == 'perp'
-              else self.moment_scores_batch)
-        return fn(Rs, ts, ss, tau_ms=tau_ms, ang_deg=ang_deg)
+        else:
+            fn = (self.perp_scores_batch if verify == 'perp'
+                  else self.moment_scores_batch)
+            base = fn(Rs, ts, ss, tau_ms=tau_ms, ang_deg=ang_deg)
+        if self._t_q_traj is not None and self._traj_w > 0:
+            base = base + self._traj_w * self.traj_scores_batch(Rs, ts, ss)
+        return base
 
     def sel_score(self, R, t, s, verify='segment', use_prior=True):
         if verify == 'moment':
@@ -600,6 +705,7 @@ class Sim3Solver:
         m = (informative & (w_ang > 0.3)
              & (s_ij > self.s_lo) & (s_ij < self.s_hi))
         s_med = float(np.median(s_ij[m])) if m.sum() > 10 else self.s0
+        self._pcm_s_med = s_med
         w_s = np.where(informative,
                        np.exp(-0.5 * ((ls - np.log(s_med)) / sigma_s) ** 2),
                        0.5)
@@ -771,8 +877,7 @@ class Sim3Solver:
         sc2 = self._verify_batch(Rs2, ts2, ss2, verify, verify_taus,
                                  verify_ang)
         if bound_scale:
-            sc2 = sc2 * np.exp(-np.log(ss2 / self.s0) ** 2
-                               / (2 * self.sigma_log ** 2))
+            sc2 = sc2 * self._sprior(ss2)
         j = int(np.argmax(sc2))
         return Rs2[j], ts2[j], float(ss2[j]), float(sc2[j])
 
@@ -781,7 +886,9 @@ class Sim3Solver:
                  verify='both', bound_scale=True, rot_grid=8000,
                  verify_taus=(0.1, 0.2, 0.4), verify_ang=20.0, pcm=True,
                  rot_hyp=6000, rot_peaks=8, polish=True, round2=True,
-                 beam_width=3, arbitrate=False):
+                 beam_width=3, arbitrate=False, pcm_scale_band=False,
+                 pcm_keep_frac=0.5, pcm_sigma_ang=6.0, pcm_sigma_s=0.25,
+                 polish_tau=0.2, traj_weight=0.0, traj_propose=False):
         """prob: (N_ref, N_qry) ScalePluckerNet probability matrix (torch
         or numpy) over self.p_r x self.p_q rows — the intended way to run
         the solver (prob=None falls back to correspondence-free seeding
@@ -811,6 +918,9 @@ class Sim3Solver:
                           out-of-distribution matcher inputs (it rescued
                           KITTI 06 where OOD candidates assemble a
                           mutually-consistent false consensus)."""
+        # trajectory-agreement verification term (active only when both
+        # keyframe trajectories were passed to __init__)
+        self._traj_w = float(traj_weight)
         if prob is not None and arbitrate:
             # SELF-ARBITRATION: the matcher is one evidence source among
             # several; when its candidates are out-of-distribution garbage
@@ -826,7 +936,14 @@ class Sim3Solver:
                                   verify_ang=verify_ang, pcm=pcm,
                                   rot_hyp=rot_hyp, rot_peaks=rot_peaks,
                                   polish=polish, round2=round2,
-                                  beam_width=beam_width, arbitrate=False)
+                                  beam_width=beam_width, arbitrate=False,
+                                  pcm_scale_band=pcm_scale_band,
+                                  pcm_keep_frac=pcm_keep_frac,
+                                  pcm_sigma_ang=pcm_sigma_ang,
+                                  pcm_sigma_s=pcm_sigma_s,
+                                  polish_tau=polish_tau,
+                                  traj_weight=traj_weight,
+                                  traj_propose=traj_propose)
             out_f = self.register(prob=None, topk=topk, refine=refine,
                                   verify=verify, bound_scale=bound_scale,
                                   rot_grid=rot_grid,
@@ -834,7 +951,13 @@ class Sim3Solver:
                                   verify_ang=verify_ang, pcm=pcm,
                                   rot_hyp=rot_hyp, rot_peaks=rot_peaks,
                                   polish=polish, round2=round2,
-                                  beam_width=beam_width, arbitrate=False)
+                                  beam_width=beam_width, arbitrate=False,
+                                  pcm_keep_frac=pcm_keep_frac,
+                                  pcm_sigma_ang=pcm_sigma_ang,
+                                  pcm_sigma_s=pcm_sigma_s,
+                                  polish_tau=polish_tau,
+                                  traj_weight=traj_weight,
+                                  traj_propose=traj_propose)
             if out_m[0] is None:
                 return out_f
             if out_f[0] is None:
@@ -857,9 +980,24 @@ class Sim3Solver:
             # scenes).
             pl_q_prop, pl_r_prop = pl_q_cand, pl_r_cand
             if pcm:
-                keep = self.pcm_filter(pl_q_cand, pl_r_cand)
+                # reset scale-band state (register may be called repeatedly)
+                self.s_lo, self.s_hi = self._s_lo0, self._s_hi0
+                self._s_centers = [self.s0]
+                keep = self.pcm_filter(pl_q_cand, pl_r_cand,
+                                       keep_frac=pcm_keep_frac,
+                                       sigma_ang=pcm_sigma_ang,
+                                       sigma_s=pcm_sigma_s)
                 pl_q_prop = pl_q_cand[:, keep]
                 pl_r_prop = pl_r_cand[:, keep]
+                if pcm_scale_band and np.isfinite(self._pcm_s_med) \
+                        and self._pcm_s_med > 0:
+                    # coverage-robust second scale hypothesis: the median
+                    # pairwise distance-ratio of matcher candidates (from
+                    # the PCM graph) does not assume equal map coverage.
+                    sp = self._pcm_s_med
+                    self._s_centers = [self.s0, sp]
+                    self.s_lo = min(self.s_lo, sp / self._scale_band)
+                    self.s_hi = max(self.s_hi, sp * self._scale_band)
             cand_dq, cand_dr = pl_q_cand[3:], pl_r_cand[3:]
             m = min(5, pt.shape[0])
             pv, pi = torch.topk(pt, k=m, dim=0)
@@ -884,6 +1022,13 @@ class Sim3Solver:
             pair_dq=pair_dq, pair_dr=pair_dr, pair_w=pair_w,
             cand_dq=cand_dq, cand_dr=cand_dr, n_hyp=rot_hyp,
             n_grid=rot_grid, n_peaks=rot_peaks, device=self.dev)
+        if self._t_q_traj is not None and self._traj_w > 0 and traj_propose:
+            # EXPERIMENTAL (off by default — measured net-harmful on the
+            # 7-Scenes probe set: the trajectory chamfer is too broad a
+            # rotation objective for compact handheld trajectories, its
+            # wrong peaks displace good beam entries): trajectory-scored
+            # rotation candidates.
+            cands = cands + self._traj_rot_candidates()
 
         cq = np.median(self.p0_q, axis=0)
         cr = np.median(self.p0_r, axis=0)
@@ -895,25 +1040,37 @@ class Sim3Solver:
         if not refine and verify in ('moment', 'perp', 'both'):
             # fully batched path: gather every candidate pose, score all in
             # one fused GPU pass (no per-pose python loops, no trees)
-            Rs_all, ts_all, ss_all = [], [], []
+            Rs_all, ts_all, ss_all, src_all = [], [], [], []
             for R, src, _ in cands:
                 if pl_q_cand is not None:
                     for t, sc_ in self._ts_proposals(
                             R, pl_q_prop, pl_r_prop, bound_scale=bound_scale):
                         Rs_all.append(R); ts_all.append(t); ss_all.append(sc_)
+                        src_all.append(src)
                 for s0 in np.geomspace(sweep_lo, sweep_hi,
                                        self.n_scale_starts):
                     Rs_all.append(R)
                     ts_all.append(cr - s0 * (R @ cq))
                     ss_all.append(float(s0))
+                    src_all.append(src)
+                    if self._t_q_traj is not None and self._traj_w > 0 \
+                            and traj_propose:
+                        # trajectory-centroid-aligned start (tied to the
+                        # experimental trajectory proposals above)
+                        Rs_all.append(R)
+                        ts_all.append(
+                            self._t_r_traj.mean(0).cpu().numpy()
+                            - s0 * (R @ self._t_q_traj.mean(0).cpu()
+                                    .numpy()))
+                        ss_all.append(float(s0))
+                        src_all.append(src)
             if not Rs_all:
                 return None, None, None, dict(score=-1.0)
             ss_np = np.asarray(ss_all)
             scores = self._verify_batch(Rs_all, ts_all, ss_np, verify,
                                         verify_taus, verify_ang)
             if bound_scale:
-                scores = scores * np.exp(-np.log(ss_np / self.s0) ** 2
-                                         / (2 * self.sigma_log ** 2))
+                scores = scores * self._sprior(ss_np)
             order = np.argsort(-scores)
             beam = []          # top rotation-distinct poses for round 2
             for i in order:
@@ -923,6 +1080,22 @@ class Sim3Solver:
                                  float(scores[i])))
                     if len(beam) >= beam_width:
                         break
+            # trajectory-derived rotations are proposed with CRUDE (t, s)
+            # (centroid starts), so they rarely out-score polished flip
+            # poses in round 1 — force the best of them into the beam so
+            # round-2 re-association gives them a refined (t, s) before
+            # the final argmax (a fair polished-vs-polished comparison)
+            n_traj_beam = 0
+            for i in order:
+                if n_traj_beam >= 2:
+                    break
+                if src_all[i] != 'trajgrid':
+                    continue
+                if all(_rot_angle_deg(Rs_all[i], Rb) > 15.0
+                       for Rb, _, _, _ in beam):
+                    beam.append((Rs_all[i], ts_all[i], ss_all[i],
+                                 float(scores[i])))
+                    n_traj_beam += 1
             best = beam[0]
         else:
             for R, src, _ in cands:
@@ -964,7 +1137,8 @@ class Sim3Solver:
                     best2 = r2
             R, t, s, sc = best2
         if polish and verify in ('moment', 'perp', 'both') and not refine:
-            Rn, tn, sn = self._polish(R, t, s, verify_taus, verify_ang)
+            Rn, tn, sn = self._polish(R, t, s, verify_taus, verify_ang,
+                                      tau_assoc=polish_tau)
             sc_new = float(self._verify_batch(
                 [Rn], [tn], np.asarray([sn]), verify, verify_taus,
                 verify_ang)[0])
