@@ -22,8 +22,11 @@ forward pass — certify A/B claims in the SAME session):
   0. scene pre-normalization — both clouds scaled so the reference median
      p0-radius (p0 = m x d) is 2.5 m; extent-ratio scale prior s0 with
      band s0*[1/1.8, 1.8] (without it: s->0 collapse attractor).
-  1. rotation candidates — 6k batched 2-pair Procrustes hypotheses + 8k
-     uniform SO(3) grid, scored under a matcher-weighted pair objective
+  1. rotation candidates — 6k batched 2-pair Procrustes hypotheses
+     (matcher-driven path: NO uniform SO(3) grid — an added grid is
+     neutral-to-harmful, 20/26 vs 20/25 @5/10deg; the grid is reserved for
+     the correspondence-free mode, where absent matches it is the actual
+     hypothesis engine), scored under a matcher-weighted pair objective
      AND a correspondence-free direction-distribution objective (hinge
      kernels); top-8 peaks each, ~14 after dedup. Never top-1: Manhattan
      flips dominate every direction-only objective.
@@ -200,7 +203,7 @@ def rotation_candidates_fast(d_q, w_q, d_r, w_r,
                              n_hyp=24000, n_grid=16000, n_peaks=12,
                              kernel_deg=8.0, dedup_deg=5.0,
                              q_bins=192, r_bins=384,
-                             seed=0, device=None):
+                             seed=0, device=None, hyp_k=2):
     """Online rotation candidate set: same objectives as rotation_candidates
     but RANSAC-sampled 2-pair hypotheses + fine-binned hinge-kernel scoring
     on the GPU (torch; numpy in/out, no scipy). ~40-120 ms on GPU.
@@ -242,8 +245,36 @@ def rotation_candidates_fast(d_q, w_q, d_r, w_r,
         U = U.clone()
         U[bad, :, -1] *= -1
         R[bad] = U[bad] @ Vt[bad]
+    if hyp_k > 2 and K >= hyp_k:
+        # k-pair hypotheses (user idea 2026-07-20): the 2-pair solve seeds
+        # the sign assignment, then each hypothesis is re-solved over k
+        # sampled candidate pairs with EM-style sign alignment — averages
+        # direction noise; contaminated samples become bad hypotheses that
+        # verification (and PCM on the proposal side) discards anyway.
+        i_f, j_f = i, j                              # post i!=j filter
+        extra = rng.integers(0, K, (len(i_f), hyp_k - 2))
+        # member sets per hypothesis, tiled over the 4 sign blocks, then
+        # filtered like the seed hypotheses
+        mem = np.concatenate([i_f[:, None], j_f[:, None], extra], axis=1)
+        mem4 = np.tile(mem, (4, 1))[good.cpu().numpy()]
+        dq_full = f32(hq[:, mem4]).permute(1, 0, 2)   # (M, 3, k)
+        dr_full = f32(hr[:, mem4]).permute(1, 0, 2)
+        for _ in range(2):
+            Rd = torch.einsum('mij,mjk->mik', R, dq_full)
+            sgn = torch.sign((Rd * dr_full).sum(1))   # (M, k)
+            sgn[sgn == 0] = 1.0
+            Hk = torch.einsum('mik,mjk->mij', dr_full,
+                              dq_full * sgn[:, None, :])
+            Uk, _, Vtk = torch.linalg.svd(Hk)
+            Rk = Uk @ Vtk
+            badk = torch.linalg.det(Rk) < 0
+            if badk.any():
+                Uk = Uk.clone()
+                Uk[badk, :, -1] *= -1
+                Rk[badk] = Uk[badk] @ Vtk[badk]
+            R = Rk
     Rs = [R]
-    if n_grid > 0:                                    # small uniform insurance
+    if n_grid > 0:                                    # corr-free hypothesis engine
         Rs.append(f32(quat_to_mat(super_fibonacci(n_grid))))
     Rs = torch.cat(Rs, dim=0)
 
@@ -354,6 +385,7 @@ class Sim3Solver:
                                          device=self.dev)
         self._t_ref_d = torch.as_tensor(self.p_r[:, 3:], dtype=torch.float32,
                                         device=self.dev)
+        self._t_ref_g24 = None       # lazy (only if verify='grass' used)
         # optional keyframe trajectories (K,3): an independent witness that
         # breaks the flip symmetry of repetitive line structure — under a
         # room/facade flip the transformed query trajectory lands in space
@@ -514,6 +546,74 @@ class Sim3Solver:
             out[lo:lo + chunk] = sc
         return out.cpu().numpy()
 
+    @staticmethod
+    def _g24_basis_torch(m, d):
+        """Affine-Grassmannian G(2,4) basis (Shin et al. Y_z embedding),
+        batched: m, d are (..., 3); returns (..., 4, 2) orthonormal bases.
+        col0 = [p0; 1]/||.|| (p0 = m x d), col1 = [d; 0] Gram-Schmidt'd."""
+        dn = d / (d.norm(dim=-1, keepdim=True) + 1e-12)
+        p0 = torch.cross(m, dn, dim=-1)
+        one = torch.ones_like(p0[..., :1])
+        zero = torch.zeros_like(p0[..., :1])
+        col0 = torch.cat([p0, one], dim=-1)
+        col1 = torch.cat([dn, zero], dim=-1)
+        col0 = col0 / (col0.norm(dim=-1, keepdim=True) + 1e-12)
+        col1 = col1 - col0 * (col1 * col0).sum(-1, keepdim=True)
+        col1 = col1 / (col1.norm(dim=-1, keepdim=True) + 1e-12)
+        return torch.stack([col0, col1], dim=-1)          # (..., 4, 2)
+
+    def grass_scores_batch(self, Rs, ts, ss, tau_ms=(0.1, 0.2, 0.4),
+                           ang_deg=20.0, k=8, chunk=32):
+        """Grassmannian verification: inlier if the transformed query line's
+        G(2,4) geodesic distance (principal-angle Frobenius norm, radians)
+        to a p0-nearest reference line is below tau. ONE coupled metric for
+        position AND direction (unlike moment/perp + a separate angle gate);
+        the [p0;1] homogeneous normalization damps position sensitivity at
+        large radius — neither Euclidean-moment (arm-amplified) nor arm-free
+        perp, but a manifold geodesic. `ang_deg` unused (kept for the
+        uniform _verify_batch signature)."""
+        P = len(Rs)
+        if self._t_ref_g24 is None:
+            self._t_ref_g24 = self._g24_basis_torch(
+                torch.as_tensor(self.p_r[:, :3], dtype=torch.float32,
+                                device=self.dev),
+                torch.as_tensor(self.p_r[:, 3:], dtype=torch.float32,
+                                device=self.dev))          # (M, 4, 2)
+        Rt = torch.as_tensor(np.asarray(Rs), dtype=torch.float32,
+                             device=self.dev)
+        tt = torch.as_tensor(np.asarray(ts, np.float32).reshape(P, 3),
+                             device=self.dev)
+        st = torch.as_tensor(np.asarray(ss, np.float32), device=self.dev)
+        out = torch.zeros(P, device=self.dev)
+        wsum = self._t_qlen.sum() + 1e-9
+        for lo in range(0, P, chunk):
+            R_, t_, s_ = Rt[lo:lo + chunk], tt[lo:lo + chunk], st[lo:lo + chunk]
+            d_out = torch.einsum('pij,nj->pni', R_, self._t_qd)
+            m_out = s_[:, None, None] * torch.einsum('pij,nj->pni', R_,
+                                                     self._t_qm) \
+                + torch.cross(t_[:, None, :].expand_as(d_out), d_out, dim=-1)
+            p0 = torch.cross(m_out, d_out, dim=-1)          # (p, N, 3)
+            p, N, _ = p0.shape
+            nn = torch.cdist(p0.reshape(-1, 3), self._t_ref_p0).topk(
+                k, largest=False).indices                   # (p*N, k)
+            Qq = self._g24_basis_torch(m_out, d_out)         # (p, N, 4, 2)
+            Qr = self._t_ref_g24[nn].reshape(p, N, k, 4, 2)
+            # M = Qq^T Qr  -> (p, N, k, 2, 2); analytic 2x2 singular values
+            M = torch.einsum('pnai,pnkaj->pnkij', Qq, Qr)
+            F = (M ** 2).sum((-1, -2))                       # ||M||_F^2
+            det = M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
+            disc = (F * F - 4 * det * det).clamp_min(0.0).sqrt()
+            s1 = ((F + disc) * 0.5).clamp(0.0, 1.0).sqrt()
+            s2 = ((F - disc) * 0.5).clamp(0.0, 1.0).sqrt()
+            th = (torch.arccos(s1.clamp(max=1.0)) ** 2
+                  + torch.arccos(s2.clamp(max=1.0)) ** 2).sqrt()   # (p,N,k)
+            gmin = th.min(-1).values                         # (p, N)
+            sc = torch.zeros(p, device=self.dev)
+            for tau in tau_ms:
+                sc += ((gmin < tau) * self._t_qlen).sum(-1) / wsum
+            out[lo:lo + chunk] = sc
+        return out.cpu().numpy()
+
     def _traj_rot_candidates(self, n_grid=32768, n_peaks=12,
                              taus=(0.2, 0.4, 0.8)):
         """Trajectory-scored rotation candidates: score a uniform SO(3)
@@ -593,6 +693,9 @@ class Sim3Solver:
                                              ang_deg=ang_deg)
                     + self.perp_scores_batch(Rs, ts, ss, tau_ms=tau_ms,
                                              ang_deg=ang_deg))
+        elif verify == 'grass':
+            base = self.grass_scores_batch(Rs, ts, ss, tau_ms=tau_ms,
+                                           ang_deg=ang_deg)
         else:
             fn = (self.perp_scores_batch if verify == 'perp'
                   else self.moment_scores_batch)
@@ -883,12 +986,13 @@ class Sim3Solver:
 
     # ── entry point ────────────────────────────────────────────────────────
     def register(self, prob=None, topk=200, refine=False,
-                 verify='both', bound_scale=True, rot_grid=8000,
+                 verify='both', bound_scale=True, rot_grid=None,
                  verify_taus=(0.1, 0.2, 0.4), verify_ang=20.0, pcm=True,
                  rot_hyp=6000, rot_peaks=8, polish=True, round2=True,
                  beam_width=3, arbitrate=False, pcm_scale_band=False,
                  pcm_keep_frac=0.5, pcm_sigma_ang=6.0, pcm_sigma_s=0.25,
-                 polish_tau=0.2, traj_weight=0.0, traj_propose=False):
+                 polish_tau=0.2, traj_weight=0.0, traj_propose=False,
+                 rot_hyp_k=2):
         """prob: (N_ref, N_qry) ScalePluckerNet probability matrix (torch
         or numpy) over self.p_r x self.p_q rows — the intended way to run
         the solver (prob=None falls back to correspondence-free seeding
@@ -943,7 +1047,8 @@ class Sim3Solver:
                                   pcm_sigma_s=pcm_sigma_s,
                                   polish_tau=polish_tau,
                                   traj_weight=traj_weight,
-                                  traj_propose=traj_propose)
+                                  traj_propose=traj_propose,
+                                  rot_hyp_k=rot_hyp_k)
             out_f = self.register(prob=None, topk=topk, refine=refine,
                                   verify=verify, bound_scale=bound_scale,
                                   rot_grid=rot_grid,
@@ -957,7 +1062,8 @@ class Sim3Solver:
                                   pcm_sigma_s=pcm_sigma_s,
                                   polish_tau=polish_tau,
                                   traj_weight=traj_weight,
-                                  traj_propose=traj_propose)
+                                  traj_propose=traj_propose,
+                                  rot_hyp_k=rot_hyp_k)
             if out_m[0] is None:
                 return out_f
             if out_f[0] is None:
@@ -1016,12 +1122,23 @@ class Sim3Solver:
             nnr = torch.cdist(t_qm, self._t_ref_mid).argmin(1).cpu().numpy()
             cand_dr = self.p_r[nnr, 3:].T.astype(float)
 
+        # rot_grid=None (default) is AUTO: the matcher-driven path proposes
+        # rotations purely from 2-pair Procrustes on matcher candidates plus
+        # direction-distribution peaks — NO uniform grid (measured neutral-to-
+        # better than a grid: 20/26 vs 20/25 @5/10deg on the 37-pair set).
+        # The uniform SO(3) grid is retained ONLY for the correspondence-free
+        # path, where — with no matcher pairs — it is the actual hypothesis
+        # engine, not insurance. An explicit int always overrides.
+        n_grid_eff = rot_grid
+        if rot_grid is None:
+            n_grid_eff = 0 if prob is not None else 16000
         cands = rotation_candidates_fast(
             self.p_q[:, 3:].T.astype(float), self.q_len,
             self.p_r[:, 3:].T.astype(float), self.ref_len,
             pair_dq=pair_dq, pair_dr=pair_dr, pair_w=pair_w,
             cand_dq=cand_dq, cand_dr=cand_dr, n_hyp=rot_hyp,
-            n_grid=rot_grid, n_peaks=rot_peaks, device=self.dev)
+            n_grid=n_grid_eff, n_peaks=rot_peaks, device=self.dev,
+            hyp_k=rot_hyp_k)
         if self._t_q_traj is not None and self._traj_w > 0 and traj_propose:
             # EXPERIMENTAL (off by default — measured net-harmful on the
             # 7-Scenes probe set: the trajectory chamfer is too broad a
@@ -1037,7 +1154,7 @@ class Sim3Solver:
                               else (self.s0 / 5.0, self.s0 * 5.0))
         best = (None, None, None, -1.0)
         beam = []
-        if not refine and verify in ('moment', 'perp', 'both'):
+        if not refine and verify in ('moment', 'perp', 'both', 'grass'):
             # fully batched path: gather every candidate pose, score all in
             # one fused GPU pass (no per-pose python loops, no trees)
             Rs_all, ts_all, ss_all, src_all = [], [], [], []
@@ -1120,7 +1237,7 @@ class Sim3Solver:
         R, t, s, sc = best
         if R is None:
             return None, None, None, dict(score=-1.0)
-        if round2 and verify in ('moment', 'perp', 'both') and not refine:
+        if round2 and verify in ('moment', 'perp', 'both', 'grass') and not refine:
             # position-aware re-proposal round, run as a BEAM over the top
             # rotation-distinct poses: associate query -> ref by foot-point
             # proximity AT each pose, PCM-filter, re-solve (t, s) at the
@@ -1136,7 +1253,7 @@ class Sim3Solver:
                 if r2[3] > best2[3]:
                     best2 = r2
             R, t, s, sc = best2
-        if polish and verify in ('moment', 'perp', 'both') and not refine:
+        if polish and verify in ('moment', 'perp', 'both', 'grass') and not refine:
             Rn, tn, sn = self._polish(R, t, s, verify_taus, verify_ang,
                                       tau_assoc=polish_tau)
             sc_new = float(self._verify_batch(

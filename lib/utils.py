@@ -1,7 +1,7 @@
 import os
 import logging
 import time
-from model.model_plucker import *
+from .model import *
 
 MODELS = {}
 MODELS["PluckerNetKnn"] = PluckerNetKnn

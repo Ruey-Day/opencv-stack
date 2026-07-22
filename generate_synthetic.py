@@ -23,9 +23,9 @@ Each split uses the standard 6-pickle format:
 
 Usage
 -----
-python scripts/generate_synthetic.py
-python scripts/generate_synthetic.py --n_train 500000 --n_valid 5000
-python scripts/generate_synthetic.py --n_train 200000 --workers 8 --seed 123
+python generate_synthetic.py
+python generate_synthetic.py --n_train 500000 --n_valid 5000
+python generate_synthetic.py --n_train 200000 --workers 8 --seed 123
 """
 import os
 import sys
@@ -36,7 +36,7 @@ import numpy as np
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
-_ROOT = Path(__file__).parent.parent
+_ROOT = Path(__file__).parent
 sys.path.insert(0, str(_ROOT))
 
 
@@ -68,7 +68,7 @@ _V4_REF_PERP_M    = 0.02
 _V4_FRAG_P        = (0.65, 0.25, 0.10)  # P(1|2|3 query fragments per real edge)
 _V4_SIGN_FLIP     = 0.5      # SLAM endpoint order is arbitrary → ~50% flipped
 
-_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'flip_room']
+_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'collision']
 # v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
 # distribution otherwise unchanged for retention when fine-tuning from v5).
 # v7: add 'street_submap' at 0.12 (asymmetric spatial coverage — the KITTI
@@ -76,9 +76,12 @@ _SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhatta
 # fraction of the reference's AREA); previous weights scaled by 0.88.
 # v8: add 'flip_room' at 0.10 (repetitive-room flip alias — the measured
 # chess/seq05-class matcher blindness), previous weights scaled by 0.90.
-_SCENARIO_P = np.array([0.0817, 0.0613, 0.0613, 0.0749, 0.0409, 0.0954,
-                        0.0613, 0.0613, 0.0817, 0.0613, 0.1109, 0.108,
-                        0.10])
+# v9: flip_room 0.14. v10: flip_room REPLACED by 'collision' at 0.16
+# (measured failure = learned-descriptor collision on dense similar
+# lines, NOT rotational symmetry; flip_room modeled the wrong thing).
+_SCENARIO_P = np.array([0.0756, 0.0567, 0.0567, 0.0693, 0.0378, 0.0882,
+                        0.0567, 0.0567, 0.0945, 0.0567, 0.1029, 0.1008,
+                        0.16])   # adversarial also bumped 0.078->0.0945
 _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()   # exact normalization
 
 
@@ -432,17 +435,68 @@ def _apply_drift(lines: np.ndarray, n_groups: int = 4, sigma: float = 0.10) -> n
 
 
 def _make_confuser_lines(n: int, ref_lines: np.ndarray, spread: float = 0.08,
-                         pos_range: float = 3.0) -> np.ndarray:
-    """Outlier lines with directions near those in ref_lines — structurally confusing."""
+                         pos_range: float = 3.0,
+                         moment_dup: bool = False) -> np.ndarray:
+    """Outlier lines with directions near those in ref_lines — structurally
+    confusing. With moment_dup=True (v10), the confuser is a near-DUPLICATE:
+    same direction AND a moment close to the source line (small perpendicular
+    foot-point offset), so its full 6D descriptor collides with a real line
+    while it has NO true correspondence. This is the measured real-map
+    failure — the learned descriptor produces spurious matches on
+    locally-similar lines — so it forces global-context discrimination."""
     if n == 0 or len(ref_lines) == 0:
         return _make_outliers(n, pos_range=pos_range)
-    # Sample directions close to random reference directions + small noise
     idx = np.random.randint(0, len(ref_lines), n)
     d = ref_lines[idx, 3:].copy()
     d += np.random.randn(n, 3).astype(np.float32) * spread
     d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+    if moment_dup:
+        # near-duplicate: shift the source foot point by a modest perpendicular
+        # offset (line stays "nearby and parallel" — a strong descriptor twin)
+        m0, d0 = ref_lines[idx, :3], ref_lines[idx, 3:]
+        p0 = np.cross(d0, m0)                          # foot of perpendicular
+        off = np.random.randn(n, 3).astype(np.float32)
+        off -= (off * d).sum(1, keepdims=True) * d
+        off /= np.linalg.norm(off, axis=1, keepdims=True) + 1e-9
+        off *= np.random.uniform(0.15, 0.7, (n, 1)).astype(np.float32)
+        return np.concatenate([np.cross(p0 + off, d), d],
+                              axis=1).astype(np.float32)
     p = np.random.uniform(-pos_range, pos_range, (n, 3)).astype(np.float32)
     return np.concatenate([np.cross(p, d), d], axis=1).astype(np.float32)
+
+
+def _make_collision_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
+    """v10 dense-room pool: 2-4 wall/floor planes, each carrying many lines
+    whose directions vary SMOOTHLY across a ~25deg arc (graded similarity,
+    not discrete clusters) at dense positions — the locally-ambiguous,
+    highly-similar line structure of a real cluttered room (chess/stairs),
+    where the measured failure is learned-descriptor collision, NOT rotational
+    symmetry (ref self-similarity is low, 0.01-0.03). Forces the network to
+    separate near-identical lines by global moment context."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    n_planes = np.random.randint(2, 5)
+    parts = []
+    per = n // n_planes + 1
+    for _ in range(n_planes):
+        normal = np.random.randn(3); normal /= np.linalg.norm(normal) + 1e-9
+        u = np.random.randn(3); u -= u.dot(normal) * normal
+        u /= np.linalg.norm(u) + 1e-9
+        v = np.cross(normal, u)
+        # a dominant in-plane axis with graded angular spread (~25 deg arc)
+        base_ang = np.random.uniform(0, 2 * np.pi)
+        angs = base_ang + np.random.uniform(-0.22, 0.22, per)  # ~+-12.5 deg
+        d = (np.cos(angs)[:, None] * u + np.sin(angs)[:, None] * v)
+        d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+        a = np.random.uniform(-pos_range, pos_range, per)
+        b = np.random.uniform(-pos_range, pos_range, per)
+        off = np.random.uniform(-0.3, 0.3, per)        # slight off-plane
+        p = (a[:, None] * u + b[:, None] * v
+             + off[:, None] * normal).astype(np.float32)
+        parts.append(np.concatenate([np.cross(p, d), d.astype(np.float32)],
+                                    axis=1).astype(np.float32))
+    pool = np.concatenate(parts, axis=0)
+    return pool[np.random.permutation(len(pool))].astype(np.float32)[:n]
 
 
 def _make_flip_room_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
@@ -456,20 +510,32 @@ def _make_flip_room_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
     stairs failure mode (matcher P@200 = 0 despite 1,000 GT pairs)."""
     if n == 0:
         return np.zeros((0, 6), np.float32)
-    n_base = max(8, int(n * np.random.uniform(0.40, 0.55)))
+    # v9 recalibration (v8's exact 2deg/5cm twin made the matcher learn a
+    # brittle "reject all symmetric matches" rule -> real-pair REGRESSION,
+    # zero transfer). Fixes: (a) the twin is a NEAR-flip, angle jittered off
+    # 90/180 by up to +-12deg (real rooms are not exactly orthogonal);
+    # (b) heavy, variable geometric noise (4-11deg / 8-22cm) so twins are
+    # convincing-but-imperfect, not artificial duplicates; (c) more partial
+    # (45-75% of base) and a LARGER asymmetric minority — the disambiguating
+    # signal the model must learn to weight.
+    n_base = max(8, int(n * np.random.uniform(0.35, 0.50)))
     base = _make_manhattan_world(n_base, pos_range=pos_range)
-    ang = np.deg2rad(np.random.choice([90.0, 180.0, 270.0]))
-    c, s = np.cos(ang), np.sin(ang)
-    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
-                  dtype=np.float32)
-    # rotate the copy about the room centre (origin) + small jitter so the
-    # twin is convincing but not identical
+    ang = np.deg2rad(np.random.choice([90.0, 180.0, 270.0])
+                     + np.random.uniform(-12.0, 12.0))
+    # near-vertical flip axis, slightly tilted (real rooms aren't gravity-exact)
+    axis = np.array([np.random.uniform(-0.12, 0.12),
+                     np.random.uniform(-0.12, 0.12), 1.0])
+    axis /= np.linalg.norm(axis)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]])
+    Rz = (np.eye(3) + np.sin(ang) * K
+          + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
     m, d = base[:, :3], base[:, 3:]
-    d2 = (Rz @ d.T).T
-    m2 = (Rz @ m.T).T
-    twin = np.concatenate([m2, d2], axis=1).astype(np.float32)
-    twin = _physical_noise(twin, 2.0, 0.05)
-    n_copy = int(len(twin) * np.random.uniform(0.6, 0.95))
+    twin = np.concatenate([(Rz @ m.T).T, (Rz @ d.T).T],
+                          axis=1).astype(np.float32)
+    twin = _physical_noise(twin, np.random.uniform(4.0, 11.0),
+                           np.random.uniform(0.08, 0.22))
+    n_copy = int(len(twin) * np.random.uniform(0.45, 0.75))
     twin = twin[np.random.choice(len(twin), n_copy, replace=False)]
     # asymmetric minority: unique clutter that breaks the symmetry
     n_rest = max(0, n - len(base) - len(twin))
@@ -484,8 +550,8 @@ def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     if n == 0:
         return np.zeros((0, 6), np.float32)
 
-    if pool_type == 'flip_room':
-        return _make_flip_room_pool(n)
+    if pool_type == 'collision':
+        return _make_collision_pool(n)
 
     if pool_type in ('street', 'street_submap'):
         # v6: no shuffle here — _make_street_pool's weighted order IS the
@@ -665,18 +731,23 @@ def _generate_pair() -> dict:
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street_submap'
-    elif scenario == 'flip_room':
-        # v8: repetitive room (see _make_flip_room_pool). Sizes/noise like
-        # 'room'; confusers OFF (the pool IS its own confuser).
-        n2           = np.random.randint(150, 900)
-        n1           = max(50, min(int(n2 * np.random.uniform(0.4, 2.0)),
-                                   900))
-        overlap_frac = float(np.random.beta(3.0, 2.5))
+    elif scenario == 'collision':
+        # v10 dense-room descriptor-collision (see _make_collision_pool):
+        # many locally-similar lines + heavy near-DUPLICATE query confusers
+        # (moment_dup). Targets the measured chess/seq05 failure: the matcher
+        # produces spurious flip-consistent matches because local descriptors
+        # collide, not because the room is symmetric. High density, moderate
+        # overlap, confusers ON.
+        n2           = np.random.randint(300, 1100)
+        n1           = max(80, min(int(n2 * np.random.uniform(0.4, 2.0)),
+                                   1100))
+        overlap_frac = float(np.random.beta(2.5, 3.0))
         noise1       = float(np.exp(np.random.uniform(np.log(0.005),
                                                       np.log(0.12))))
         noise2       = float(np.exp(np.random.uniform(np.log(0.001),
                                                       np.log(0.04))))
-        pool_type    = 'flip_room'
+        use_confusers = True
+        pool_type    = 'collision'
     else:  # corridor
         # Corridor / stairwell — 1-2 dominant directions, higher noise
         n2           = np.random.randint(50, 450)
@@ -803,7 +874,7 @@ def _generate_pair() -> dict:
         n_reg  = n_out1 - n_conf
         out_q_reg  = (_apply_sim3(out_q_ref[:n_reg], s_i, R_i, t_i) if n_reg > 0
                       else np.zeros((0, 6), np.float32))
-        out_q_conf = _make_confuser_lines(n_conf, inliers_q) if n_conf > 0 else np.zeros((0, 6), np.float32)
+        out_q_conf = _make_confuser_lines(n_conf, inliers_q, moment_dup=(scenario == 'collision')) if n_conf > 0 else np.zeros((0, 6), np.float32)
         out_q_parts = [p for p in [out_q_reg, out_q_conf] if len(p) > 0]
         out_q = np.concatenate(out_q_parts) if out_q_parts else np.zeros((0, 6), np.float32)
     else:

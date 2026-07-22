@@ -69,7 +69,8 @@ class prob_mat_sinkhorn(nn.Module):
 
 
 class conv_in_seq_direction_moment_knn(nn.Module):
-    def __init__(self, out_channel: int, in_channel: int = 6):
+    def __init__(self, out_channel: int, in_channel: int = 6,
+                 dual_knn: bool = False):
         super().__init__()
         half = out_channel // 2
 
@@ -78,17 +79,29 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         self.mlp_direction  = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_moment     = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_merged     = MLP([out_channel, out_channel, out_channel])
+        # dual_knn: build the moment sub-network's graph in MOMENT (position)
+        # space instead of reusing the direction-space neighbourhood. Adds NO
+        # parameters (same convs, different neighbour indices), so a
+        # direction-only checkpoint loads unchanged and only the moment
+        # aggregation neighbourhood differs. Fixes the measured descriptor
+        # collision: with a shared direction graph, two distinct lines that
+        # happen to point similarly are "neighbours" even when far apart, so
+        # the moment features cannot separate them.
+        self.dual_knn = dual_knn
 
     def forward(self, x):
-        # Compute knn index once on direction subspace, reuse for moment subspace
         dir_feat = x[:, :3, :]
         idx = knn(dir_feat, k=min(10, dir_feat.size(-1)))
-
         x_dir = self.mlp_direction(
             self.conv_direction(get_graph_feature(dir_feat, idx=idx)).mean(dim=-1))
-        x_mom = self.mlp_moment(
-            self.conv_moment(get_graph_feature(x[:, 3:, :], idx=idx)).mean(dim=-1))
-
+        if self.dual_knn:
+            mom_feat = x[:, 3:, :]
+            idx_m = knn(mom_feat, k=min(10, mom_feat.size(-1)))
+            x_mom = self.mlp_moment(
+                self.conv_moment(get_graph_feature(mom_feat, idx=idx_m)).mean(dim=-1))
+        else:
+            x_mom = self.mlp_moment(
+                self.conv_moment(get_graph_feature(x[:, 3:, :], idx=idx)).mean(dim=-1))
         return self.mlp_merged(torch.cat([x_dir, x_mom], dim=1))
 
 
@@ -159,7 +172,9 @@ class FeatureExtractorGraph(nn.Module):
     def __init__(self, config, in_channel):
         super().__init__()
         nc = config['net_nchannel']
-        self.conv_in    = conv_in_seq_direction_moment_knn(nc, in_channel=in_channel)
+        dual_knn = bool(config['dual_knn']) if 'dual_knn' in config else False
+        self.conv_in    = conv_in_seq_direction_moment_knn(
+            nc, in_channel=in_channel, dual_knn=dual_knn)
         self.gnn        = SpatialAttentionalGNN(nc, config['GNN_layers'])
         self.final_proj = nn.Conv1d(nc, nc, kernel_size=1, bias=True)
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)

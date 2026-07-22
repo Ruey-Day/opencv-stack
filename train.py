@@ -94,6 +94,9 @@ def parse_args():
                    help='Warm-start from checkpoint (strict=False)')
     p.add_argument('--resume',   default=None,
                    help='Resume training from checkpoint')
+    p.add_argument('--dual_knn', action='store_true',
+                   help='moment sub-network aggregates over a MOMENT-space '
+                        'KNN graph (adds no params; warm-start compatible)')
 
     return p.parse_args()
 
@@ -113,6 +116,7 @@ def main():
         GNN_layers         = ['self', 'cross'] * 6,
         net_lambda         = 0.1,
         net_maxiter        = 30,
+        dual_knn           = args.dual_knn,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',

@@ -29,13 +29,11 @@ The repo is self-contained (network in `model/`, solver in `lib/`).
 ```
 lib/sim3_solver.py     THE Sim(3) estimator — one self-contained file
                        (also contains the max-inlier RANSAC baseline)
+lib/model.py           PluckerNetKnn network (unchanged from PlueckerNet)
 lib/{trainer,loss,dataloader,utils}.py   training machinery
-model/model_plucker.py PluckerNetKnn (unchanged from PlueckerNet)
-scripts/generate_synthetic.py   calibrated Sim(3) pair generator (11 scenarios)
-scripts/make_sim3_from_se3.py   add random scales to an SE(3) pkl dataset
+generate_synthetic.py  calibrated Sim(3) pair generator (13 scenarios)
 train.py               training entry point
 register.py            register two SLAM .db line maps (the demo entry point)
-docs/                  project page + Colab notebook + bundled demo data
 output/                checkpoints (best: output/synthetic_v6/.../snap_ep8.pth)
 ```
 
@@ -64,7 +62,7 @@ s, R, t, info = solver.register(prob=prob)  # prob = matcher output (optional)
 
 ```bash
 # 1) generate data (200k train / 2k valid; ~2 h, CPU)
-python scripts/generate_synthetic.py --name synthetic_v6 --workers 12
+python generate_synthetic.py --name synthetic_v6 --workers 12
 
 # 2) train (fine-tuning from a previous checkpoint via --pretrain)
 python train.py --dataset synthetic_v6 --epochs 120 --batch 1 --iter_size 32 \
