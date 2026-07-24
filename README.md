@@ -9,9 +9,11 @@ map onto a metric RGB-D or LiDAR line map — recovering scale, rotation, and
 translation in ~0.3 s per map pair.
 
 **Explanation, theory, and full results live on the
-[project page](https://rueyday.github.io/ScalePluckerNet/).** A runnable
-[Colab demo notebook](docs/scalar_colab_demo.ipynb) registers a real bundled
-7-Scenes map pair end-to-end on CPU. This README covers only the codebase.
+[project page](https://rueyday.github.io/scale-aware-cross-modal-registration/).**
+A runnable [Colab demo notebook](https://github.com/rueyday/scale-aware-cross-modal-registration/blob/main/docs/scalar_demo.ipynb)
+registers a real bundled 7-Scenes map pair end-to-end on CPU. Both live in the
+parent [SCALAR repo](https://github.com/rueyday/scale-aware-cross-modal-registration);
+this README covers only the codebase.
 
 ---
 
