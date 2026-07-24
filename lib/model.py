@@ -79,14 +79,21 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         self.mlp_direction  = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_moment     = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_merged     = MLP([out_channel, out_channel, out_channel])
-        # dual_knn: build the moment sub-network's graph in MOMENT (position)
-        # space instead of reusing the direction-space neighbourhood. Adds NO
-        # parameters (same convs, different neighbour indices), so a
-        # direction-only checkpoint loads unchanged and only the moment
-        # aggregation neighbourhood differs. Fixes the measured descriptor
-        # collision: with a shared direction graph, two distinct lines that
-        # happen to point similarly are "neighbours" even when far apart, so
-        # the moment features cannot separate them.
+        # NAMING WARNING (verified 2026-07-24): these variable names are
+        # inherited from upstream PlueckerNet, which uses [d, m] channel order.
+        # OUR data is [m, d] (see lib/dataloader.py + segments_to_plucker), so
+        # channels 0:3 are MOMENTS and 3:6 are DIRECTIONS. Therefore the tensor
+        # called `dir_feat` below actually holds MOMENTS and `mom_feat` holds
+        # DIRECTIONS. (Checked numerically: channels 3:6 are unit-norm.)
+        #
+        # What this means for dual_knn: the BASE graph `idx` is built on
+        # channels 0:3 = moments, i.e. POSITION space — both branches already
+        # aggregate over spatially-near lines. Setting dual_knn=True gives the
+        # second branch its own graph in DIRECTION space, so direction features
+        # aggregate over similarly-ORIENTED lines instead of merely nearby ones
+        # (previously they were smeared across spatially-near but
+        # differently-oriented lines). Adds NO parameters (same convs, different
+        # neighbour indices), so an existing checkpoint loads unchanged.
         self.dual_knn = dual_knn
 
     def forward(self, x):
