@@ -96,6 +96,24 @@ def _random_rotation() -> np.ndarray:
     return Q.astype(np.float32)
 
 
+# ROT_CAL=1 : sample the PAIR (inter-map) rotation from the measured real
+# distribution instead of Haar-uniform SO(3). Real 7-Scenes mono->metric map
+# rotations are median 29 deg / max 76 deg (uniform SO(3) is median ~131 deg,
+# 4x too broad — the main sim-to-real gap, and what defeats sign canon on the
+# training data). Rayleigh(24.6 deg) angle -> median ~29, mean ~31; uniform
+# axis (real axes are general, tilt median 63 deg from vertical). Capped 85 deg.
+_ROT_CAL = bool(int(os.environ.get('ROT_CAL', '0')))
+
+def _pair_rotation() -> np.ndarray:
+    if not _ROT_CAL:
+        return _random_rotation()
+    ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
+    ang = np.radians(min(float(np.random.rayleigh(24.6)), 85.0))
+    K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+    R = np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)
+    return R.astype(np.float32)
+
+
 def _apply_sim3(L6: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
     m, d  = L6[:, :3], L6[:, 3:]
     d_new = (R @ d.T).T
@@ -765,7 +783,7 @@ def _generate_pair() -> dict:
     log_s = np.random.normal(_SCALE_LOG_CENTER, _SCALE_LOG_STD)
     log_s = np.clip(log_s, np.log(_SCALE_CLIP[0]), np.log(_SCALE_CLIP[1]))
     s   = float(np.exp(log_s))
-    R   = _random_rotation()
+    R   = _pair_rotation()          # ROT_CAL env -> real-calibrated (median 29deg) vs Haar
     # v2 fix: t_range_eff = 0.4 * s so that the inverse translation
     # |t_i| = |t|/s ≤ 0.4m for ALL s (both s < 1 and s > 1).
     # Prevents the t × d cross term from inflating query moments.

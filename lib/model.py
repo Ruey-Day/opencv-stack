@@ -175,11 +175,28 @@ class SpatialAttentionalGNN(nn.Module):
         return desc0, desc1, desc0_reg, desc1_reg
 
 
+class SymmetricInputEmbed(nn.Module):
+    """Per-line sign-EVEN input embedding: e_i = phi(x_i) + phi(-x_i), with phi a
+    per-line (1x1) nonlinear MLP. Because it is computed per line and even in that
+    line's Plucker sign, e_i is unchanged when line i is flipped [m;d]->[-m;-d].
+    The downstream KNN graph + edge features are then built on these even node
+    features, so the WHOLE matcher is per-line sign-invariant BY CONSTRUCTION --
+    no random-flip augmentation and no hemisphere canonicalisation needed. This is
+    the matcher analogue of the solver's p0 = m x d invariance."""
+    def __init__(self, ch=6):
+        super().__init__()
+        self.phi = nn.Sequential(nn.Conv1d(ch, 32, 1), nn.GELU(), nn.Conv1d(32, ch, 1))
+    def forward(self, x):                       # x: (B, ch, N)
+        return self.phi(x) + self.phi(-x)
+
+
 class FeatureExtractorGraph(nn.Module):
     def __init__(self, config, in_channel):
         super().__init__()
         nc = config['net_nchannel']
         dual_knn = bool(config['dual_knn']) if 'dual_knn' in config else False
+        self.sign_inv = bool(config['sign_inv']) if 'sign_inv' in config else False
+        self.sym = SymmetricInputEmbed(in_channel) if self.sign_inv else None
         self.conv_in    = conv_in_seq_direction_moment_knn(
             nc, in_channel=in_channel, dual_knn=dual_knn)
         self.gnn        = SpatialAttentionalGNN(nc, config['GNN_layers'])
@@ -187,6 +204,8 @@ class FeatureExtractorGraph(nn.Module):
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 
     def forward(self, x, y):
+        if self.sym is not None:                # per-line sign-even embedding first
+            x, y = self.sym(x), self.sym(y)
         desc0, desc1, x_prob, y_prob = self.gnn(self.conv_in(x), self.conv_in(y))
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         x_prob = self.regress(x_prob).softmax(dim=-1)

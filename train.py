@@ -97,6 +97,10 @@ def parse_args():
     p.add_argument('--dual_knn', action='store_true',
                    help='moment sub-network aggregates over a MOMENT-space '
                         'KNN graph (adds no params; warm-start compatible)')
+    p.add_argument('--sign_inv', action='store_true',
+                   help='per-line sign-EVEN input embedding phi(x)+phi(-x): makes '
+                        'the matcher invariant to Plucker sign by construction '
+                        '(no random-flip aug / canonicalisation needed)')
 
     return p.parse_args()
 
@@ -117,6 +121,7 @@ def main():
         net_lambda         = 0.1,
         net_maxiter        = 30,
         dual_knn           = args.dual_knn,
+        sign_inv           = args.sign_inv,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',
