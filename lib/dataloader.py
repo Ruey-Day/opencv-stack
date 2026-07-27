@@ -16,6 +16,20 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# CANON=1 : hemisphere sign-canonicalisation of [m, d] lines (v14 experiment).
+# Flip each 6-vector jointly so the largest-|component| of the DIRECTION (chan
+# 3:6, see feedback on inverted channel names) is >= 0. Idempotent w.r.t. the
+# generator's baked-in 50% random sign flips, so the existing dataset is reused
+# unchanged; must be applied identically at inference (segments_to_plucker).
+_CANON = bool(int(os.environ.get('CANON', '0')))
+
+def canonicalize_sign(p):
+    """p: (N, 6) [m, d]. Flip [m; d] jointly so d's largest-|comp| >= 0."""
+    d = p[:, 3:6]
+    idx = np.argmax(np.abs(d), axis=1)
+    s = np.sign(d[np.arange(len(d)), idx]); s[s == 0] = 1.0
+    return p * s[:, None]
+
 def variable_collate(batch):
     """
     Collate variable-N Plücker samples by zero-padding to the max N in the batch.
@@ -94,6 +108,10 @@ class Sim3PluckerData(Dataset):
         if self.in_channel is not None:
             plucker1 = plucker1[:, :self.in_channel]
             plucker2 = plucker2[:, :self.in_channel]
+
+        if _CANON:                       # v14: remove sign DOF before the encoder
+            plucker1 = canonicalize_sign(plucker1)
+            plucker2 = canonicalize_sign(plucker2)
 
         # Moment normalisation: divide BOTH clouds by plucker2 (query) std.
         # This preserves the scale ratio p1_inlier/p2 ≈ s_gt, which is the
