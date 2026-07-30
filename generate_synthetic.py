@@ -103,8 +103,23 @@ def _random_rotation() -> np.ndarray:
 # training data). Rayleigh(24.6 deg) angle -> median ~29, mean ~31; uniform
 # axis (real axes are general, tilt median 63 deg from vertical). Capped 85 deg.
 _ROT_CAL = bool(int(os.environ.get('ROT_CAL', '0')))
+# BROAD=1: train on SET broad ranges (rotation, noise severity) that cover the
+# realistic cross-modal regime with margin, INSTEAD of statistics calibrated to
+# the benchmark. Stronger paper argument (we bound the regime, not fit it) and a
+# bet on better generalization to the failure cases. Takes precedence over ROT_CAL.
+_BROAD = bool(int(os.environ.get('BROAD', '0')))
 
 def _pair_rotation() -> np.ndarray:
+    # BROAD=1: rotation angle drawn from a SET range [0, 90 deg] that broadly
+    # covers realistic cross-modal inter-map rotations (7-Scenes measured max is
+    # 76 deg) WITHOUT fitting the measured 29-deg median — a parameter we set to
+    # bound the regime, not a statistic we calibrate. ROT_CAL=1 is the calibrated
+    # (Rayleigh, median 29) variant. Neither -> Haar-uniform SO(3).
+    if _BROAD:
+        ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
+        ang = np.radians(np.random.uniform(0.0, 90.0))
+        K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+        return (np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
     if not _ROT_CAL:
         return _random_rotation()
     ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
@@ -848,7 +863,11 @@ def _generate_pair() -> dict:
 
     # v4: per-pair severity replaces the per-scenario Gaussian noise levels;
     # hard scenarios are drifty runs (higher severity), not a different model.
-    severity = np.random.uniform(*_V4_SEVERITY) * (2.0 if scenario == 'hard_noise' else 1.0)
+    # BROAD: widen the per-pair noise severity to a SET range covering clean->very
+    # noisy (dir sigma ~1.6-15.6 deg, perp ~2-21 cm) so the matcher generalizes
+    # across the whole realistic noise regime rather than a calibrated band.
+    _sev_range = (0.3, 3.0) if _BROAD else _V4_SEVERITY
+    severity = np.random.uniform(*_sev_range) * (2.0 if scenario == 'hard_noise' else 1.0)
     # v6: street positional noise is measured in street metres (KITTI GT
     # correspondences: perp median 0.32-0.35 m -> Rayleigh sigma ~0.28;
     # LiDAR reference edges are range-noisy too). Direction noise keeps the
