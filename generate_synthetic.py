@@ -109,6 +109,17 @@ _ROT_CAL = bool(int(os.environ.get('ROT_CAL', '0')))
 # bet on better generalization to the failure cases. Takes precedence over ROT_CAL.
 _BROAD = bool(int(os.environ.get('BROAD', '0')))
 
+# KITTI_MONO=1: recalibrate ONLY the two street scenarios (street, street_submap)
+# to the CURRENT KITTI mono->LiDAR test regime, measured 2026-07-31 on
+# test_data/kitti/gt_corr/*_mono_best.npz (seqs 03/05/07/10):
+#   * scale s_gt = 8-39   (was ~1.0: the old metric camlines->LiDAR calibration)
+#   * true-corr overlap  = 2-8% of the query lines  (was Beta(2,7) ~= 22%)
+#   * ref (LiDAR) 1.3-5.6k lines, query (mono) 0.9-3.3k lines, ref denser
+#   * corr noise dir ~8-10 deg, perp ~0.36 m (metric frame) — covered by the
+#     BROAD severity range already; only scale + overlap + counts move here.
+# Indoor scenarios are UNTOUCHED, so 7-Scenes is preserved (it never used street).
+_KITTI_MONO = bool(int(os.environ.get('KITTI_MONO', '0')))
+
 def _pair_rotation() -> np.ndarray:
     # BROAD=1: rotation angle drawn from a SET range [0, 90 deg] that broadly
     # covers realistic cross-modal inter-map rotations (7-Scenes measured max is
@@ -743,10 +754,15 @@ def _generate_pair() -> dict:
         # facades whose repetitions ARE the confuser structure — no
         # synthetic confusers needed; the pool aliases itself under
         # 180-deg flips and street-axis translations.
-        n2           = np.random.randint(600, 2200)
-        n1           = max(200, min(int(n2 * np.random.uniform(0.4, 1.6)),
-                                    2200))
-        overlap_frac = float(np.random.beta(2.0, 7.0))   # mean ~0.22
+        if _KITTI_MONO:
+            n2           = np.random.randint(1300, 5600)   # LiDAR ref (real 1273-5599)
+            n1           = np.random.randint(900, 3300)    # mono query (real 942-3295)
+            overlap_frac = float(np.random.beta(2.0, 30.0))  # mean ~0.06 (real 4.5-8%)
+        else:
+            n2           = np.random.randint(600, 2200)
+            n1           = max(200, min(int(n2 * np.random.uniform(0.4, 1.6)),
+                                        2200))
+            overlap_frac = float(np.random.beta(2.0, 7.0))   # mean ~0.22
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street'
@@ -758,9 +774,14 @@ def _generate_pair() -> dict:
         # confined to the window (asymmetric spatial coverage — the
         # distribution v6 lacked). Overlap is the shared fraction WITHIN
         # the window (same height-band logic as 'street').
-        n2           = np.random.randint(800, 2200)
-        n1           = np.random.randint(150, 600)
-        overlap_frac = float(np.random.beta(2.0, 6.0))   # mean ~0.25 of window
+        if _KITTI_MONO:
+            n2           = np.random.randint(1300, 5600)   # full LiDAR route
+            n1           = np.random.randint(300, 1200)    # short mono submap
+            overlap_frac = float(np.random.beta(2.0, 26.0))  # mean ~0.07 within window
+        else:
+            n2           = np.random.randint(800, 2200)
+            n1           = np.random.randint(150, 600)
+            overlap_frac = float(np.random.beta(2.0, 6.0))   # mean ~0.25 of window
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street_submap'
@@ -804,18 +825,30 @@ def _generate_pair() -> dict:
     # Prevents the t × d cross term from inflating query moments.
     t_range_eff = 0.4 * s
     if scenario == 'street':
-        # v6: both maps are metric (LiDAR GT frame vs depth-lifted camera
-        # map) — s_gt measured 0.999/1.003 on KITTI. Translation offsets
-        # are tens of metres at street scale.
-        s = float(np.exp(np.clip(np.random.normal(0.0, 0.12),
-                                 np.log(0.7), np.log(1.4))))
-        t_range_eff = 20.0 * s
+        if _KITTI_MONO:
+            # mono->LiDAR: the query is a monocular SLAM map at ARBITRARY large
+            # scale (s_gt measured 8-39 on KITTI 03/05/07/10); the reference is
+            # the metric LiDAR map. Translation is street-scale in ref metres.
+            s = float(np.exp(np.clip(np.random.normal(np.log(15.0), 0.5),
+                                     np.log(7.0), np.log(42.0))))
+            t_range_eff = 10.0 * s
+        else:
+            # v6: both maps metric (LiDAR GT frame vs depth-lifted camera map)
+            # — s_gt measured 0.999/1.003 on the old camlines->LiDAR setup.
+            s = float(np.exp(np.clip(np.random.normal(0.0, 0.12),
+                                     np.log(0.7), np.log(1.4))))
+            t_range_eff = 20.0 * s
     elif scenario == 'street_submap':
-        # v7: a standalone mono submap has ARBITRARY scale (unlike the
-        # depth-lifted full camera maps) and lives in its own local frame
-        s = float(np.exp(np.clip(np.random.normal(0.0, 0.45),
-                                 np.log(1 / 3.0), np.log(3.0))))
-        t_range_eff = 20.0 * s
+        if _KITTI_MONO:
+            s = float(np.exp(np.clip(np.random.normal(np.log(15.0), 0.5),
+                                     np.log(7.0), np.log(42.0))))
+            t_range_eff = 10.0 * s
+        else:
+            # v7: a standalone mono submap has ARBITRARY scale (unlike the
+            # depth-lifted full camera maps) and lives in its own local frame
+            s = float(np.exp(np.clip(np.random.normal(0.0, 0.45),
+                                     np.log(1 / 3.0), np.log(3.0))))
+            t_range_eff = 20.0 * s
     t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 

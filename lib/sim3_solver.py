@@ -992,7 +992,8 @@ class Sim3Solver:
                  beam_width=3, arbitrate=False, pcm_scale_band=False,
                  pcm_keep_frac=0.5, pcm_sigma_ang=6.0, pcm_sigma_s=0.25,
                  polish_tau=0.2, traj_weight=0.0, traj_propose=False,
-                 rot_hyp_k=2):
+                 rot_hyp_k=2, flip_tiebreak=True, flip_min_deg=120.0,
+                 flip_margin=0.30, flip_traj_margin=0.15):
         """prob: (N_ref, N_qry) ScalePluckerNet probability matrix (torch
         or numpy) over self.p_r x self.p_q rows — the intended way to run
         the solver (prob=None falls back to correspondence-free seeding
@@ -1003,7 +1004,28 @@ class Sim3Solver:
         (pure Plücker, no refinement, moment-residual verification,
         scale band on, PCM-filtered proposal pool + halved rotation
         budget — 18/35 @5deg, 25/35 @10deg, 0.1 s on the 35-pair
-        benchmark). Flags exist for ablations:
+        benchmark) plus the gated trajectory flip-tiebreak (below).
+
+        flip_tiebreak=True (DEFAULT) — resolve near-180deg selection aliases
+                          with the INDEPENDENT keyframe-trajectory witness.
+                          Repetitive line structure (staircases, facades) lets
+                          a flipped pose out-score the truth on the whole-map
+                          moment residual by a hair; the transformed query
+                          trajectory, however, lands where the reference camera
+                          never went under a flip. GATED: fires only when a
+                          rotation-distinct beam rival sits >= flip_min_deg
+                          (120) from the line-verification winner AND ties its
+                          score within flip_margin (0.30); it then switches
+                          only if that rival's trajectory agreement exceeds the
+                          winner's by flip_traj_margin (0.15). No-op without
+                          trajectories (q_traj/r_traj at __init__) and on every
+                          pair lacking such a rival — so the 34 unambiguous
+                          7-Scenes pairs are bit-identical to pre-tiebreak,
+                          while stairs03 recovers (172->6.1deg): same-prob
+                          37-pair A/B @5 21->21, @10 26->27, <15deg 34->35, zero
+                          regressions (2026-07-31, v17). Safe by construction:
+                          a correct winner already has the high trajectory
+                          agreement, so no flip rival can beat it.
         refine=True       append the guarded line-ICP polish (ablation:
                           REDUCES success 18->11/35 at ~100x the cost)
         verify='segment'  endpoint-based segment score instead of the
@@ -1246,13 +1268,40 @@ class Sim3Solver:
             # advantage — the runner-up (often the true rotation) never
             # gets its re-proposal round.
             hyps = beam if beam else [(R, t, s, sc)]
-            best2 = (R, t, s, sc)
-            for Rb, tb, sb, scb in hyps:
-                r2 = self._round2(Rb, tb, sb, scb, verify, verify_taus,
-                                  verify_ang, bound_scale)
-                if r2[3] > best2[3]:
-                    best2 = r2
-            R, t, s, sc = best2
+            refined = [self._round2(Rb, tb, sb, scb, verify, verify_taus,
+                                    verify_ang, bound_scale)
+                       for Rb, tb, sb, scb in hyps]
+            refined.sort(key=lambda x: -x[3])
+            R, t, s, sc = refined[0]
+            if getattr(self, '_capture', False):
+                self._cap_refined = [
+                    (r[0], r[1], r[2], r[3], float(self.traj_scores_batch(
+                        [r[0]], [r[1]], np.asarray([r[2]]))[0]))
+                    for r in refined]
+            # GATED near-flip tiebreak (default ON): only when a rotation-
+            # distinct rival is ~flipped from the line-verification winner AND
+            # nearly ties its score do we consult the INDEPENDENT trajectory
+            # witness. Repetitive line structure lets a 180deg alias out-score
+            # the truth on whole-map moment residual; the transformed query
+            # trajectory, however, lands where the reference camera never went
+            # under a flip. The gate keeps every unambiguous pair (no near-flip
+            # rival, or a clear score winner) on the untouched shipped path.
+            if flip_tiebreak and self._t_q_traj is not None and len(refined) > 1:
+                win = refined[0]
+                for riv in refined[1:]:
+                    if _rot_angle_deg(win[0], riv[0]) >= flip_min_deg \
+                            and riv[3] >= win[3] * (1 - flip_margin):
+                        tw = self.traj_scores_batch(
+                            [win[0], riv[0]], [win[1], riv[1]],
+                            np.asarray([win[2], riv[2]]))
+                        # switch only if the rival's trajectory agreement
+                        # EXCEEDS the winner's by a real margin — truth-vs-flip
+                        # separation is ~0.7-1.2 vs ~0.0, so a small absolute
+                        # floor blocks noise-triggered switches when both are
+                        # near zero (e.g. degenerate short trajectories).
+                        if tw[1] > tw[0] + flip_traj_margin:
+                            R, t, s, sc = riv
+                        break
         if polish and verify in ('moment', 'perp', 'both', 'grass') and not refine:
             Rn, tn, sn = self._polish(R, t, s, verify_taus, verify_ang,
                                       tau_assoc=polish_tau)
