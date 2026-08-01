@@ -24,7 +24,9 @@ conda activate torch5090        # Python 3.11, PyTorch 2.6, CUDA
 pip install easydict msgpack    # + numpy, torch, matplotlib
 ```
 
-The repo is self-contained (network in `model/`, solver in `lib/`).
+The repo is self-contained — network and solver both live in `lib/`
+(`lib/model.py`, `lib/sim3_solver.py`); no external service or dataset is
+required to register two maps.
 
 ## Layout
 

@@ -243,19 +243,19 @@ def main():
                      f'{trainer.config.exp_gamma}^{trainer.start_epoch})')
 
     if args.cosine_lr:
+        # Single cosine anneal over the whole run (T_mult=1, T_0=epochs):
+        # lr goes args.lr -> eta_min across epochs 0..args.epochs, landing the
+        # anneal exactly at the horizon. On resume, align the cosine phase to the
+        # model epoch via last_epoch (the old ckpt's ExponentialLR state is
+        # incompatible, so we reconstruct rather than load it). initial_lr was
+        # set on every param group above, which cosine needs as its base_lr.
+        cos_last_epoch = (trainer.start_epoch - 1) if args.resume else -1
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
-            trainer.optimizer, T_0=50, T_mult=2, eta_min=1e-6,
+            trainer.optimizer, T_0=args.epochs, T_mult=1, eta_min=1e-6,
+            last_epoch=cos_last_epoch,
         )
-        if args.resume and os.path.exists(args.resume):
-            ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
-            if 'scheduler' in ckpt:
-                try:
-                    trainer.scheduler.load_state_dict(ckpt['scheduler'])
-                    logging.info(f'Restored cosine scheduler state (last_epoch={ckpt["scheduler"].get("last_epoch")}, '
-                                 f'lr={ckpt["scheduler"].get("_last_lr")})')
-                except Exception as e:
-                    logging.warning(f'Could not restore scheduler state: {e}')
-        logging.info('Scheduler: CosineAnnealingWarmRestarts(T_0=50, T_mult=2)')
+        logging.info(f'Scheduler: CosineAnnealingWarmRestarts(T_0={args.epochs}, '
+                     f'T_mult=1, eta_min=1e-6, last_epoch={cos_last_epoch})')
 
     trainer.train()
 

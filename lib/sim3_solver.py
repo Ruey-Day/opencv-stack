@@ -310,6 +310,39 @@ def rotation_candidates_fast(d_q, w_q, d_r, w_r,
     return dedup
 
 
+# ═══ Grassmannian single-rotation RANSAC (numpy helpers) ═════════════════
+# Affine-Grassmannian Y_z embedding + analytic 2x2 principal angles, for the
+# position-coupled inlier test that a direction-only |cos| cannot provide.
+
+
+def _yz_np(p0, d):                                # (...,3),(...,3) -> (...,4,2)
+    one = np.ones_like(p0[..., :1]); zero = np.zeros_like(p0[..., :1])
+    c0 = np.concatenate([p0, one], -1)
+    c0 = c0 / (np.linalg.norm(c0, axis=-1, keepdims=True) + 1e-12)
+    c1 = np.concatenate([d, zero], -1)
+    c1 = c1 - c0 * (c1 * c0).sum(-1, keepdims=True)
+    c1 = c1 / (np.linalg.norm(c1, axis=-1, keepdims=True) + 1e-12)
+    return np.stack([c0, c1], -1)
+
+
+def _s2_np(M):                                    # cos(MAX principal angle) of (...,2,2)
+    F = (M ** 2).sum((-1, -2))
+    det = M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
+    disc = np.sqrt(np.clip(F * F - 4 * det * det, 0.0, None))
+    return np.sqrt(np.clip((F - disc) * 0.5, 0.0, 1.0))
+
+
+def _rot_from_2_np(a1, a2, b1, b2):               # 4 sign-combo Procrustes from 2 dirs
+    out = []
+    for sa in (1.0, -1.0):
+        for sb in (1.0, -1.0):
+            A = np.stack([sa * a1, sb * a2, np.cross(sa * a1, sb * a2)], 1)
+            B = np.stack([b1, b2, np.cross(b1, b2)], 1)
+            U, _, Vt = np.linalg.svd(B @ A.T)
+            out.append(U @ np.diag([1., 1., float(np.linalg.det(U @ Vt))]) @ Vt)
+    return out
+
+
 class Sim3Solver:
     def __init__(self, q_ends, r_ends,
                  prenorm_radius=2.5, scale_band=1.8,
@@ -654,6 +687,80 @@ class Sim3Solver:
         return [(R_.cpu().numpy().astype(float), 'trajgrid', float(s))
                 for R_, s in peaks]
 
+    def grass_ransac_rotation(self, pl_q, pl_r, w=None, thresh_deg=16.0,
+                              n_samples=800, seed=0, flip_keep=0.9,
+                              max_hyp_chunk=400):  # flip_keep HIGH: loosening it
+        # (0.5/0.2) BACKFIRED — offering the 180 rival lets whole-map
+        # verification pick the flip on repetitive scenes, and the compact
+        # 7-Scenes trajectory witness is too weak to veto it (<15deg 31->27).
+        """Two-stage single-rotation estimate (Grassmannian). Replaces the
+        ~14-candidate direction-population stage with ONE RANSAC-selected
+        rotation:
+
+          1. hypotheses: 2 matcher correspondences -> rotation by sign-
+             invariant Procrustes over [d_i, d_j, d_i x d_j], all 4 sign combos
+             (Plucker directions are sign-arbitrary).
+          2. scoring/outlier rejection: MAX principal angle on the affine
+             Grassmannian G(2,4) (Y_z embedding), foot points centred per cloud
+             and the query scaled by the extent-ratio s0 to strip translation +
+             scale. Unlike a direction-only |cos| — which is invariant to the
+             180deg rotation aliases of symmetric/Manhattan scenes — this SEES
+             POSITION, so a flip that lands the feet in the wrong place is
+             rejected. inlier iff cos(max angle) > cos(thresh).
+          3. refit: sign-invariant direction L1 IRLS on the winner's inliers
+             (precision comes from the directions; the G(2,4) only selects).
+
+        Measured (7-Scenes, same-prob): single direction-only RANSAC flips ~9
+        pairs to 180deg (the |cos| ambiguity); this G(2,4) rejection recovers
+        ~7 of them (<15deg 28->31/37) at equal precision on the clean pairs.
+
+        Returns a SHORT candidate list [(R, 'grass', inliers), ...]: the winner,
+        plus a ~flipped rival whose inlier count is within `flip_keep` of it, so
+        the downstream whole-map verification + trajectory flip-tiebreak can
+        arbitrate the few facade-degenerate pairs the angle alone still flips.
+        """
+        dq = np.ascontiguousarray(pl_q[3:].T)                # (K,3)
+        dr = np.ascontiguousarray(pl_r[3:].T)
+        K = len(dq)
+        if K < 2:
+            return [(np.eye(3), 'grass', 0.0)]
+        p0q = np.cross(pl_q[:3].T, dq); p0r = np.cross(pl_r[:3].T, dr)
+        p0q = p0q - p0q.mean(0); p0r = p0r - p0r.mean(0)     # strip translation
+        cosT = float(np.cos(np.deg2rad(thresh_deg)))
+        Qr = _yz_np(p0r, dr)                                 # (K,4,2)
+        rng = np.random.default_rng(seed)
+        p = (w / w.sum()) if (w is not None and np.sum(w) > 0) else None
+        I = rng.choice(K, n_samples, p=p); J = rng.choice(K, n_samples, p=p)
+        Rs = []
+        for a, b in zip(I, J):
+            if a != b:
+                Rs.extend(_rot_from_2_np(dq[a], dq[b], dr[a], dr[b]))
+        if not Rs:
+            return [(np.eye(3), 'grass', 0.0)]
+        Rs = np.stack(Rs)
+        inl = np.empty(len(Rs))
+        for lo in range(0, len(Rs), max_hyp_chunk):
+            Rc = Rs[lo:lo + max_hyp_chunk]
+            dq_t = np.einsum('hij,nj->hni', Rc, dq)
+            p0q_t = self.s0 * np.einsum('hij,nj->hni', Rc, p0q)
+            M = np.einsum('hnak,nal->hnkl', _yz_np(p0q_t, dq_t), Qr)
+            inl[lo:lo + max_hyp_chunk] = (_s2_np(M) > cosT).sum(1)
+        order = np.argsort(-inl)
+        R0 = Rs[order[0]]
+
+        def refine(R):
+            dq_t = dq @ R.T; p0q_t = self.s0 * (p0q @ R.T)
+            m = _s2_np(np.einsum('nak,nal->nkl', _yz_np(p0q_t, dq_t), Qr)) > cosT
+            return solve_rotation_l1(dq[m].T, dr[m].T) if m.sum() >= 3 else R
+
+        out = [(refine(R0), 'grass', float(inl[order[0]]))]
+        for idx in order[1:]:                                # near-flip rival
+            if _rot_angle_deg(Rs[idx], R0) >= 120.0:
+                if inl[idx] >= flip_keep * inl[order[0]]:
+                    out.append((refine(Rs[idx]), 'grass', float(inl[idx])))
+                break
+        return out
+
     def traj_scores_batch(self, Rs, ts, ss, taus=(0.2, 0.4, 0.8),
                           chunk=256):
         """Trajectory-agreement term: sum over taus of the fraction of
@@ -993,7 +1100,9 @@ class Sim3Solver:
                  pcm_keep_frac=0.5, pcm_sigma_ang=6.0, pcm_sigma_s=0.25,
                  polish_tau=0.2, traj_weight=0.0, traj_propose=False,
                  rot_hyp_k=2, flip_tiebreak=True, flip_min_deg=120.0,
-                 flip_margin=0.30, flip_traj_margin=0.15):
+                 flip_margin=0.30, flip_traj_margin=0.15,
+                 rot_mode='candidates', grass_thresh_deg=16.0,
+                 grass_flip_keep=0.9):
         """prob: (N_ref, N_qry) ScalePluckerNet probability matrix (torch
         or numpy) over self.p_r x self.p_q rows — the intended way to run
         the solver (prob=None falls back to correspondence-free seeding
@@ -1097,9 +1206,10 @@ class Sim3Solver:
         if prob is not None:
             pt = torch.as_tensor(prob)
             k = min(topk, pt.numel())
-            _, flat = torch.topk(pt.flatten(), k=k)
+            wv, flat = torch.topk(pt.flatten(), k=k)
             ir = (flat // pt.size(-1)).cpu().numpy()
             iq = (flat % pt.size(-1)).cpu().numpy()
+            cand_w = wv.clamp(min=0).cpu().numpy().astype(float)
             pl_q_cand = self.p_q[iq].T.astype(float)
             pl_r_cand = self.p_r[ir].T.astype(float)
             # PCM filters the (t, s) proposal pool only: rotation
@@ -1154,13 +1264,23 @@ class Sim3Solver:
         n_grid_eff = rot_grid
         if rot_grid is None:
             n_grid_eff = 0 if prob is not None else 16000
-        cands = rotation_candidates_fast(
-            self.p_q[:, 3:].T.astype(float), self.q_len,
-            self.p_r[:, 3:].T.astype(float), self.ref_len,
-            pair_dq=pair_dq, pair_dr=pair_dr, pair_w=pair_w,
-            cand_dq=cand_dq, cand_dr=cand_dr, n_hyp=rot_hyp,
-            n_grid=n_grid_eff, n_peaks=rot_peaks, device=self.dev,
-            hyp_k=rot_hyp_k)
+        if rot_mode == 'grass' and pl_q_cand is not None:
+            # single-rotation Grassmannian RANSAC (2-corr direction hypotheses,
+            # G(2,4) max-principal-angle inlier rejection); returns 1-2 poses
+            # (winner + near-flip rival) instead of the ~14-candidate set, and
+            # lets the downstream verification + trajectory flip-tiebreak
+            # arbitrate. Falls back to the candidate stage when no matcher.
+            cands = self.grass_ransac_rotation(pl_q_cand, pl_r_cand, w=cand_w,
+                                               thresh_deg=grass_thresh_deg,
+                                               flip_keep=grass_flip_keep)
+        else:
+            cands = rotation_candidates_fast(
+                self.p_q[:, 3:].T.astype(float), self.q_len,
+                self.p_r[:, 3:].T.astype(float), self.ref_len,
+                pair_dq=pair_dq, pair_dr=pair_dr, pair_w=pair_w,
+                cand_dq=cand_dq, cand_dr=cand_dr, n_hyp=rot_hyp,
+                n_grid=n_grid_eff, n_peaks=rot_peaks, device=self.dev,
+                hyp_k=rot_hyp_k)
         if self._t_q_traj is not None and self._traj_w > 0 and traj_propose:
             # EXPERIMENTAL (off by default — measured net-harmful on the
             # 7-Scenes probe set: the trajectory chamfer is too broad a
