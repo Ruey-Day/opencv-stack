@@ -120,6 +120,19 @@ _BROAD = bool(int(os.environ.get('BROAD', '0')))
 # Indoor scenarios are UNTOUCHED, so 7-Scenes is preserved (it never used street).
 _KITTI_MONO = bool(int(os.environ.get('KITTI_MONO', '0')))
 
+# FULL=1: the ONE definitive full-range dataset — spans the whole Sim(3) regime
+# with MARGIN rather than fitting any single test set. Where KITTI_MONO fits the
+# street scale/overlap to the measured KITTI 03/05/07/10 seqs, FULL widens street
+# scale to LogNormal(log12,0.8) clip[4,48] and overlap to Beta(1.7,20) (~8%, tail
+# to ~20% — bounds KITTI's 2-8% with margin, not fitted), and lifts the base
+# (indoor/general) scale ceiling to 16 so scale is a CONTINUUM 0.4-48 with no
+# indoor/street gap. Implies BROAD (bounded rotation 0-90 + severity). All 13
+# scenarios. This is the dataset the shipped model trains on; the per-regime
+# BROAD/KITTI_MONO recipes are superseded by it. FULL=0 -> byte-identical to before.
+_FULL = bool(int(os.environ.get('FULL', '0')))
+if _FULL:
+    _BROAD = True
+
 def _pair_rotation() -> np.ndarray:
     # BROAD=1: rotation angle drawn from a SET range [0, 90 deg] that broadly
     # covers realistic cross-modal inter-map rotations (7-Scenes measured max is
@@ -754,7 +767,11 @@ def _generate_pair() -> dict:
         # facades whose repetitions ARE the confuser structure — no
         # synthetic confusers needed; the pool aliases itself under
         # 180-deg flips and street-axis translations.
-        if _KITTI_MONO:
+        if _FULL:
+            n2           = np.random.randint(800, 6000)    # bounded street-size range
+            n1           = np.random.randint(500, 3500)
+            overlap_frac = float(np.random.beta(1.7, 20.0))  # ~8%, tail ~20% (bounds KITTI 2-8)
+        elif _KITTI_MONO:
             n2           = np.random.randint(1300, 5600)   # LiDAR ref (real 1273-5599)
             n1           = np.random.randint(900, 3300)    # mono query (real 942-3295)
             overlap_frac = float(np.random.beta(2.0, 30.0))  # mean ~0.06 (real 4.5-8%)
@@ -774,7 +791,11 @@ def _generate_pair() -> dict:
         # confined to the window (asymmetric spatial coverage — the
         # distribution v6 lacked). Overlap is the shared fraction WITHIN
         # the window (same height-band logic as 'street').
-        if _KITTI_MONO:
+        if _FULL:
+            n2           = np.random.randint(800, 6000)    # full route, bounded range
+            n1           = np.random.randint(250, 1400)    # short submap
+            overlap_frac = float(np.random.beta(1.7, 18.0))  # ~9%, tail ~22% within window
+        elif _KITTI_MONO:
             n2           = np.random.randint(1300, 5600)   # full LiDAR route
             n1           = np.random.randint(300, 1200)    # short mono submap
             overlap_frac = float(np.random.beta(2.0, 26.0))  # mean ~0.07 within window
@@ -816,8 +837,12 @@ def _generate_pair() -> dict:
     n2 = max(n2, k)
 
     # v4: scale distribution matched to measured real pairs (median 2.1).
-    log_s = np.random.normal(_SCALE_LOG_CENTER, _SCALE_LOG_STD)
-    log_s = np.clip(log_s, np.log(_SCALE_CLIP[0]), np.log(_SCALE_CLIP[1]))
+    # FULL: lift the base (indoor/general) scale ceiling so scale is a smooth
+    # continuum into the street regime (no indoor/street bimodal gap).
+    _sc_std = 0.75 if _FULL else _SCALE_LOG_STD
+    _sc_hi  = 16.0 if _FULL else _SCALE_CLIP[1]
+    log_s = np.random.normal(_SCALE_LOG_CENTER, _sc_std)
+    log_s = np.clip(log_s, np.log(_SCALE_CLIP[0]), np.log(_sc_hi))
     s   = float(np.exp(log_s))
     R   = _pair_rotation()          # ROT_CAL env -> real-calibrated (median 29deg) vs Haar
     # v2 fix: t_range_eff = 0.4 * s so that the inverse translation
@@ -825,7 +850,13 @@ def _generate_pair() -> dict:
     # Prevents the t × d cross term from inflating query moments.
     t_range_eff = 0.4 * s
     if scenario == 'street':
-        if _KITTI_MONO:
+        if _FULL:
+            # full-range mono->LiDAR: scale BOUNDED [4,48] with margin (not fitted
+            # to the KITTI 8-39 measurement); translation street-scale in ref metres.
+            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), 0.80),
+                                     np.log(4.0), np.log(48.0))))
+            t_range_eff = 10.0 * s
+        elif _KITTI_MONO:
             # mono->LiDAR: the query is a monocular SLAM map at ARBITRARY large
             # scale (s_gt measured 8-39 on KITTI 03/05/07/10); the reference is
             # the metric LiDAR map. Translation is street-scale in ref metres.
@@ -839,7 +870,11 @@ def _generate_pair() -> dict:
                                      np.log(0.7), np.log(1.4))))
             t_range_eff = 20.0 * s
     elif scenario == 'street_submap':
-        if _KITTI_MONO:
+        if _FULL:
+            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), 0.80),
+                                     np.log(4.0), np.log(48.0))))
+            t_range_eff = 10.0 * s
+        elif _KITTI_MONO:
             s = float(np.exp(np.clip(np.random.normal(np.log(15.0), 0.5),
                                      np.log(7.0), np.log(42.0))))
             t_range_eff = 10.0 * s
@@ -1081,8 +1116,13 @@ def main():
           f'train={args.n_train:,}  valid={args.n_valid:,}  '
           f'workers={args.workers}  seed={args.seed}')
     print(f'Output: {args.out_dir}  name: {args.name}')
-    print(f'Scale distribution: LogNormal(log({np.exp(_SCALE_LOG_CENTER):.1f}), {_SCALE_LOG_STD}) '
-          f'clipped to {_SCALE_RANGE}')
+    if _FULL:
+        print('Mode: FULL (full-range) — scale continuum 0.4-48 (base clip 16 + street '
+              '[4,48]), street overlap Beta(1.7,20) bounded-not-fit, BROAD rotation/severity, '
+              'all 13 scenarios')
+    else:
+        print(f'Scale distribution: LogNormal(log({np.exp(_SCALE_LOG_CENTER):.1f}), {_SCALE_LOG_STD}) '
+              f'clipped to {_SCALE_RANGE}   [BROAD={_BROAD} KITTI_MONO={_KITTI_MONO}]')
 
     print('\n=== Training split ===')
     _save(generate_split(args.n_train, args.workers, args.chunk_size,

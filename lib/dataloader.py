@@ -23,6 +23,47 @@ from torch.utils.data import Dataset
 # unchanged; must be applied identically at inference (segments_to_plucker).
 _CANON = bool(int(os.environ.get('CANON', '0')))
 
+# MAX_LINES: cap per-cloud line count in training to bound the O(N^2) attention
+# + dense (n1,n2) match-matrix memory. The FULL dataset has clouds up to ~6000
+# lines -> ~31 GB peak, which OOM/cuDNN-faults the trainer on a 32 GB GPU. Keep
+# ALL matched inliers, random-subsample the outliers, reindex matches. MAX_LINES=0
+# disables (byte-identical). Default 4000 covers the test regime (KITTI ref clouds
+# <=~2400 except seq05 5599; solver caps query at 400).
+_MAX_LINES = int(os.environ.get('MAX_LINES', '4000'))
+
+
+def _cap_cloud(pl, matches_ind, row, max_n):
+    """Subsample a cloud to <=max_n lines, keeping all matched inliers on `row`
+    (0=query/plucker1, 1=ref/plucker2) and reindexing matches."""
+    n = pl.shape[0]
+    if n <= max_n:
+        return pl, matches_ind
+    if matches_ind.shape[1] > 0:
+        keep = np.unique(matches_ind[row])
+        keep = keep[(keep >= 0) & (keep < n)]
+    else:
+        keep = np.empty(0, dtype=np.int64)
+    n_others = max_n - len(keep)
+    if n_others > 0:
+        mask = np.ones(n, dtype=bool)
+        mask[keep] = False
+        others = np.nonzero(mask)[0]
+        if len(others) > n_others:
+            others = np.random.choice(others, n_others, replace=False)
+        sel = np.concatenate([keep, others])
+    else:
+        sel = keep[:max_n]           # more inliers than max_n (rare): truncate
+    sel.sort()
+    remap = -np.ones(n, dtype=np.int64)
+    remap[sel] = np.arange(len(sel))
+    pl = pl[sel]
+    if matches_ind.shape[1] > 0:
+        mi = matches_ind.copy()
+        mi[row] = remap[mi[row]]
+        mi = mi[:, mi[row] >= 0]     # drop matches whose inlier was truncated
+        matches_ind = mi
+    return pl, matches_ind
+
 def canonicalize_sign(p):
     """p: (N, 6) [m, d]. Flip [m; d] jointly so d's largest-|comp| >= 0."""
     d = p[:, 3:6]
@@ -104,6 +145,10 @@ class Sim3PluckerData(Dataset):
         R_gt        = self.data['R_gt'][index]
         t_gt        = self.data['t_gt'][index]
         s_gt        = np.float32(self.data['s_gt'][index])
+
+        if _MAX_LINES > 0:
+            plucker1, matches_ind = _cap_cloud(plucker1, matches_ind, 0, _MAX_LINES)
+            plucker2, matches_ind = _cap_cloud(plucker2, matches_ind, 1, _MAX_LINES)
 
         if self.in_channel is not None:
             plucker1 = plucker1[:, :self.in_channel]
