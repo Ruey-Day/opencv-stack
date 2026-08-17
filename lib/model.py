@@ -46,13 +46,34 @@ def pairwiseL2Dist(x1, x2):
 
 
 class prob_mat_sinkhorn(nn.Module):
+    """Entropic-OT matching layer.
+
+    dustbin=False (pre-v24): BALANCED transport with the learned soft
+    marginals r/c — every line's mass MUST be transported, so the 80-97% of
+    real cross-modal lines with no true counterpart dump probability onto
+    wrong pairs (measured: flat ranking, P@10 ≈ P@200).
+
+    dustbin=True (v24): SuperGlue-style log-space OT with a learnable bin
+    row/column (bin_score). Real rows/cols carry unit mass, the bins carry
+    the opposite side's count, so unmatched lines can park their mass in the
+    bin instead of polluting real pairs. Returns the (B, Nr, Nq) slice
+    without the bins; entries of confidently matched pairs are ~1, so the
+    BCE loss is unchanged. r/c are ignored by the transport in this mode
+    (they remain supervised matchability predictors used by the loss and
+    for inference-time gating)."""
+
     def __init__(self, config, mu=0.1, tolerance=1e-9, iterations=30):
         super().__init__()
         self.mu         = mu
         self.iterations = iterations
         self.eps        = 1e-12
+        self.dustbin    = bool(config['dustbin']) if 'dustbin' in config else False
+        if self.dustbin:
+            self.bin_score = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, M, r=None, c=None):
+        if self.dustbin:
+            return self._forward_dustbin(M)
         K = (-M / self.mu).exp()
         K = K / K.sum(dim=(-2, -1), keepdim=True).clamp_min_(self.eps)
 
@@ -67,18 +88,90 @@ class prob_mat_sinkhorn(nn.Module):
 
         return (u * K) * v.transpose(-2, -1)
 
+    def _forward_dustbin(self, M):
+        B, Nr, Nq = M.shape
+        S = -M / self.mu                                   # similarity logits
+        alpha = self.bin_score.expand(B, 1, 1)
+        S = torch.cat([S, alpha.expand(B, Nr, 1)], dim=2)
+        S = torch.cat([S, alpha.expand(B, 1, Nq + 1)], dim=1)  # (B,Nr+1,Nq+1)
+        one = S.new_tensor(1.0)
+        ms, ns = one * Nr, one * Nq
+        norm = -(ms + ns).log()
+        log_mu = torch.cat([norm.expand(Nr), ns.log()[None] + norm]).expand(B, -1)
+        log_nu = torch.cat([norm.expand(Nq), ms.log()[None] + norm]).expand(B, -1)
+        u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
+        for _ in range(self.iterations):
+            u = log_mu - torch.logsumexp(S + v.unsqueeze(1), dim=2)
+            v = log_nu - torch.logsumexp(S + u.unsqueeze(2), dim=1)
+        Z = S + u.unsqueeze(2) + v.unsqueeze(1) - norm     # total mass Nr+Ns
+        return Z.exp()[:, :Nr, :Nq]
+
+
+def geo_edge_features(raw, idx):
+    """Sim(3)-INVARIANT relative-geometry edge features (v24, geo_edge flag).
+
+    raw: (B, 6, N) RAW [m; d] Plucker lines (pre sign-embedding); idx: (B, N, k)
+    neighbour indices. For each edge (i, j) returns 3 channels:
+      0: |d_i . d_j|                     rotation/scale/translation/sign inv.
+      1: sin of the inter-line angle     (conditioning companion of 0)
+      2: log line-to-line perpendicular distance, normalized by the per-line
+         median over its k neighbours    scale-invariant by construction
+    A 2-line configuration of infinite lines has exactly these two Sim(3)
+    invariants (angle + normalized distance) — feeding them explicitly removes
+    the coordinate-statistics shortcut that made fine-tuned models fit
+    sequences instead of the modality (v23 finding). Near-parallel edges fall
+    back to point-to-line distance. Output: (B, 3, N, k)."""
+    B, _, N = raw.shape
+    k = idx.size(-1)
+    m, d = raw[:, :3].transpose(1, 2), raw[:, 3:].transpose(1, 2)   # (B,N,3)
+    d = F.normalize(d, dim=-1)
+    p0 = torch.cross(d, m, dim=-1)                                  # foot points
+    bi = torch.arange(B, device=raw.device).view(-1, 1, 1)
+    dj = d[bi, idx]                                                 # (B,N,k,3)
+    pj = p0[bi, idx]
+    di = d.unsqueeze(2)
+    dp = pj - p0.unsqueeze(2)
+    csign = (di * dj).sum(-1)                                       # signed
+    cos = csign.abs().clamp(max=1.0)
+    sin = (1.0 - cos ** 2).clamp_min(0.0).sqrt()
+    # exact min distance between the two infinite lines via closest points
+    # (translation-exact for ANY angle; the naive point-to-line fallback is
+    # only slide-invariant for EXACTLY parallel lines, so the parallel branch
+    # is reserved for sin < 1e-3)
+    A_ = (dp * di).sum(-1)
+    B_ = (dp * dj).sum(-1)
+    denom = (1.0 - csign ** 2).clamp_min(1e-9)
+    tb = (csign * A_ - B_) / denom
+    ta = A_ + csign * tb
+    v = dp + tb.unsqueeze(-1) * dj - ta.unsqueeze(-1) * di
+    d_skew = v.norm(dim=-1)
+    d_par = torch.cross(dp, di.expand_as(dp), dim=-1).norm(dim=-1)
+    dist = torch.where(sin > 1e-3, d_skew, d_par)
+    med = dist.median(dim=-1, keepdim=True)[0].clamp_min(1e-9)
+    # ratio floor 0.01: below that the pair is "essentially intersecting" —
+    # no information, and the log only amplifies float cancellation noise
+    logd = (dist / med).clamp_min(0.01).log()
+    return torch.stack([cos, sin, logd], dim=1)                     # (B,3,N,k)
+
 
 class conv_in_seq_direction_moment_knn(nn.Module):
     def __init__(self, out_channel: int, in_channel: int = 6,
-                 dual_knn: bool = False):
+                 dual_knn: bool = False, geo_edge: bool = False):
         super().__init__()
         half = out_channel // 2
+
+        self.geo_edge = geo_edge
+        if geo_edge:
+            # third branch mirroring the other two; merged MLP widens
+            self.conv_geo = nn.Conv2d(3, half // 8, 1)
+            self.mlp_geo  = MLP([half // 8, half // 4, half // 2, half])
 
         self.conv_direction = nn.Conv2d(6, half // 8, 1)
         self.conv_moment    = nn.Conv2d((in_channel - 3) * 2, half // 8, 1)
         self.mlp_direction  = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_moment     = MLP([half // 8, half // 4, half // 2, half])
-        self.mlp_merged     = MLP([out_channel, out_channel, out_channel])
+        merged_in = out_channel + (half if geo_edge else 0)
+        self.mlp_merged     = MLP([merged_in, out_channel, out_channel])
         # NAMING WARNING (verified 2026-07-24): these variable names are
         # inherited from upstream PlueckerNet, which uses [d, m] channel order.
         # OUR data is [m, d] (see lib/dataloader.py + segments_to_plucker), so
@@ -96,7 +189,7 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         # neighbour indices), so an existing checkpoint loads unchanged.
         self.dual_knn = dual_knn
 
-    def forward(self, x):
+    def forward(self, x, raw=None):
         dir_feat = x[:, :3, :]
         idx = knn(dir_feat, k=min(10, dir_feat.size(-1)))
         x_dir = self.mlp_direction(
@@ -109,7 +202,12 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         else:
             x_mom = self.mlp_moment(
                 self.conv_moment(get_graph_feature(x[:, 3:, :], idx=idx)).mean(dim=-1))
-        return self.mlp_merged(torch.cat([x_dir, x_mom], dim=1))
+        parts = [x_dir, x_mom]
+        if self.geo_edge:
+            assert raw is not None, 'geo_edge needs the raw [m;d] input'
+            geo = geo_edge_features(raw, idx)
+            parts.append(self.mlp_geo(self.conv_geo(geo).mean(dim=-1)))
+        return self.mlp_merged(torch.cat(parts, dim=1))
 
 
 def attention(query, key, value):
@@ -195,18 +293,22 @@ class FeatureExtractorGraph(nn.Module):
         super().__init__()
         nc = config['net_nchannel']
         dual_knn = bool(config['dual_knn']) if 'dual_knn' in config else False
+        self.geo_edge = bool(config['geo_edge']) if 'geo_edge' in config else False
         self.sign_inv = bool(config['sign_inv']) if 'sign_inv' in config else False
         self.sym = SymmetricInputEmbed(in_channel) if self.sign_inv else None
         self.conv_in    = conv_in_seq_direction_moment_knn(
-            nc, in_channel=in_channel, dual_knn=dual_knn)
+            nc, in_channel=in_channel, dual_knn=dual_knn,
+            geo_edge=self.geo_edge)
         self.gnn        = SpatialAttentionalGNN(nc, config['GNN_layers'])
         self.final_proj = nn.Conv1d(nc, nc, kernel_size=1, bias=True)
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 
     def forward(self, x, y):
+        raw_x, raw_y = (x, y) if self.geo_edge else (None, None)
         if self.sym is not None:                # per-line sign-even embedding first
             x, y = self.sym(x), self.sym(y)
-        desc0, desc1, x_prob, y_prob = self.gnn(self.conv_in(x), self.conv_in(y))
+        desc0, desc1, x_prob, y_prob = self.gnn(self.conv_in(x, raw=raw_x),
+                                                self.conv_in(y, raw=raw_y))
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         x_prob = self.regress(x_prob).softmax(dim=-1)
         y_prob = self.regress(y_prob).softmax(dim=-1)

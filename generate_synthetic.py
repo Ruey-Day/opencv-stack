@@ -68,7 +68,7 @@ _V4_REF_PERP_M    = 0.02
 _V4_FRAG_P        = (0.65, 0.25, 0.10)  # P(1|2|3 query fragments per real edge)
 _V4_SIGN_FLIP     = 0.5      # SLAM endpoint order is arbitrary → ~50% flipped
 
-_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'collision']
+_SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'collision', 'street_mono']
 # v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
 # distribution otherwise unchanged for retention when fine-tuning from v5).
 # v7: add 'street_submap' at 0.12 (asymmetric spatial coverage — the KITTI
@@ -81,8 +81,14 @@ _SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhatta
 # lines, NOT rotational symmetry; flip_room modeled the wrong thing).
 _SCENARIO_P = np.array([0.0756, 0.0567, 0.0567, 0.0693, 0.0378, 0.0882,
                         0.0567, 0.0567, 0.0945, 0.0567, 0.1029, 0.1008,
-                        0.16])   # adversarial also bumped 0.078->0.0945
+                        0.16, 0.0])   # last = street_mono (off unless MONO=1)
 _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()   # exact normalization
+# v24 SUBCAL: street_submap weight 0.10 -> 0.16, others scaled down
+if bool(int(os.environ.get('SUBCAL', '0'))):
+    _i_ss = _SCENARIOS.index('street_submap')
+    _SCENARIO_P = _SCENARIO_P * (1 - 0.16) / (1 - _SCENARIO_P[_i_ss])
+    _SCENARIO_P[_i_ss] = 0.16
+    _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()
 
 
 # ── Plücker line primitives ───────────────────────────────────────────────────
@@ -133,6 +139,101 @@ _FULL = bool(int(os.environ.get('FULL', '0')))
 if _FULL:
     _BROAD = True
 
+# FOUND=1: the FOUNDATION dataset (v21) — trains a matcher that works on ANY
+# input frame, not the benchmark's. Implies FULL. Motivated by the measured
+# 2026-08-14 failures (KITTI submap scramble 0/14 while GT-corr oracle passes):
+#   * rotation: FULL capped the pair rotation at 90 deg; the submap scramble is
+#     Haar SO(3) (median ~131 deg) — the model had NEVER seen the test regime.
+#     FOUND: angle ~ U[0, 180] deg, uniform axis.
+#   * scale: FULL capped at 48; submap composed true scales reach ~80.
+#     FOUND: base clip [0.25, 32], street clip [3, 100].
+#   * drift: real mono maps warp smoothly along the trajectory (measured warp
+#     median 2-13 m with +/-10% local scale on KITTI mono_best). FOUND replaces
+#     the bucket-translation _apply_drift with _apply_traj_drift (smooth Sim(3)
+#     field along a random axis) applied to the WHOLE query map.
+#   * sizes are snapped to a x1.5 grid (64..4096) so same-shape pairs can be
+#     BATCHED at train time (the model is latency-bound below ~1.5k lines).
+_FOUND = bool(int(os.environ.get('FOUND', '0')))
+if _FOUND:
+    _FULL = True
+    _BROAD = True
+
+_SIZE_GRID = np.array([64, 96, 128, 192, 256, 384, 512, 768,
+                       1024, 1536, 2048, 3072, 4096])
+
+# GHOST=1 (v22, implies FOUND): near-miss ghost outliers. Real cross-modal
+# maps are dominated by a CONTINUUM of almost-right lines (measured on KITTI
+# mono_best vs LiDAR, drift-corrected: only ~20% of query lines lie within
+# 1 m of a compatible reference line; median nearest-compatible distance
+# ~3.5 m ≈ 2.3% of map extent). The generator's outliers were either true
+# structure + small noise or random clutter — nothing taught "close but
+# wrong", and the matcher scores P@200 ≈ 0 outdoors (v21 ep237). Under
+# GHOST, a U[0.25,0.55] fraction of QUERY outliers become ghosts: copies of
+# reference structure displaced perpendicular by LogUniform(0.5%, 8%) of the
+# map extent + Rayleigh(6 deg) direction jitter, UNLABELED.
+_GHOST = bool(int(os.environ.get('GHOST', '0')))
+if _GHOST:
+    _FOUND = True
+    _FULL = True
+    _BROAD = True
+
+# SUBCAL=1 (v24, implies GHOST): recalibrate street_submap to the MEASURED
+# submap-quarter benchmark (test_data/kitti/submap_gt_corr, 14 kept quarters):
+# query 115-821 lines after corridor/length filters (generator had 250-1400),
+# matched-query fraction median ~0.35 (generator had Beta(1.7,18) ~ 9% —
+# calibrated to FULL-map overlap, ~4x too sparse for quarters whose corridor
+# lies entirely inside the reference). Also bumps the street_submap scenario
+# weight 0.10 -> 0.16 (others renormalized) — submap localization is the one
+# benchmark still at 0/14.
+_SUBCAL = bool(int(os.environ.get('SUBCAL', '0')))
+if _SUBCAL:
+    _GHOST = True
+    _FOUND = True
+    _FULL = True
+    _BROAD = True
+
+# MONO=1 (implies FOUND): add the ALIGNED mono full-map -> LiDAR regime as the
+# 'street_mono' scenario (weight 0.10, others renormalized). FOUND draws the
+# inter-map rotation ~U[0,180] independent of scale, so the small-rotation +
+# large-scale corner that IS real KITTI mono_best (measured rot 0.6-6 deg, scale
+# 9-39) is only ~1.2% of found3 — street_mono covers it directly (small rotation,
+# scale 8-42, mono_best-calibrated counts/overlap). Compose with GHOST/SUBCAL freely.
+_MONO = bool(int(os.environ.get('MONO', '0')))
+if _MONO:
+    _FOUND = True
+    _FULL = True
+    _BROAD = True
+    _i_sm = _SCENARIOS.index('street_mono')
+    _SCENARIO_P = _SCENARIO_P * (1 - 0.10) / (1 - _SCENARIO_P[_i_sm])
+    _SCENARIO_P[_i_sm] = 0.10
+    _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()
+
+
+def _make_ghost_lines(src: np.ndarray, n: int) -> np.ndarray:
+    """n near-miss copies of random lines from src (same frame): foot point
+    displaced perpendicular to the line by LogUniform(0.005, 0.08) x extent,
+    direction jittered Rayleigh(6 deg) capped 20. Preserves m·d = 0."""
+    if n <= 0 or len(src) == 0:
+        return np.zeros((0, 6), np.float32)
+    pick = np.random.randint(0, len(src), n)
+    m, d = src[pick, :3].astype(np.float64), src[pick, 3:].astype(np.float64)
+    p0 = np.cross(d, m)
+    ctr = p0.mean(0)
+    ext = float(np.abs(np.cross(src[:, 3:], src[:, :3]) - ctr).max()) + 1e-9
+    off = np.random.randn(n, 3)
+    off -= (off * d).sum(1, keepdims=True) * d
+    off /= np.linalg.norm(off, axis=1, keepdims=True) + 1e-9
+    mag = np.exp(np.random.uniform(np.log(0.005), np.log(0.08), n)) * ext
+    ang = np.radians(np.minimum(np.random.rayleigh(6.0, n), 20.0))
+    ax = np.cross(d, np.random.randn(n, 3))
+    ax /= np.linalg.norm(ax, axis=1, keepdims=True) + 1e-9
+    ca, sa = np.cos(ang)[:, None], np.sin(ang)[:, None]
+    d_new = ca * d + sa * np.cross(ax, d) \
+        + (1 - ca) * (ax * d).sum(1, keepdims=True) * ax
+    d_new /= np.linalg.norm(d_new, axis=1, keepdims=True) + 1e-9
+    m_new = np.cross(p0 + off * mag[:, None], d_new)
+    return np.concatenate([m_new, d_new], 1).astype(np.float32)
+
 def _pair_rotation() -> np.ndarray:
     # BROAD=1: rotation angle drawn from a SET range [0, 90 deg] that broadly
     # covers realistic cross-modal inter-map rotations (7-Scenes measured max is
@@ -141,7 +242,8 @@ def _pair_rotation() -> np.ndarray:
     # (Rayleigh, median 29) variant. Neither -> Haar-uniform SO(3).
     if _BROAD:
         ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
-        ang = np.radians(np.random.uniform(0.0, 90.0))
+        # FOUND: full SO(3) coverage (uniform angle 0-180). FULL/BROAD: [0, 90].
+        ang = np.radians(np.random.uniform(0.0, 180.0 if _FOUND else 90.0))
         K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
         return (np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
     if not _ROT_CAL:
@@ -491,6 +593,79 @@ def _apply_drift(lines: np.ndarray, n_groups: int = 4, sigma: float = 0.10) -> n
     return out
 
 
+def _apply_traj_drift(lines: np.ndarray) -> np.ndarray:
+    """
+    FOUND drift model: smooth trajectory-correlated Sim(3) warp, matching the
+    drift measured on real KITTI mono maps (build_kitti_gt_corr_v2: warp
+    median 2-13 m over 100-400 m extents = 1-5% of extent, local scale
+    p10/p90 ~ 0.95/1.09, slowly varying along the drive).
+
+    Lines are parameterized by the projection tau of their perpendicular foot
+    point onto a random axis (a proxy for "position along the trajectory").
+    Piecewise-linear control knots define smooth rotation / scale /
+    translation fields over tau; each line is warped by its local Sim(3)
+    about the moving centre. Preserves m . d = 0 exactly.
+    """
+    n = len(lines)
+    if n < 4:
+        return lines
+    m, d = lines[:, :3].astype(np.float64), lines[:, 3:].astype(np.float64)
+    p0 = np.cross(d, m)                       # perpendicular foot points
+    ctr = p0.mean(0)
+    ext = float(np.abs(p0 - ctr).max()) + 1e-9
+    u = np.random.randn(3); u /= np.linalg.norm(u) + 1e-12
+    tau = (p0 - ctr) @ u
+    tau = (tau - tau.min()) / (tau.max() - tau.min() + 1e-9)
+
+    K = np.random.randint(4, 9)               # control knots
+    kt = np.linspace(0.0, 1.0, K)
+    # random-walk knot values (drift accumulates), zeroed at the start
+    def walk(scale, dim):
+        w = np.cumsum(np.random.randn(K, dim), axis=0) * scale
+        return w - w[0]
+    rot_amp   = np.radians(np.random.uniform(0.5, 4.0))
+    scale_amp = np.random.uniform(0.02, 0.12)
+    trans_amp = np.random.uniform(0.01, 0.05) * ext
+    k_rot   = walk(rot_amp / np.sqrt(K), 3)         # axis-angle per knot
+    k_scale = walk(scale_amp / np.sqrt(K), 1)[:, 0]  # log-scale per knot
+    k_tr    = walk(trans_amp / np.sqrt(K), 3)
+
+    w_rot = np.stack([np.interp(tau, kt, k_rot[:, i]) for i in range(3)], 1)
+    sig   = np.exp(np.interp(tau, kt, k_scale))
+    delta = np.stack([np.interp(tau, kt, k_tr[:, i]) for i in range(3)], 1)
+
+    th = np.linalg.norm(w_rot, axis=1, keepdims=True) + 1e-12
+    ax = w_rot / th
+    ca, sa = np.cos(th), np.sin(th)
+    def rot(v):                                # Rodrigues, rowwise
+        return (ca * v + sa * np.cross(ax, v)
+                + (1 - ca) * (ax * v).sum(1, keepdims=True) * ax)
+    p_new = sig[:, None] * rot(p0 - ctr) + ctr + delta
+    d_new = rot(d)
+    d_new /= np.linalg.norm(d_new, axis=1, keepdims=True) + 1e-12
+    m_new = np.cross(p_new, d_new)
+    return np.concatenate([m_new, d_new], 1).astype(np.float32)
+
+
+def _quantize_cloud(pl: np.ndarray, matches: np.ndarray, row: int):
+    """FOUND: uniformly subsample a cloud to the largest _SIZE_GRID value <= n
+    (cap 4096) so same-shape pairs batch at train time. Uniform (not
+    inlier-preserving) so the inlier fraction stays honest; dropped matches
+    are removed."""
+    n = len(pl)
+    g = int(_SIZE_GRID[_SIZE_GRID <= max(n, _SIZE_GRID[0])].max())
+    g = min(g, n)
+    if n == g:
+        return pl, matches
+    sel = np.sort(np.random.choice(n, g, replace=False))
+    remap = -np.ones(n, np.int64); remap[sel] = np.arange(g)
+    mi = matches.copy()
+    if mi.shape[1] > 0:
+        mi[row] = remap[mi[row]]
+        mi = mi[:, mi[row] >= 0]
+    return pl[sel], mi
+
+
 def _make_confuser_lines(n: int, ref_lines: np.ndarray, spread: float = 0.08,
                          pos_range: float = 3.0,
                          moment_dup: bool = False) -> np.ndarray:
@@ -791,7 +966,12 @@ def _generate_pair() -> dict:
         # confined to the window (asymmetric spatial coverage — the
         # distribution v6 lacked). Overlap is the shared fraction WITHIN
         # the window (same height-band logic as 'street').
-        if _FULL:
+        if _SUBCAL:
+            # v24: calibrated to the measured submap-quarter benchmark
+            n2           = np.random.randint(800, 6000)    # full route (real 1273-5599)
+            n1           = np.random.randint(100, 850)     # quarter (real 115-821)
+            overlap_frac = float(np.random.beta(2.5, 5.0))  # mean ~0.33 (real med ~0.35)
+        elif _FULL:
             n2           = np.random.randint(800, 6000)    # full route, bounded range
             n1           = np.random.randint(250, 1400)    # short submap
             overlap_frac = float(np.random.beta(1.7, 18.0))  # ~9%, tail ~22% within window
@@ -823,6 +1003,18 @@ def _generate_pair() -> dict:
                                                       np.log(0.04))))
         use_confusers = True
         pool_type    = 'collision'
+    elif scenario == 'street_mono':
+        # ALIGNED mono full-map -> LiDAR (the KITTI mono_best regime): small
+        # inter-map rotation (overridden below) + LARGE arbitrary mono scale.
+        # Calibrated to test_data/kitti/gt_corr/*_mono_best.npz (03/05/06/07/10):
+        # ref (LiDAR) ~0.9-5.6k lines, query (mono) ~0.3-3.3k, overlap 9-57%
+        # (median ~40%), scale 9-39, rotation 0.6-6 deg (gravity-aligned frames).
+        n2           = np.random.randint(300, 5600)
+        n1           = np.random.randint(300, 3300)
+        overlap_frac = float(np.random.beta(2.5, 4.0))   # mean ~0.38 (real 9-57%, med ~0.40)
+        noise1       = 0.3
+        noise2       = 0.1
+        pool_type    = 'street'
     else:  # corridor
         # Corridor / stairwell — 1-2 dominant directions, higher noise
         n2           = np.random.randint(50, 450)
@@ -839,12 +1031,22 @@ def _generate_pair() -> dict:
     # v4: scale distribution matched to measured real pairs (median 2.1).
     # FULL: lift the base (indoor/general) scale ceiling so scale is a smooth
     # continuum into the street regime (no indoor/street bimodal gap).
-    _sc_std = 0.75 if _FULL else _SCALE_LOG_STD
-    _sc_hi  = 16.0 if _FULL else _SCALE_CLIP[1]
+    _sc_std = (1.0 if _FOUND else 0.75) if _FULL else _SCALE_LOG_STD
+    _sc_hi  = (32.0 if _FOUND else 16.0) if _FULL else _SCALE_CLIP[1]
+    _sc_lo  = 0.25 if _FOUND else _SCALE_CLIP[0]
     log_s = np.random.normal(_SCALE_LOG_CENTER, _sc_std)
-    log_s = np.clip(log_s, np.log(_SCALE_CLIP[0]), np.log(_sc_hi))
+    log_s = np.clip(log_s, np.log(_sc_lo), np.log(_sc_hi))
     s   = float(np.exp(log_s))
     R   = _pair_rotation()          # ROT_CAL env -> real-calibrated (median 29deg) vs Haar
+    if scenario == 'street_mono':
+        # aligned world frames (mono SLAM vs LiDAR, common gravity-up trajectory):
+        # SMALL inter-map rotation (measured 0.6-6 deg on KITTI mono_best), NOT the
+        # FOUND uniform-SO(3) scramble. This is the joint (small-rot, large-scale)
+        # regime the base rotation draw under-covers.
+        ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
+        ang = np.radians(min(float(np.random.rayleigh(3.0)), 12.0))
+        K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+        R = (np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
     # v2 fix: t_range_eff = 0.4 * s so that the inverse translation
     # |t_i| = |t|/s ≤ 0.4m for ALL s (both s < 1 and s > 1).
     # Prevents the t × d cross term from inflating query moments.
@@ -853,8 +1055,10 @@ def _generate_pair() -> dict:
         if _FULL:
             # full-range mono->LiDAR: scale BOUNDED [4,48] with margin (not fitted
             # to the KITTI 8-39 measurement); translation street-scale in ref metres.
-            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), 0.80),
-                                     np.log(4.0), np.log(48.0))))
+            _st_std, _st_lo, _st_hi = ((0.9, 3.0, 100.0) if _FOUND
+                                       else (0.80, 4.0, 48.0))
+            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), _st_std),
+                                     np.log(_st_lo), np.log(_st_hi))))
             t_range_eff = 10.0 * s
         elif _KITTI_MONO:
             # mono->LiDAR: the query is a monocular SLAM map at ARBITRARY large
@@ -871,8 +1075,10 @@ def _generate_pair() -> dict:
             t_range_eff = 20.0 * s
     elif scenario == 'street_submap':
         if _FULL:
-            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), 0.80),
-                                     np.log(4.0), np.log(48.0))))
+            _st_std, _st_lo, _st_hi = ((0.9, 3.0, 100.0) if _FOUND
+                                       else (0.80, 4.0, 48.0))
+            s = float(np.exp(np.clip(np.random.normal(np.log(12.0), _st_std),
+                                     np.log(_st_lo), np.log(_st_hi))))
             t_range_eff = 10.0 * s
         elif _KITTI_MONO:
             s = float(np.exp(np.clip(np.random.normal(np.log(15.0), 0.5),
@@ -884,6 +1090,12 @@ def _generate_pair() -> dict:
             s = float(np.exp(np.clip(np.random.normal(0.0, 0.45),
                                      np.log(1 / 3.0), np.log(3.0))))
             t_range_eff = 20.0 * s
+    elif scenario == 'street_mono':
+        # arbitrary large mono scale (real KITTI mono_best s_gt 9-39); translation
+        # street-scale in reference metres.
+        s = float(np.exp(np.clip(np.random.normal(np.log(16.0), 0.45),
+                                 np.log(8.0), np.log(42.0))))
+        t_range_eff = 10.0 * s
     t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 
@@ -940,7 +1152,7 @@ def _generate_pair() -> dict:
     # correspondences: perp median 0.32-0.35 m -> Rayleigh sigma ~0.28;
     # LiDAR reference edges are range-noisy too). Direction noise keeps the
     # v4 calibration (measured 5.4-6.0 deg median on KITTI — same as indoor).
-    _street = scenario in ('street', 'street_submap')
+    _street = scenario in ('street', 'street_submap', 'street_mono')
     perp_q_sigma = 0.28 if _street else _V4_PERP_SIGMA_M
     perp_r_sigma = 0.08 if _street else _V4_REF_PERP_M
     drift_scale  = 6.0 if _street else 1.0
@@ -962,7 +1174,8 @@ def _generate_pair() -> dict:
                                       perp_r_sigma)
 
         # Drift augmentation (20% of pairs): spatially correlated moment noise on query.
-        if np.random.random() < 0.20:
+        # FOUND: replaced by the whole-map trajectory drift applied below.
+        if not _FOUND and np.random.random() < 0.20:
             inliers_q = _apply_drift(
                 inliers_q,
                 n_groups=np.random.randint(2, 6),
@@ -989,10 +1202,25 @@ def _generate_pair() -> dict:
     out_q = _physical_noise(out_q, _V4_DIR_SIGMA_DEG * severity,
                             perp_q_sigma * severity / s, _V4_DIR_CAP_DEG)
 
+    # v22 GHOST: convert a fraction of query outliers into near-miss ghosts
+    # (displaced copies of true query-frame structure, unlabeled)
+    if _GHOST and len(out_q) > 4:
+        src = np.concatenate([inliers_q, out_q]) if len(inliers_q) else out_q
+        n_g = int(np.random.uniform(0.25, 0.55) * len(out_q))
+        if n_g > 0:
+            out_q = np.concatenate([out_q[:len(out_q) - n_g],
+                                    _make_ghost_lines(src, n_g)])
+
     q_parts = [p for p in [inliers_q, out_q]   if len(p) > 0]
     r_parts = [p for p in [inliers_ref, out_r] if len(p) > 0]
     query_all = (np.concatenate(q_parts, axis=0) if q_parts else _make_pool(max(n1, 10), pool_type))
     ref_all   = (np.concatenate(r_parts, axis=0) if r_parts else _make_pool(max(n2, 10), pool_type))
+
+    # FOUND: smooth trajectory-correlated Sim(3) drift over the WHOLE query
+    # map (35% of pairs) — a coherent map-level warp, matching real mono SLAM
+    # drift; correspondences stay labeled (the point is noise tolerance).
+    if _FOUND and np.random.random() < 0.35:
+        query_all = _apply_traj_drift(query_all)
 
     # v4: ~50% Plücker sign flips on BOTH clouds (endpoint order is arbitrary
     # in SLAM; a flipped [m,d] is the same line, so labels are unaffected)
@@ -1012,11 +1240,17 @@ def _generate_pair() -> dict:
     # (s, R, t) maps query -> reference, i.e. plucker2 -> plucker1.
     m_ref = r_pos[frag_src].astype(np.int32)
     m_qry = q_pos.astype(np.int32)
+    matches = (np.stack([m_ref, m_qry], 0) if k_q > 0
+               else np.zeros((2, 0), np.int32))
+
+    if _FOUND:   # snap both clouds to the batching size grid
+        ref_all, matches = _quantize_cloud(ref_all, matches, 0)
+        query_all, matches = _quantize_cloud(query_all, matches, 1)
 
     return dict(
         plucker1 = ref_all.astype(np.float32),
         plucker2 = query_all.astype(np.float32),
-        matches  = np.stack([m_ref, m_qry], 0) if k_q > 0 else np.zeros((2, 0), np.int32),
+        matches  = matches.astype(np.int32),
         R_gt     = R.astype(np.float32),
         t_gt     = t.reshape(3, 1).astype(np.float32),
         s_gt     = np.float32(s),

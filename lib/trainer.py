@@ -147,11 +147,19 @@ class Sim3Trainer:
 
         data_loader_iter = iter(self.data_loader)
         iter_size  = self.iter_size
-        start_iter = (epoch - 1) * (len(self.data_loader) // iter_size)
+        start_iter = (epoch - 1) * max(1, (getattr(self.data_loader, 'epoch_samples', None)
+                                           or len(self.data_loader)) // iter_size)
         data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
-        loss_fn = TotalLoss().to(self.device)
+        loss_fn = TotalLoss(getattr(self.config, 'match_w', 0.0)).to(self.device)
 
-        for curr_iter in range(len(self.data_loader) // iter_size):
+        # iter_size counts SAMPLES per optimizer step (not loader batches):
+        # with a bucketed loader a batch carries B samples, so we accumulate
+        # until >= iter_size samples. B == 1 reproduces the old loop exactly
+        # (per-sample loss summed, i.e. sum-reduction over the step).
+        n_samples_epoch = getattr(self.data_loader, 'epoch_samples', None) \
+            or len(self.data_loader)
+        n_steps = max(1, n_samples_epoch // iter_size)
+        for curr_iter in range(n_steps):
             self.optimizer.zero_grad()
             # accumulate logging stats on-device; sync once per iteration
             batch_total_loss = torch.zeros((), device=self.device)
@@ -159,18 +167,25 @@ class Sim3Trainer:
             data_time = 0.0
             total_timer.tic()
 
-            for _ in range(iter_size):
+            acc = 0
+            while acc < iter_size:
                 data_timer.tic()
-                matches, plucker1, plucker2, *_ = next(data_loader_iter)
+                try:
+                    matches, plucker1, plucker2, *_ = next(data_loader_iter)
+                except StopIteration:
+                    data_loader_iter = iter(self.data_loader)
+                    matches, plucker1, plucker2, *_ = next(data_loader_iter)
                 data_time += data_timer.toc(average=False)
 
                 matches  = matches.to(self.device, non_blocking=True)
                 plucker1 = plucker1.to(self.device, non_blocking=True)
                 plucker2 = plucker2.to(self.device, non_blocking=True)
+                B = matches.shape[0]
 
                 prob_matrix, prior1, prior2 = self.net(plucker1, plucker2)
 
-                loss = loss_fn(prob_matrix, matches)
+                # x B: keep sum-over-samples semantics at any batch size
+                loss = loss_fn(prob_matrix, matches, prior1, prior2) * B
 
                 if not torch.isnan(loss).any():
                     loss.backward()
@@ -178,7 +193,8 @@ class Sim3Trainer:
                 batch_total_loss += loss.detach().sum()
                 batch_prob_loss  += (
                     (1.0 - 2.0 * matches) * prob_matrix.detach()
-                ).sum(dim=(-2, -1)).mean()
+                ).sum(dim=(-2, -1)).mean() * B
+                acc += B
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
@@ -194,7 +210,7 @@ class Sim3Trainer:
                 self.writer.add_scalar('train/total_loss', batch_total_loss, start_iter + curr_iter)
                 self.writer.add_scalar('train/prob_loss',  batch_prob_loss,  start_iter + curr_iter)
                 logging.info(
-                    f'Train Epoch: {epoch} [{curr_iter}/{len(self.data_loader) // iter_size}]'
+                    f'Train Epoch: {epoch} [{curr_iter}/{n_steps}]'
                     f'  Loss: {batch_total_loss:.3e}'
                     f'  InlierProb: {batch_prob_loss:.3f}'
                     f'  DataT: {data_meter.avg:.4f}'

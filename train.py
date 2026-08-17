@@ -19,6 +19,7 @@ import random
 import logging
 from datetime import date
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
@@ -102,7 +103,77 @@ def parse_args():
                         'the matcher invariant to Plucker sign by construction '
                         '(no random-flip aug / canonicalisation needed)')
 
+    p.add_argument('--nchannel', type=int, default=128,
+                   help='network channel width (v19=128; 256 ~4x params)')
+    p.add_argument('--gnn_pairs', type=int, default=6,
+                   help='num self+cross GNN layer pairs (v19=6 -> 12 layers)')
+
+    p.add_argument('--dustbin', action='store_true',
+                   help='v24: SuperGlue-style unbalanced Sinkhorn with a '
+                        'learnable no-match bin — unmatched lines park mass '
+                        'in the bin instead of polluting real pairs (real '
+                        'cross-modal overlap is 2-8%%)')
+    p.add_argument('--geo_edge', action='store_true',
+                   help='v24: Sim(3)-invariant relative-geometry edge features '
+                        '(inter-line angle + normalized line-line distance) in '
+                        'the input encoder')
+    p.add_argument('--init_from', default=None,
+                   help='checkpoint to initialize WEIGHTS from (fresh '
+                        'optimizer/scheduler/epoch counter — unlike --resume). '
+                        'For warm-starting on a new dataset mix.')
+    p.add_argument('--match_w', type=float, default=0.0,
+                   help='weight of the matchability loss on the Sinkhorn '
+                        'marginal heads r/c (v21: 0.2). 0 = off (pre-v21).')
+    p.add_argument('--bucket_batch', action='store_true',
+                   help='group same-shape (n1,n2) pairs into batches '
+                        '(requires a FOUND size-grid dataset). The model is '
+                        'latency-bound below ~1.5k lines, so this is ~2-4x '
+                        'wall-clock at identical sum-over-samples gradients.')
+
     return p.parse_args()
+
+
+class BucketBatchSampler(torch.utils.data.Sampler):
+    """Batch sampler grouping same-shape (n1, n2) pairs (FOUND grid data).
+
+    Per-bucket batch size: max(1, min(max_b, budget // max(n1, n2))) — 256-line
+    pairs batch 16 deep, 4096-line pairs run alone. Each epoch draws
+    epoch_size indices without replacement and shuffles the batch order."""
+
+    def __init__(self, shapes, epoch_size, budget=4096, max_b=16, seed=0):
+        self.shapes = shapes
+        self.epoch_size = (min(epoch_size, len(shapes)) if epoch_size > 0
+                           else len(shapes))
+        self.budget, self.max_b = budget, max_b
+        self.seed, self.epoch = seed, 0
+
+    def _batch_size(self, n1, n2):
+        return max(1, min(self.max_b, self.budget // max(n1, n2)))
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        idx = rng.choice(len(self.shapes), self.epoch_size, replace=False)
+        groups = {}
+        for i in idx:
+            groups.setdefault(self.shapes[i], []).append(int(i))
+        batches = []
+        for (n1, n2), ids in groups.items():
+            B = self._batch_size(n1, n2)
+            batches.extend(ids[j:j + B] for j in range(0, len(ids), B))
+        order = rng.permutation(len(batches))
+        for j in order:
+            yield batches[j]
+
+    def __len__(self):
+        # estimate; the trainer paces itself by loader.epoch_samples
+        groups = {}
+        for sh in self.shapes:
+            groups[sh] = groups.get(sh, 0) + 1
+        frac = self.epoch_size / max(1, len(self.shapes))
+        return max(1, int(sum(
+            np.ceil(cnt * frac / self._batch_size(*sh))
+            for sh, cnt in groups.items())))
 
 
 def main():
@@ -116,12 +187,14 @@ def main():
 
     configs = edict(
         # Network
-        net_nchannel       = 128,
-        GNN_layers         = ['self', 'cross'] * 6,
+        net_nchannel       = args.nchannel,
+        GNN_layers         = ['self', 'cross'] * args.gnn_pairs,
         net_lambda         = 0.1,
         net_maxiter        = 30,
         dual_knn           = args.dual_knn,
         sign_inv           = args.sign_inv,
+        dustbin            = args.dustbin,
+        geo_edge           = args.geo_edge,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',
@@ -148,6 +221,7 @@ def main():
         in_channel         = 6,
         pose_loss_weight   = args.pose_loss,
         resume             = args.resume,
+        match_w            = args.match_w,
     )
 
     if configs.train_seed is not None:
@@ -171,7 +245,26 @@ def main():
 
     train_dataset = Sim3PluckerData(phase='train', config=configs)
 
-    if args.train_epoch_size > 0:
+    if args.bucket_batch:
+        shapes = [(len(p1), len(p2)) for p1, p2 in
+                  zip(train_dataset.data['plucker1'],
+                      train_dataset.data['plucker2'])]
+        n_shapes = len(set(shapes))
+        epoch_size = args.train_epoch_size if args.train_epoch_size > 0 \
+            else len(train_dataset)
+        sampler = BucketBatchSampler(shapes, epoch_size,
+                                     seed=configs.train_seed or 0)
+        logging.info(f'  bucket_batch: {n_shapes} distinct shapes, '
+                     f'~{len(sampler)} batches/epoch for {epoch_size} samples')
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            num_workers=args.workers, pin_memory=True,
+            persistent_workers=(args.workers > 0),
+            collate_fn=variable_collate,
+        )
+        train_loader.epoch_samples = epoch_size
+    elif args.train_epoch_size > 0:
         train_sampler = RandomSampler(train_dataset,
                                       replacement=True,
                                       num_samples=args.train_epoch_size)
@@ -206,6 +299,12 @@ def main():
 
     # ── Build trainer ─────────────────────────────────────────────────────────
     trainer = Sim3Trainer(configs, train_loader, val_loader)
+    if args.init_from:
+        state = torch.load(args.init_from, map_location='cpu',
+                           weights_only=False)
+        trainer.model.load_state_dict(state['state_dict'])
+        logging.info(f'initialized weights from {args.init_from} '
+                     f'(epoch {state.get("epoch", "?")}, fresh optimizer)')
 
     # ── Load pretrained weights (non-strict, for fine-tuning) ─────────────────
     if args.pretrain and os.path.exists(args.pretrain):
