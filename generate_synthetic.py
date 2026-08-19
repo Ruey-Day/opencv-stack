@@ -192,6 +192,25 @@ if _SUBCAL:
     _FULL = True
     _BROAD = True
 
+# DEALIAS=1 (v27, implies SUBCAL): de-aliased street pool. Measured 2026-08-17:
+# the v6 street pool has median ALIAS MULTIPLICITY 20 (geometrically
+# indistinguishable twins per line at the 8-deg/3%-extent noise floor) vs
+# median 3 on the REAL KITTI lidarv3 maps — the generator made streets 6-7x
+# more ambiguous than reality, capping ANY per-line matcher at ~1/20 = 5%
+# P@200 in-domain (exactly where v19/v25/v26 all saturate). Sources: period-
+# grid vertical positions (node collisions stack identical poles), one
+# constant facade half-width W, uniform facade heights, uniform ground-edge
+# offsets. The DEALIAS pool draws collision-free Poisson vertical sites,
+# per-building facade depth/floor heights, few distinct curb/lane lines and
+# more oblique clutter — targeting real-map multiplicity (~3).
+_DEALIAS = bool(int(os.environ.get('DEALIAS', '0')))
+if _DEALIAS:
+    _SUBCAL = True
+    _GHOST = True
+    _FOUND = True
+    _FULL = True
+    _BROAD = True
+
 # MONO=1 (implies FOUND): add the ALIGNED mono full-map -> LiDAR regime as the
 # 'street_mono' scenario (weight 0.10, others renormalized). FOUND draws the
 # inter-map rotation ~U[0,180] independent of scale, so the small-rotation +
@@ -492,6 +511,105 @@ def _make_large_scale_pool(n: int, pos_range: float = 12.0) -> np.ndarray:
     return pool[np.random.permutation(len(pool))].astype(np.float32)
 
 
+def _make_street_pool_dealias(n: int) -> np.ndarray:
+    """v27 DE-ALIASED street pool: same slab geometry / direction mix /
+    cross-modal weighting as the v6 pool, but with the alias sources removed
+    (see the _DEALIAS comment at the top). Every structural element gets a
+    distinct geometric identity: vertical sites are a collision-free Poisson
+    process, facades belong to BUILDINGS with per-building depth and floor
+    heights, ground edges are a handful of distinct curb/lane offsets."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    n_seg = np.random.randint(2, 6)   # found6: more yaw diversity -> real dir-conc 0.12-0.21
+    ez = np.array([0.0, 0.0, 1.0])
+    ex = np.array([1.0, 0.0, 0.0])
+    lines, wts = [], []
+
+    def add(p, d, w, Ryaw, org):
+        d = Ryaw @ (np.asarray(d, np.float64) + np.random.randn(3) * 0.05)
+        d /= np.linalg.norm(d) + 1e-9
+        p = Ryaw @ np.asarray(p, np.float64) + org
+        lines.append(np.concatenate([np.cross(p, d), d]))
+        wts.append(w)
+
+    org = np.zeros(3)
+    yaw = 0.0
+    per_seg = (2 * n) // n_seg + 1
+    for _seg in range(n_seg):
+        L = float(np.random.uniform(40.0, 250.0))
+        W = float(np.random.uniform(3.0, 8.0))
+        H = float(np.random.uniform(4.0, 10.0))
+        c, si = np.cos(yaw), np.sin(yaw)
+        Ryaw = np.array([[c, -si, 0.0], [si, c, 0.0], [0.0, 0.0, 1.0]])
+        # collision-free vertical sites: Poisson-ish walk, min separation 2.5 m
+        sites = []
+        x = float(np.random.uniform(0.0, 6.0))
+        while x < L:
+            sites.append(x)
+            x += max(5.5, np.random.lognormal(np.log(9.0), 0.5))
+        sites = np.array(sites)
+        np.random.shuffle(sites)
+        site_i = 0
+        # buildings: per-building facade depth offset and distinct floor heights
+        blds = []
+        for side in (-1.0, 1.0):
+            x0 = 0.0
+            while x0 < L:
+                blen = float(np.random.uniform(8.0, 30.0))
+                depth = W + float(np.random.uniform(-1.5, 1.5))
+                floors = np.random.uniform(0.3, H, np.random.randint(2, 5))
+                blds.append((side, x0, min(x0 + blen, L), depth, floors))
+                x0 += blen
+        # ground: few distinct curb/lane offsets for the whole segment
+        n_g = np.random.randint(2, 5)
+        gys = np.random.uniform(-W, W, n_g)
+        made = 0
+        # direction mix matched to REAL maps (dominant-direction concentration
+        # 0.15-0.21): street-axis parallels cut 54% -> 26%, oblique clutter up
+        # to 37% — at street scale the 3%-extent alias gate spans the whole
+        # cross-section, so exact-parallel families are the alias mass and
+        # only direction diversity (as in real curvature-edge maps) breaks it
+        while made < per_seg:
+            r = np.random.random()
+            if r < 0.18 and site_i < len(sites):     # unique vertical site
+                side = -1.0 if np.random.random() < 0.5 else 1.0
+                # extra tilt jitter: real corner/pole lines lean (found6 —
+                # verticals were the 0.30-0.42 direction-concentration mode
+                # vs real maps' 0.12-0.21)
+                add([sites[site_i], side * W * np.random.uniform(0.8, 1.15),
+                     0.0], ez + np.random.randn(3) * 0.06, 1.0, Ryaw, org)
+                site_i += 1
+            elif r < 0.34:                            # facade horizontal
+                side, xa, xb, depth, floors = blds[np.random.randint(len(blds))]
+                add([np.random.uniform(xa, xb), side * depth,
+                     np.random.uniform(0.3, H)], ex, 0.35, Ryaw, org)
+            elif r < 0.38:                            # curb/lane edge, fresh offset
+                add([np.random.uniform(0.0, L),
+                     float(np.random.uniform(-W, W)),
+                     0.0], ex, 0.8, Ryaw, org)
+            elif r < 0.50:                            # cross-street horizontal
+                side, xa, xb, depth, floors = blds[np.random.randint(len(blds))]
+                add([float(np.random.uniform(xa, xb)), side * depth,
+                     np.random.uniform(0.3, H)], [0.0, 1.0, 0.0], 0.5,
+                    Ryaw, org)
+            else:                                     # oblique clutter (37%)
+                add([np.random.uniform(0.0, L), np.random.uniform(-W, W),
+                     np.random.uniform(0.0, 0.6 * H)],
+                    np.random.randn(3), 0.4, Ryaw, org)
+            made += 1
+        org = org + Ryaw @ np.array([L, 0.0, 0.0])
+        yaw += np.deg2rad(np.random.uniform(70.0, 110.0)
+                          * (1 if np.random.random() < 0.5 else -1))
+    A = np.stack(lines).astype(np.float32)
+    p0 = np.cross(A[:, :3], A[:, 3:])
+    shift = -np.median(p0, axis=0)
+    A[:, :3] += np.cross(shift[None].astype(np.float32), A[:, 3:])
+    w = np.asarray(wts, np.float64)
+    order = np.random.choice(len(A), size=n, replace=(n > len(A)),
+                             p=w / w.sum())
+    return A[order]
+
+
 def _make_street_pool(n: int) -> np.ndarray:
     """v6 street-canyon pool, calibrated to the measured KITTI camera/LiDAR
     line maps (2026-07-16: extent ~(80-520) x (8-12) x (5-10) m slab,
@@ -788,7 +906,8 @@ def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     if pool_type in ('street', 'street_submap'):
         # v6: no shuffle here — _make_street_pool's weighted order IS the
         # inlier-selection bias (verticals/ground first)
-        return _make_street_pool(n)
+        return (_make_street_pool_dealias(n) if _DEALIAS
+                else _make_street_pool(n))
 
     if pool_type == 'manhattan':
         n_mw = int(n * np.random.uniform(0.55, 0.85))
@@ -942,7 +1061,14 @@ def _generate_pair() -> dict:
         # facades whose repetitions ARE the confuser structure — no
         # synthetic confusers needed; the pool aliases itself under
         # 180-deg flips and street-axis translations.
-        if _FULL:
+        if _DEALIAS:
+            # found6 recalibration: drift-corrected GT corr (1 m gate) measures
+            # matched-query 14-21% on the real mono_best full maps — the old
+            # Beta(1.7,20) ~8% was fit to the pre-drift-correction 0.5 m gate
+            n2           = np.random.randint(800, 6000)
+            n1           = np.random.randint(500, 3500)
+            overlap_frac = float(np.random.beta(2.5, 7.5))   # mf med ~0.17, covers 0.08-0.35
+        elif _FULL:
             n2           = np.random.randint(800, 6000)    # bounded street-size range
             n1           = np.random.randint(500, 3500)
             overlap_frac = float(np.random.beta(1.7, 20.0))  # ~8%, tail ~20% (bounds KITTI 2-8)
@@ -970,7 +1096,7 @@ def _generate_pair() -> dict:
             # v24: calibrated to the measured submap-quarter benchmark
             n2           = np.random.randint(800, 6000)    # full route (real 1273-5599)
             n1           = np.random.randint(100, 850)     # quarter (real 115-821)
-            overlap_frac = float(np.random.beta(2.5, 5.0))  # mean ~0.33 (real med ~0.35)
+            overlap_frac = float(np.random.beta(2.4, 6.8))  # found6: mf med ~0.35 (real 27-62%), covers 0.15-0.55
         elif _FULL:
             n2           = np.random.randint(800, 6000)    # full route, bounded range
             n1           = np.random.randint(250, 1400)    # short submap
@@ -1011,7 +1137,7 @@ def _generate_pair() -> dict:
         # (median ~40%), scale 9-39, rotation 0.6-6 deg (gravity-aligned frames).
         n2           = np.random.randint(300, 5600)
         n1           = np.random.randint(300, 3300)
-        overlap_frac = float(np.random.beta(2.5, 4.0))   # mean ~0.38 (real 9-57%, med ~0.40)
+        overlap_frac = float(np.random.beta(2.0, 9.0))   # found6: unique-matched-query med ~0.17 (real 14-21%), covers to ~0.35
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street'
