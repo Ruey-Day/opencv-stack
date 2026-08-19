@@ -7,39 +7,50 @@ SHIPPED (2026-08-19): the Grass 2-LINE pipeline, the only solver.
     R, t, s = solve_sim3(solver, prob_matrix)        # matcher prob (n_ref,n_q)
 
 Lines are Plücker [m; d] (sign ambiguity [m;d] ~ [-m;-d]); positions are always
-foot points p0 = d x m (sign-invariant). Pipeline, every stage ablation-tested:
+foot points p0 = d x m (sign-invariant). Pipeline (FROZEN 2026-08-19; every
+stage and every default carries a controlled A/B — root CLAUDE.md +
+scratchpad_*_v27.txt):
 
   0. prenorm: both clouds scaled so the reference median foot radius is 1 —
-     all thresholds below are calibrated in these units (ablation: removing it
-     costs 1 pair indoors, 2/5 outdoors).
-  1. top-K matcher pairs (K=200) -> nsamp random 2-line samples.
-  2. SKEW OBSERVABILITY GATE |(d1xd2).(f2-f1)| > 0.2 on both clouds — two
-     lines fix Sim(3) only if skew; near-coplanar pairs are scale-degenerate
-     yet self-consistent, so no residual test can catch them (+1 pair AND
-     ~2x faster: rejected samples cost nothing).
+     the assumption-free units normalization every threshold is calibrated in.
+     (The extent-ratio SNORM and the scale clamp were both removed: unclamped
+     is bit-identical — the position-aware criterion cannot reward collapsed
+     scales.)
+  1. top-K matcher pairs (K=200, LOAD-BEARING: 150/100 -> -4/-9 pairs) ->
+     nsamp random 2-line samples (LESS IS MORE: 2000 indoor / 4000 outdoor
+     are interior optima — more samples = more impostor exposure).
+  2. SCALE-FREE SKEW OBSERVABILITY GATE, pre-solve: |(d1xd2).(f2-f1)| >
+     skew_min x (per-cloud median foot radius), both clouds — two lines fix
+     Sim(3) only if skew; near-coplanar pairs are scale-degenerate yet
+     self-consistent (no residual test can catch them). Rejected samples are
+     never solved.
   3. minimal solve: hemisphere-canon SVD Procrustes (directions) + joint 4x4
-     linear (t,s) from the moment constraint. Optional: `iters` runs the
-     closed-form alternating descent on the Grassmann projection cost
-     (`_alternate`, sign-invariant, also the E2E training head) — benchmark
-     accuracy is identical at 0 iterations, so the default skips it.
-  4. CONSISTENCY FILTER: the projection cost of the fitted pair (8 constraints
-     vs 7 DoF -> 1 redundant: contaminated pairs cannot fit, cost stays high;
-     pure pairs fit to ~0). cost < 0.12, plus the (smin, smax) scale clamp.
-  5. PROP G(2,4) SELECTION: every hypothesis scored over all K pairs by
-     sum(max(0, 1 - theta/tau)) where theta is the max principal angle between
-     the affine-Grassmann embeddings — position-aware (vetoes direction-
-     consistent flips), graded (precision outranks equal loose counts; a plain
-     hard count is brittle in tau), one parameter. tau=3 deg indoors; ~9 deg
-     for high-noise/outdoor regimes.
-  6. strict G(2,4) gate (4 deg) -> Cauchy-robust manifold refine of (R,t,s)
-     (finite-difference ascent; essential outdoors: 3/5 -> 1/5 without).
+     linear (t,s) from the moment constraint, then alt_iters=3 closed-form
+     alternating steps on the Grassmann projection cost (`_alternate`,
+     sign-invariant, also the E2E training head). 3 suffices: the L2 init
+     lands in-basin and 3 steps absorb the residual below the ~8 deg noise
+     floor (3 = 25 = 100 empirically).
+  4. CONSISTENCY FILTER: converged projection cost < 0.12 (8 constraints vs
+     7 DoF -> contaminated pairs cannot fit; quality-inert at every tested
+     threshold — retained purely to cut scoring cost).
+  5. G(2,4) LADDER SELECTION: every hypothesis scored over all K pairs by the
+     summed inlier count at taus=(1,2,3) deg (indoor) / (3,6,9) (outdoor) on
+     the max principal angle between affine-Grassmann embeddings —
+     position-aware, vetoes direction-consistent flips. Argmax wins. END.
 
-v27 caches, CPU: 7-Scenes 21/37 @5 (med 3.84 deg / 4.0% / 0.121 m) at ~70 ms;
-KITTI mono_best 3/5 (tau=9, extent prenorm) at ~100 ms; submaps matcher-bound.
+  NO refinement (four families tested — Cauchy G(2,4) FD, alternation-L2,
+  R-locked LS, iterative re-gated LS — all lose to none: today's filtered,
+  polished hypotheses beat their own inlier-pool averages). Residual
+  translation error equals its line-observable projection (t_gr/t_e ~ 0.96):
+  not a manifold artifact; correspondence-bound.
 
-`solve_sim3_unified` is kept as a compatibility alias: legacy kwargs whose
-semantics changed (taus ladder, sign_search, refine_tol) are accepted and
-ignored; it runs THIS solver.
+v27 caches, CPU: 7-Scenes 23/37 @5 (rot med 3.56 deg, <5 deg 29/37, s 6.0%,
+t 0.169 m) at ~42 ms; KITTI mono_best 2/5 (rot med 2.81 deg, <5 deg 4/5) at
+~180 ms with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
+
+`solve_sim3_unified` is kept as a compatibility alias: legacy kwargs
+(refit_tau_deg, refine_*, sign_search, taus ladders, smin/smax) are accepted
+and ignored; it runs THIS solver at the frozen defaults.
 """
 import numpy as np
 
@@ -307,15 +318,31 @@ def _refine_g24(plq, plr, idx, R, t, s, rb, n_iter=200, tol=1e-4):
 # ── THE solver ──────────────────────────────────────────────────────────────
 
 
-def solve_sim3(solver, prob, topk=200, nsamp=4000, tau_deg=3.0,
-               refit_tau_deg=4.0, refine_rb_deg=1.0, skew_min=0.2,
-               cost_max=0.12, iters=(0, 0), cost_phase1=1.5,
-               smin=0.05, smax=20.0, seed=0):
-    """SHIPPED Sim(3) estimate from a matcher probability matrix (see module
-    docstring for the pipeline). Returns (R, t, s), t in the original metric
-    frame. tau_deg: prop-score cutoff — 3 (indoor default) to ~9 (high-noise/
-    outdoor). smin/smax: scale sanity clamp — widen (or extent-prenormalize
-    the query) when true scales can exceed 20."""
+def solve_sim3(solver, prob, topk=200, nsamp=2000, taus=(1.0, 2.0, 3.0),
+               skew_min=0.2, cost_max=0.12, alt_iters=3, seed=0,
+               smin=0.0, smax=0.0):
+    """THE shipped Sim(3) estimate from a matcher probability matrix.
+    FROZEN 2026-08-19 (validated on the v27 caches; every default carries a
+    controlled A/B — see root CLAUDE.md and scratchpad_*_v27.txt logs).
+
+    Defaults = INDOOR profile (7-Scenes 23/37 @5, rot med 3.56 deg, ~47 ms).
+    OUTDOOR / high-noise profile: taus=(3, 6, 9), skew_min=0.05, nsamp=4000
+    (KITTI mono_best 2/5, rot med 2.81 deg, ~140 ms).
+
+    Pipeline: top-k candidates -> 2-line samples -> SCALE-FREE skew
+    observability gate (threshold x per-cloud median foot radius; rejects
+    scale-degenerate near-coplanar/parallel pairs BEFORE solving) ->
+    hemisphere-canon SVD Procrustes + joint (t,s) init -> alt_iters closed-form
+    alternation steps on the Grassmann projection cost (the L2 init lands
+    in-basin; 3 steps absorb the residual below the ~8 deg correspondence
+    noise floor) -> consistency filter (converged projection cost < cost_max;
+    sign-invariant) -> G(2,4) ladder inlier count over all top-k pairs ->
+    argmax. NO refinement (4 families tested, all lose to none), NO scale
+    prior/clamp (smin/smax=0 = off; the position-aware criterion cannot reward
+    collapsed scales), NO sign handling beyond the init canon. topk=200 is
+    load-bearing (do not reduce); nsamp is a less-is-more knob (2000/4000 are
+    the per-regime optima). Returns (R, t, s), t in the original metric frame."""
+    cost_thr = np.array([np.cos(np.deg2rad(a)) for a in taus])
     nq = prob.shape[1]; k = min(topk, prob.size)
     flat = np.argpartition(prob.ravel(), -k)[-k:]
     ir, iq = flat // nq, flat % nq
@@ -324,12 +351,15 @@ def solve_sim3(solver, prob, topk=200, nsamp=4000, tau_deg=3.0,
     rng = np.random.default_rng(seed)
     T = rng.integers(0, K, (nsamp, 2))
     T = T[T[:, 0] != T[:, 1]]
-    if skew_min > 0:                                 # observability gate FIRST
+    if skew_min > 0:                # scale-free observability gate, PRE-solve
         ok = np.ones(len(T), bool)
         for pl in (plq, plr):
+            f_all = _feet(pl[3:].T, pl[:3].T)
+            thr = skew_min * (float(np.median(
+                np.linalg.norm(f_all, axis=1))) + 1e-9)
             a, b = pl[3:, T[:, 0]].T, pl[3:, T[:, 1]].T
-            fa = _feet(a, pl[:3, T[:, 0]].T); fb = _feet(b, pl[:3, T[:, 1]].T)
-            ok &= np.abs((np.cross(a, b) * (fb - fa)).sum(1)) > skew_min
+            ok &= np.abs((np.cross(a, b)
+                          * (f_all[T[:, 1]] - f_all[T[:, 0]])).sum(1)) > thr
         T = T[ok]
     if len(T) == 0:
         return np.eye(3), np.zeros(3), 1.0
@@ -344,39 +374,35 @@ def solve_sim3(solver, prob, topk=200, nsamp=4000, tau_deg=3.0,
     Rs = _procrustes_batch(dqc, drc)
     ts, ss = _solve_ts_batch(mqc, dqc, mrc, Rs)
     ss = np.clip(np.abs(ss), 1e-3, 1e3)
-    Rs, ts, ss, cost = _alternate(dq, fq, dr, fr, Rs, ts, ss, iters[0])
-    if iters[1] > 0:                                 # optional polish phase
-        keep = np.isfinite(cost) & (cost < cost_phase1)
-        Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
-        dq, fq, dr, fr = dq[keep], fq[keep], dr[keep], fr[keep]
-        if len(Rs) == 0:
-            return np.eye(3), np.zeros(3), 1.0
-        Rs, ts, ss, cost = _alternate(dq, fq, dr, fr, Rs, ts, ss, iters[1])
-    keep = np.isfinite(cost) & (ss > smin) & (ss < smax)   # consistency filter
+    Rs, ts, ss, cost = _alternate(dq, fq, dr, fr, Rs, ts, ss, alt_iters)
+    keep = np.isfinite(cost)                         # consistency filter
     if cost_max > 0:
         keep &= cost < cost_max
+    if smin > 0:
+        keep &= ss > smin
+    if smax > 0:
+        keep &= ss < smax
     Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
     if len(Rs) == 0:
         return np.eye(3), np.zeros(3), 1.0
-    sc = _score_prop(plq, plr, Rs, ts, ss, np.deg2rad(tau_deg))
+    sc = _g24_count_batch(plq[3:], plq[:3], plr[3:], plr[:3],
+                          Rs, ts, ss, cost_thr)      # ladder selection
     bi = int(np.argmax(sc))
     R, t, s = Rs[bi], ts[bi], float(ss[bi])
-    if refit_tau_deg > 0:                            # strict gate -> refine
-        cs = _g24_cos_all(plq, plr, R, np.asarray(t), s)
-        idx = np.where(cs > np.cos(np.deg2rad(refit_tau_deg)))[0]
-        if len(idx) < 6:
-            k2 = min(20, len(cs)); idx = np.argpartition(cs, -k2)[-k2:]
-        R, t, s = _refine_g24(plq, plr, idx, R.copy(), np.asarray(t).copy(), s,
-                              np.deg2rad(refine_rb_deg))
     return R, np.asarray(t) / solver.alpha, s
 
 
-def solve_sim3_unified(solver, prob, topk=200, nsamp=4000, refit_tau_deg=4.0,
-                       refine_rb_deg=1.0, smin=0.05, smax=20.0, seed=0,
+# Outdoor/high-noise profile as a convenience (KITTI mono_best-validated):
+SOLVE_SIM3_OUTDOOR = dict(taus=(3.0, 6.0, 9.0), skew_min=0.05, nsamp=4000)
+
+
+def solve_sim3_unified(solver, prob, topk=200, nsamp=None, seed=0,
                        **_legacy_ignored):
     """Compatibility alias for pre-2026-08-19 callers: runs THE shipped
-    solver. Legacy kwargs with changed semantics (taus ladder, sign_search,
-    refine_tol, ...) are accepted and ignored."""
-    return solve_sim3(solver, prob, topk=topk, nsamp=nsamp,
-                      refit_tau_deg=refit_tau_deg, refine_rb_deg=refine_rb_deg,
-                      smin=smin, smax=smax, seed=seed)
+    solver at its frozen defaults. Legacy kwargs (taus ladder variants,
+    refit_tau_deg, refine_*, sign_search, smin/smax, ...) are accepted and
+    ignored — refinement and the scale clamp no longer exist."""
+    kw = dict(topk=topk, seed=seed)
+    if nsamp is not None:
+        kw['nsamp'] = nsamp
+    return solve_sim3(solver, prob, **kw)
