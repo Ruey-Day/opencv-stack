@@ -290,9 +290,9 @@ class AttentionalPropagation(nn.Module):
 
 
 class SpatialAttentionalGNN(nn.Module):
-    def __init__(self, feature_dim: int, layer_names: list):
+    def __init__(self, feature_dim: int, layer_names: list, num_heads: int = 4):
         super().__init__()
-        self.layers = nn.ModuleList([AttentionalPropagation(feature_dim, 4)
+        self.layers = nn.ModuleList([AttentionalPropagation(feature_dim, num_heads)
                                      for _ in range(len(layer_names))])
         self.names = layer_names
         self.mlp   = MLP([feature_dim * 3, feature_dim * 2, feature_dim * 2, feature_dim])
@@ -342,7 +342,9 @@ class FeatureExtractorGraph(nn.Module):
         self.conv_in    = conv_in_seq_direction_moment_knn(
             nc, in_channel=in_channel, dual_knn=dual_knn,
             geo_edge=self.geo_edge, geo_knn=self.geo_knn)
-        self.gnn        = SpatialAttentionalGNN(nc, config['GNN_layers'])
+        self.gnn        = SpatialAttentionalGNN(
+            nc, config['GNN_layers'],
+            num_heads=int(config['attn_heads']) if 'attn_heads' in config else 4)
         self.final_proj = nn.Conv1d(nc, nc, kernel_size=1, bias=True)
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 

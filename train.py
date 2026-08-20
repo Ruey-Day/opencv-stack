@@ -113,6 +113,9 @@ def parse_args():
                         'learnable no-match bin — unmatched lines park mass '
                         'in the bin instead of polluting real pairs (real '
                         'cross-modal overlap is 2-8%%)')
+    p.add_argument('--attn_heads', type=int, default=4,
+                   help='attention heads in the GNN (default 4 = upstream; '
+                        '1 = single-head ablation, same param count)')
     p.add_argument('--geo_knn', action='store_true',
                    help='v29: sign-invariant GEOMETRIC KNN graph (foot points '
                         '+ sqrt(2)sin(theta) direction term) instead of KNN on '
@@ -201,6 +204,7 @@ def main():
         dustbin            = args.dustbin,
         geo_edge           = args.geo_edge,
         geo_knn            = args.geo_knn,
+        attn_heads         = args.attn_heads,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',

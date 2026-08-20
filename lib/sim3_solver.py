@@ -24,12 +24,17 @@ scratchpad_*_v27.txt):
      Sim(3) only if skew; near-coplanar pairs are scale-degenerate yet
      self-consistent (no residual test can catch them). Rejected samples are
      never solved.
-  3. minimal solve: hemisphere-canon SVD Procrustes (directions) + joint 4x4
-     linear (t,s) from the moment constraint, then alt_iters=3 closed-form
+  3. minimal solve: SVD Procrustes (directions) + joint 4x4 linear (t,s)
+     from the moment constraint, then alt_iters=3 closed-form
      alternating steps on the Grassmann projection cost (`_alternate`,
      sign-invariant, also the E2E training head). 3 suffices: the L2 init
      lands in-basin and 3 steps absorb the residual below the ~8 deg noise
-     floor (3 = 25 = 100 empirically).
+     floor (3 = 25 = 100 empirically). SIGN HANDLING, init='2sign' (default):
+     line 1 is hemisphere-canonicalized and BOTH signs of line 2 are proposed
+     (2 hypotheses/sample), letting G(2,4) arbitrate — strictly better than the
+     per-line hemisphere canon indoors (+1 strict, better rot/scale/trans
+     medians) at ~+35% runtime, identical outdoors; init='hemi' restores the
+     1-hypothesis canon (better only on the matcher-bound submap tail).
   4. CONSISTENCY FILTER: converged projection cost < 0.12 (8 constraints vs
      7 DoF -> contaminated pairs cannot fit; quality-inert at every tested
      threshold — retained purely to cut scoring cost).
@@ -48,9 +53,9 @@ scratchpad_*_v27.txt):
   translation error equals its line-observable projection (t_gr/t_e ~ 0.96):
   not a manifold artifact; correspondence-bound.
 
-v27 caches, CPU: 7-Scenes 22/37 @5 (rot med 3.93 deg, <5 deg 27/37, s 5.0%,
-t 0.180 m) at ~50 ms; KITTI mono_best 2/5 (rot med 4.93 deg, s 9.7%, @10 3/5)
-at ~200 ms with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
+v27 caches, CPU: 7-Scenes 23/37 @5 (rot med 3.62 deg, <5 deg 28/37, <10 deg
+35/37, s 4.6%, t 0.177 m) at ~77 ms; KITTI mono_best 2/5 (rot med 4.93 deg,
+s 9.7%, @10 3/5) at ~195 ms with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
 
 `solve_sim3_unified` is kept as a compatibility alias: legacy kwargs
 (refit_tau_deg, refine_*, sign_search, taus ladders, smin/smax) are accepted
@@ -251,8 +256,8 @@ def _score_prop(plq, plr, Rs, ts, ss, tau_rad, chunk=1024):
 
 
 def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=4.0,
-               skew_min=0.1, cost_max=0.12, alt_iters=3, seed=0,
-               smin=0.0, smax=0.0):
+               skew_min=0.1, cost_max=0.12, alt_iters=3, init='2sign',
+               seed=0, smin=0.0, smax=0.0):
     """THE shipped Sim(3) estimate from a matcher probability matrix.
     FROZEN 2026-08-19 (validated on the v27 caches; every default carries a
     controlled A/B — see root CLAUDE.md and scratchpad_*_v27.txt logs).
@@ -300,13 +305,25 @@ def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=4.0,
     mq = np.stack([plq[:3, T[:, l]].T for l in range(2)], 1)
     mr = np.stack([plr[:3, T[:, l]].T for l in range(2)], 1)
     fq, fr = _feet(dq, mq), _feet(dr, mr)
-    sgq, sgr = _maxabs_sign(dq), _maxabs_sign(dr)    # minimal solve (init)
-    dqc, mqc = dq * sgq[..., None], mq * sgq[..., None]
+    sgr = _maxabs_sign(dr)
     drc, mrc = dr * sgr[..., None], mr * sgr[..., None]
-    Rs = _procrustes_batch(dqc, drc)
-    ts, ss = _solve_ts_batch(mqc, dqc, mrc, Rs)
-    ss = np.clip(np.abs(ss), 1e-3, 1e3)
-    Rs, ts, ss, cost = _alternate(dq, fq, dr, fr, Rs, ts, ss, alt_iters)
+
+    def _init(sq):
+        # the sign canon feeds ONLY the init; `_alternate` gets the raw
+        # quantities (it is sign-invariant, and the feet f = d x m already are)
+        dqc, mqc = dq * sq[..., None], mq * sq[..., None]
+        Rs = _procrustes_batch(dqc, drc)
+        ts, ss = _solve_ts_batch(mqc, dqc, mrc, Rs)
+        return _alternate(dq, fq, dr, fr, Rs, ts,
+                          np.clip(np.abs(ss), 1e-3, 1e3), alt_iters)
+
+    if init == '2sign':          # canon line 1, PROPOSE both signs of line 2
+        s1 = _maxabs_sign(dq[:, :1])[:, 0]
+        outs = [_init(np.stack([s1, s1 * f], 1)) for f in (1.0, -1.0)]
+        Rs, ts, ss, cost = (np.concatenate([o[i] for o in outs])
+                            for i in range(4))
+    else:                        # per-line hemisphere canon (1 hyp/sample)
+        Rs, ts, ss, cost = _init(_maxabs_sign(dq))
     keep = np.isfinite(cost)                         # consistency filter
     if cost_max > 0:
         keep &= cost < cost_max
