@@ -107,6 +107,42 @@ class prob_mat_sinkhorn(nn.Module):
         return Z.exp()[:, :Nr, :Nq]
 
 
+GEO_KNN_W = 0.5   # direction weight in sigma-units: sin(90deg) contributes ~0.7
+
+
+def geo_knn_idx(raw, k):
+    """Sign-invariant GEOMETRIC KNN graph (v29, geo_knn flag).
+
+    The base graph was KNN on the first 3 feature channels — raw moments are
+    SIGN-dependent (m and -m are L2-far: spatially adjacent lines with
+    opposite stored signs never become neighbors) and origin-lever-arm
+    quantities; under sign_inv the learned even embedding hides the sign
+    issue but the space is arbitrary early in training. This graph instead
+    uses explicit geometry, all sign-invariant:
+      position:  foot points p0 = d x m  (p0(-L) = p0(L)), normalized by the
+                 per-cloud median foot radius
+      direction: vec(d d^T) with sqrt(2) off-diagonals, whose pairwise L2 is
+                 exactly sqrt(2) sin(theta_ij) — the |cos| metric in a form
+                 plain KNN consumes; weighted by GEO_KNN_W
+    Restores upstream's direction-aware neighborhoods without its sign
+    fragility. raw: (B, 6, N) RAW [m; d] -> idx (B, N, k)."""
+    m, d = raw[:, :3], raw[:, 3:]
+    d = F.normalize(d, dim=1)
+    p0 = torch.cross(d, m, dim=1)                     # (B, 3, N)
+    # mean centre (rotation-EQUIVARIANT — a coordinate-wise median is not,
+    # which perturbed the normalizer under rotation and broke graph
+    # invariance via distance ties)
+    ctr = p0.mean(dim=2, keepdim=True)
+    sig = (p0 - ctr).norm(dim=1).median(dim=1).values.clamp_min(1e-9)
+    pn = p0 / sig.view(-1, 1, 1)
+    dx, dy, dz = d[:, 0:1], d[:, 1:2], d[:, 2:3]
+    s2 = 2.0 ** 0.5
+    outer = torch.cat([dx * dx, dy * dy, dz * dz,
+                       s2 * dx * dy, s2 * dx * dz, s2 * dy * dz], dim=1)
+    feat = torch.cat([pn, GEO_KNN_W * outer], dim=1)
+    return knn(feat, min(k, raw.size(-1)))
+
+
 def geo_edge_features(raw, idx):
     """Sim(3)-INVARIANT relative-geometry edge features (v24, geo_edge flag).
 
@@ -156,11 +192,13 @@ def geo_edge_features(raw, idx):
 
 class conv_in_seq_direction_moment_knn(nn.Module):
     def __init__(self, out_channel: int, in_channel: int = 6,
-                 dual_knn: bool = False, geo_edge: bool = False):
+                 dual_knn: bool = False, geo_edge: bool = False,
+                 geo_knn: bool = False):
         super().__init__()
         half = out_channel // 2
 
         self.geo_edge = geo_edge
+        self.geo_knn = geo_knn
         if geo_edge:
             # third branch mirroring the other two; merged MLP widens
             self.conv_geo = nn.Conv2d(3, half // 8, 1)
@@ -191,7 +229,11 @@ class conv_in_seq_direction_moment_knn(nn.Module):
 
     def forward(self, x, raw=None):
         dir_feat = x[:, :3, :]
-        idx = knn(dir_feat, k=min(10, dir_feat.size(-1)))
+        if self.geo_knn:
+            assert raw is not None, 'geo_knn needs the raw [m;d] input'
+            idx = geo_knn_idx(raw, 10)
+        else:
+            idx = knn(dir_feat, k=min(10, dir_feat.size(-1)))
         x_dir = self.mlp_direction(
             self.conv_direction(get_graph_feature(dir_feat, idx=idx)).mean(dim=-1))
         if self.dual_knn:
@@ -294,17 +336,19 @@ class FeatureExtractorGraph(nn.Module):
         nc = config['net_nchannel']
         dual_knn = bool(config['dual_knn']) if 'dual_knn' in config else False
         self.geo_edge = bool(config['geo_edge']) if 'geo_edge' in config else False
+        self.geo_knn = bool(config['geo_knn']) if 'geo_knn' in config else False
         self.sign_inv = bool(config['sign_inv']) if 'sign_inv' in config else False
         self.sym = SymmetricInputEmbed(in_channel) if self.sign_inv else None
         self.conv_in    = conv_in_seq_direction_moment_knn(
             nc, in_channel=in_channel, dual_knn=dual_knn,
-            geo_edge=self.geo_edge)
+            geo_edge=self.geo_edge, geo_knn=self.geo_knn)
         self.gnn        = SpatialAttentionalGNN(nc, config['GNN_layers'])
         self.final_proj = nn.Conv1d(nc, nc, kernel_size=1, bias=True)
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 
     def forward(self, x, y):
-        raw_x, raw_y = (x, y) if self.geo_edge else (None, None)
+        need_raw = self.geo_edge or self.geo_knn
+        raw_x, raw_y = (x, y) if need_raw else (None, None)
         if self.sym is not None:                # per-line sign-even embedding first
             x, y = self.sym(x), self.sym(y)
         desc0, desc1, x_prob, y_prob = self.gnn(self.conv_in(x, raw=raw_x),

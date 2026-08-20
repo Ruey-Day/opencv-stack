@@ -113,6 +113,11 @@ def parse_args():
                         'learnable no-match bin — unmatched lines park mass '
                         'in the bin instead of polluting real pairs (real '
                         'cross-modal overlap is 2-8%%)')
+    p.add_argument('--geo_knn', action='store_true',
+                   help='v29: sign-invariant GEOMETRIC KNN graph (foot points '
+                        '+ sqrt(2)sin(theta) direction term) instead of KNN on '
+                        'learned/moment channels — restores direction-aware '
+                        'neighborhoods without sign fragility')
     p.add_argument('--geo_edge', action='store_true',
                    help='v24: Sim(3)-invariant relative-geometry edge features '
                         '(inter-line angle + normalized line-line distance) in '
@@ -195,6 +200,7 @@ def main():
         sign_inv           = args.sign_inv,
         dustbin            = args.dustbin,
         geo_edge           = args.geo_edge,
+        geo_knn            = args.geo_knn,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',

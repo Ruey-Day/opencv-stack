@@ -33,10 +33,14 @@ scratchpad_*_v27.txt):
   4. CONSISTENCY FILTER: converged projection cost < 0.12 (8 constraints vs
      7 DoF -> contaminated pairs cannot fit; quality-inert at every tested
      threshold — retained purely to cut scoring cost).
-  5. G(2,4) LADDER SELECTION: every hypothesis scored over all K pairs by the
-     summed inlier count at taus=(1,2,3) deg (indoor) / (3,6,9) (outdoor) on
-     the max principal angle between affine-Grassmann embeddings —
-     position-aware, vetoes direction-consistent flips. Argmax wins. END.
+  5. PROP G(2,4) SELECTION: every hypothesis scored over all K pairs by
+     sum(max(0, 1 - theta/tau)) on the max principal angle theta between
+     affine-Grassmann embeddings — position-aware (vetoes direction-consistent
+     flips), graded (precision outranks equal loose counts), ONE parameter:
+     tau_deg = 4 indoor / 10 outdoor (smooth plateau in tau; hard counting is
+     brittle, the 3-rung ladder is +1 strict indoors but -9pts outdoor scale —
+     moved to tools/g24_legacy.py for the experiment harness). Also the exact
+     linear kernel of the E2E soft score. Argmax wins. END.
 
   NO refinement (four families tested — Cauchy G(2,4) FD, alternation-L2,
   R-locked LS, iterative re-gated LS — all lose to none: today's filtered,
@@ -44,9 +48,9 @@ scratchpad_*_v27.txt):
   translation error equals its line-observable projection (t_gr/t_e ~ 0.96):
   not a manifold artifact; correspondence-bound.
 
-v27 caches, CPU: 7-Scenes 23/37 @5 (rot med 3.56 deg, <5 deg 29/37, s 6.0%,
-t 0.169 m) at ~42 ms; KITTI mono_best 2/5 (rot med 2.81 deg, <5 deg 4/5) at
-~180 ms with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
+v27 caches, CPU: 7-Scenes 22/37 @5 (rot med 3.93 deg, <5 deg 27/37, s 5.0%,
+t 0.180 m) at ~50 ms; KITTI mono_best 2/5 (rot med 4.93 deg, s 9.7%, @10 3/5)
+at ~200 ms with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
 
 `solve_sim3_unified` is kept as a compatibility alias: legacy kwargs
 (refit_tau_deg, refine_*, sign_search, taus ladders, smin/smax) are accepted
@@ -239,95 +243,23 @@ def _score_prop(plq, plr, Rs, ts, ss, tau_rad, chunk=1024):
     return out
 
 
-def _g24_count_batch(dq, mq, dr, mr, Rs, ts, ss, cost):
-    """LEGACY primitive (pre-2026-08-19 ladder counting) kept for the
-    experiment harness; the shipped scorer is _score_prop."""
-    Yr = _yz_np(np.cross(mr.T, dr.T), dr.T)
-    out = np.empty(len(Rs))
-    for lo in range(0, len(Rs), 1024):
-        Rc, tc, sc = Rs[lo:lo + 1024], ts[lo:lo + 1024], ss[lo:lo + 1024]
-        d_t = np.einsum('hij,jn->hin', Rc, dq)
-        m_t = sc[:, None, None] * np.einsum('hij,jn->hin', Rc, mq) \
-            + np.cross(tc[:, :, None], d_t, axis=1)
-        Yq = _yz_np(np.transpose(np.cross(m_t, d_t, axis=1), (0, 2, 1)),
-                    np.transpose(d_t, (0, 2, 1)))
-        cs = _s2_np(np.einsum('hkai,kaj->hkij', Yq, Yr))
-        out[lo:lo + 1024] = (cs[:, :, None] > cost[None, None, :]).sum(1).sum(1)
-    return out
 
 
-def _g24_cos_all(plq, plr, R, t, s):
-    mq, dq, mr, dr = plq[:3], plq[3:], plr[:3], plr[3:]
-    d_t = R @ dq; m_t = s * (R @ mq) + np.cross(t[None, :], d_t.T).T
-    Yq = _yz_np(np.cross(m_t.T, d_t.T), d_t.T)
-    Yr = _yz_np(np.cross(mr.T, dr.T), dr.T)
-    return _s2_np(np.einsum('nak,nal->nkl', Yq, Yr))
-
-
-def _expm_so3(w):
-    th = np.linalg.norm(w)
-    if th < 1e-12:
-        return np.eye(3)
-    k = w / th
-    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
-
-
-def _refine_g24(plq, plr, idx, R, t, s, rb, n_iter=200, tol=1e-4):
-    """Cauchy-robust joint (R,t,s) ascent of the G(2,4) agreement over the
-    strict inlier pool (finite differences + backtracking). Essential in
-    high-noise regimes; the plain/IRLS alternation refine is within ~1 pair
-    but this keeps the edge (measured 2026-08-18)."""
-    mq, dq, mr, dr = plq[:3, idx], plq[3:, idx], plr[:3, idx], plr[3:, idx]
-    Yr = _yz_np(np.cross(mr.T, dr.T), dr.T)
-
-    def g(R, t, s):
-        d_t = R @ dq; m_t = s * (R @ mq) + np.cross(t[None, :], d_t.T).T
-        Yq = _yz_np(np.cross(m_t.T, d_t.T), d_t.T)
-        M = np.einsum('nak,nal->nkl', Yq, Yr)
-        th = np.arccos(np.clip(_s2_np(M), -1, 1))
-        return ((M ** 2).sum((1, 2)) / (1 + (th / rb) ** 2)).sum()
-
-    eps = 1e-4; step = .05; cur = g(R, t, s)
-    for _ in range(n_iter):
-        gr = np.zeros(7)
-        for k in range(3):
-            w = np.zeros(3); w[k] = eps
-            gr[k] = (g(_expm_so3(w) @ R, t, s) - g(_expm_so3(-w) @ R, t, s)) / (2 * eps)
-        for k in range(3):
-            e = np.zeros(3); e[k] = eps
-            gr[3 + k] = (g(R, t + e, s) - g(R, t - e, s)) / (2 * eps)
-        gr[6] = (g(R, t, s * np.exp(eps)) - g(R, t, s * np.exp(-eps))) / (2 * eps)
-        if np.linalg.norm(gr) < 1e-9:
-            break
-        for _bt in range(20):
-            Rn = _expm_so3(step * gr[:3]) @ R
-            tn = t + step * gr[3:6]; sn = s * np.exp(step * gr[6])
-            v = g(Rn, tn, sn)
-            if v > cur:
-                gain = v - cur; R, t, s, cur = Rn, tn, sn, v; step *= 1.3
-                if gain < tol * max(cur, 1e-9):
-                    return R, np.asarray(t), s
-                break
-            step *= .5
-        else:
-            break
-    return R, np.asarray(t), s
 
 
 # ── THE solver ──────────────────────────────────────────────────────────────
 
 
-def solve_sim3(solver, prob, topk=200, nsamp=2000, taus=(1.0, 2.0, 3.0),
-               skew_min=0.2, cost_max=0.12, alt_iters=3, seed=0,
+def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=4.0,
+               skew_min=0.1, cost_max=0.12, alt_iters=3, seed=0,
                smin=0.0, smax=0.0):
     """THE shipped Sim(3) estimate from a matcher probability matrix.
     FROZEN 2026-08-19 (validated on the v27 caches; every default carries a
     controlled A/B — see root CLAUDE.md and scratchpad_*_v27.txt logs).
 
-    Defaults = INDOOR profile (7-Scenes 23/37 @5, rot med 3.56 deg, ~47 ms).
-    OUTDOOR / high-noise profile: taus=(3, 6, 9), skew_min=0.05, nsamp=4000
-    (KITTI mono_best 2/5, rot med 2.81 deg, ~140 ms).
+    Defaults = INDOOR profile (7-Scenes 22/37 @5, rot med 3.93 deg, s 5.0%,
+    ~50 ms). OUTDOOR / high-noise profile = SOLVE_SIM3_OUTDOOR: tau_deg=10,
+    skew_min=0.05, nsamp=4000 (KITTI mono_best 2/5, s 9.7%, @10 3/5, ~200 ms).
 
     Pipeline: top-k candidates -> 2-line samples -> SCALE-FREE skew
     observability gate (threshold x per-cloud median foot radius; rejects
@@ -336,13 +268,13 @@ def solve_sim3(solver, prob, topk=200, nsamp=2000, taus=(1.0, 2.0, 3.0),
     alternation steps on the Grassmann projection cost (the L2 init lands
     in-basin; 3 steps absorb the residual below the ~8 deg correspondence
     noise floor) -> consistency filter (converged projection cost < cost_max;
-    sign-invariant) -> G(2,4) ladder inlier count over all top-k pairs ->
+    sign-invariant) -> PROP G(2,4) score sum(max(0, 1-theta/tau)) over all
+    top-k pairs ->
     argmax. NO refinement (4 families tested, all lose to none), NO scale
     prior/clamp (smin/smax=0 = off; the position-aware criterion cannot reward
     collapsed scales), NO sign handling beyond the init canon. topk=200 is
     load-bearing (do not reduce); nsamp is a less-is-more knob (2000/4000 are
     the per-regime optima). Returns (R, t, s), t in the original metric frame."""
-    cost_thr = np.array([np.cos(np.deg2rad(a)) for a in taus])
     nq = prob.shape[1]; k = min(topk, prob.size)
     flat = np.argpartition(prob.ravel(), -k)[-k:]
     ir, iq = flat // nq, flat % nq
@@ -385,15 +317,15 @@ def solve_sim3(solver, prob, topk=200, nsamp=2000, taus=(1.0, 2.0, 3.0),
     Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
     if len(Rs) == 0:
         return np.eye(3), np.zeros(3), 1.0
-    sc = _g24_count_batch(plq[3:], plq[:3], plr[3:], plr[:3],
-                          Rs, ts, ss, cost_thr)      # ladder selection
+    sc = _score_prop(plq, plr, Rs, ts, ss,
+                     np.deg2rad(tau_deg))            # prop selection
     bi = int(np.argmax(sc))
     R, t, s = Rs[bi], ts[bi], float(ss[bi])
     return R, np.asarray(t) / solver.alpha, s
 
 
 # Outdoor/high-noise profile as a convenience (KITTI mono_best-validated):
-SOLVE_SIM3_OUTDOOR = dict(taus=(3.0, 6.0, 9.0), skew_min=0.05, nsamp=4000)
+SOLVE_SIM3_OUTDOOR = dict(tau_deg=10.0, skew_min=0.05, nsamp=4000)
 
 
 def solve_sim3_unified(solver, prob, topk=200, nsamp=None, seed=0,
