@@ -7,11 +7,13 @@ Trains on pre-generated .pkl datasets.
 
 Examples
 --------
-# Standard training on the joint dataset:
-python train.py --dataset joint --batch 32 --lr 5e-4 --gamma 0.99
+# Standard training (foundation generator, hemisphere canon):
+CANON=1 python train.py --dataset synthetic_found6 --geo_edge --bucket_batch \
+    --match_w 0.2 --batch 1 --iter_size 32 --lr 5e-4 --gamma 0.99 --name v33_hemi
 
 # Resume a run:
-python train.py --dataset joint --resume output/joint/2026-05-12/checkpoint.pth
+python train.py --dataset synthetic_found6 --name v33_hemi \
+    --resume output/synthetic_found6/v33_hemi/checkpoint.pth
 """
 import os
 import sys
