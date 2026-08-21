@@ -143,6 +143,64 @@ def geo_knn_idx(raw, k):
     return knn(feat, min(k, raw.size(-1)))
 
 
+def graff_knn_idx(raw, k):
+    """AFFINE-GRASSMANNIAN KNN graph (v34, graff_knn flag) — user's proposal.
+
+    Each line is a point on the affine Grassmannian Graff(1,3) ~ a 2-plane in
+    R^4: span{ c0 = [p0; 1]/||.||,  c1 = orth([d; 0]) }.  This is exactly the
+    representation the SOLVER already scores with (_yz_np / _s2_np), so the
+    matcher's neighbourhood and the solver's inlier criterion finally use ONE
+    geometric primitive.
+
+    The CHORDAL metric on this manifold is L2-EMBEDDABLE: for the rank-2
+    orthogonal projector P = Y Y^T,
+        ||P_i - P_j||_F^2 = 2 (2 - sum_k cos^2 theta_k) = 2 (sin^2 t1 + sin^2 t2)
+    so stacking the 10 unique entries of the symmetric 4x4 projector (sqrt(2)
+    on the off-diagonals) turns the Grassmannian distance into a plain
+    Euclidean distance -> ordinary KNN, same cost as before, and with NO
+    direction/position weighting hyper-parameter: the manifold fixes the
+    relative weighting intrinsically (unlike geo_knn's hand-set GEO_KNN_W).
+
+    Invariances (all unit-tested): SIGN — flipping [m;d] leaves p0 = d x m
+    untouched and sends c1 -> -c1, so the SUBSPACE and hence P are unchanged;
+    ROTATION — R acts as the orthogonal diag(R,1) on R^4, and Frobenius norms
+    are orthogonally invariant; TRANSLATION — p0 is mean-centred first;
+    SCALE — p0 is divided by its median radius.  raw: (B,6,N) -> idx (B,N,k).
+    """
+    m, d = raw[:, :3], raw[:, 3:]
+    d = F.normalize(d, dim=1)
+    p0 = torch.cross(d, m, dim=1)                           # (B,3,N)
+    # TRANSLATION: foot points are NOT translation-equivariant --
+    #   p0' = sRp0 + t - d'(d'.t)  (the shift leaks in direction-dependently),
+    # so mean-centring does NOT remove a world translation.  Use the canonical
+    # Sim(3)-EQUIVARIANT origin instead: c = argmin_x sum_i dist(x, line_i)^2,
+    # i.e. A c = b with A = sum (I - d d^T), b = sum (I - d d^T) p0.  Under
+    # (s,R,t) this maps c -> sRc + t exactly, and the perpendicular offset
+    #   q = (I - d d^T)(p0 - c)   transforms as   q -> s R q,
+    # a pure rotation+scale that the median-radius division then normalises.
+    B, _, N = p0.shape
+    dT = d.transpose(1, 2)                                  # (B,N,3)
+    Proj = torch.eye(3, device=d.device, dtype=d.dtype).expand(B, N, 3, 3) \
+        - dT.unsqueeze(-1) * dT.unsqueeze(-2)               # (B,N,3,3)
+    A = Proj.sum(1) + 1e-6 * torch.eye(3, device=d.device, dtype=d.dtype)
+    b = (Proj @ p0.transpose(1, 2).unsqueeze(-1)).sum(1)    # (B,3,1)
+    c = torch.linalg.solve(A, b)                            # (B,3,1)
+    dp = (p0 - c)                                           # (B,3,N)
+    p0 = dp - d * (d * dp).sum(1, keepdim=True)             # perpendicular part
+    sig = p0.norm(dim=1).median(dim=1).values.clamp_min(1e-9)
+    p0 = p0 / sig.view(-1, 1, 1)                            # scale norm.
+    one = torch.ones_like(p0[:, :1])
+    c0 = F.normalize(torch.cat([p0, one], dim=1), dim=1)    # (B,4,N)
+    c1 = torch.cat([d, torch.zeros_like(one)], dim=1)
+    c1 = F.normalize(c1 - c0 * (c1 * c0).sum(1, keepdim=True), dim=1)
+    s2, feats = 2.0 ** 0.5, []
+    for a in range(4):                                      # vec(P), 10 dims
+        for b in range(a, 4):
+            v = c0[:, a] * c0[:, b] + c1[:, a] * c1[:, b]
+            feats.append(v if a == b else s2 * v)
+    return knn(torch.stack(feats, dim=1), min(k, raw.size(-1)))
+
+
 def geo_edge_features(raw, idx):
     """Sim(3)-INVARIANT relative-geometry edge features (v24, geo_edge flag).
 
@@ -193,12 +251,13 @@ def geo_edge_features(raw, idx):
 class conv_in_seq_direction_moment_knn(nn.Module):
     def __init__(self, out_channel: int, in_channel: int = 6,
                  dual_knn: bool = False, geo_edge: bool = False,
-                 geo_knn: bool = False):
+                 geo_knn: bool = False, graff_knn: bool = False):
         super().__init__()
         half = out_channel // 2
 
         self.geo_edge = geo_edge
         self.geo_knn = geo_knn
+        self.graff_knn = graff_knn
         if geo_edge:
             # third branch mirroring the other two; merged MLP widens
             self.conv_geo = nn.Conv2d(3, half // 8, 1)
@@ -229,7 +288,10 @@ class conv_in_seq_direction_moment_knn(nn.Module):
 
     def forward(self, x, raw=None):
         dir_feat = x[:, :3, :]
-        if self.geo_knn:
+        if self.graff_knn:
+            assert raw is not None, 'graff_knn needs the raw [m;d] input'
+            idx = graff_knn_idx(raw, 10)
+        elif self.geo_knn:
             assert raw is not None, 'geo_knn needs the raw [m;d] input'
             idx = geo_knn_idx(raw, 10)
         else:
@@ -337,11 +399,13 @@ class FeatureExtractorGraph(nn.Module):
         dual_knn = bool(config['dual_knn']) if 'dual_knn' in config else False
         self.geo_edge = bool(config['geo_edge']) if 'geo_edge' in config else False
         self.geo_knn = bool(config['geo_knn']) if 'geo_knn' in config else False
+        self.graff_knn = bool(config['graff_knn']) if 'graff_knn' in config else False
         self.sign_inv = bool(config['sign_inv']) if 'sign_inv' in config else False
         self.sym = SymmetricInputEmbed(in_channel) if self.sign_inv else None
         self.conv_in    = conv_in_seq_direction_moment_knn(
             nc, in_channel=in_channel, dual_knn=dual_knn,
-            geo_edge=self.geo_edge, geo_knn=self.geo_knn)
+            geo_edge=self.geo_edge, geo_knn=self.geo_knn,
+            graff_knn=self.graff_knn)
         self.gnn        = SpatialAttentionalGNN(
             nc, config['GNN_layers'],
             num_heads=int(config['attn_heads']) if 'attn_heads' in config else 4)
@@ -349,7 +413,7 @@ class FeatureExtractorGraph(nn.Module):
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 
     def forward(self, x, y):
-        need_raw = self.geo_edge or self.geo_knn
+        need_raw = self.geo_edge or self.geo_knn or self.graff_knn
         raw_x, raw_y = (x, y) if need_raw else (None, None)
         if self.sym is not None:                # per-line sign-even embedding first
             x, y = self.sym(x), self.sym(y)

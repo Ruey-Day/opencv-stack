@@ -68,7 +68,11 @@ _V4_REF_PERP_M    = 0.02
 _V4_FRAG_P        = (0.65, 0.25, 0.10)  # P(1|2|3 query fragments per real edge)
 _V4_SIGN_FLIP     = 0.5      # SLAM endpoint order is arbitrary → ~50% flipped
 
+_INDOOR = bool(int(os.environ.get('INDOOR', '0')))   # v37 foundation flag
+
 _SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'collision', 'street_mono']
+if _INDOOR:                      # v37: three building-scale indoor families
+    _SCENARIOS = _SCENARIOS + ['building', 'atrium', 'cluttered']
 # v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
 # distribution otherwise unchanged for retention when fine-tuning from v5).
 # v7: add 'street_submap' at 0.12 (asymmetric spatial coverage — the KITTI
@@ -83,6 +87,13 @@ _SCENARIO_P = np.array([0.0756, 0.0567, 0.0567, 0.0693, 0.0378, 0.0882,
                         0.0567, 0.0567, 0.0945, 0.0567, 0.1029, 0.1008,
                         0.16, 0.0])   # last = street_mono (off unless MONO=1)
 _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()   # exact normalization
+# v37 INDOOR: the three building-scale indoor families take 0.18 total
+# (0.06 each), the rest scaled by 0.82 — enough mass to learn the regime
+# without displacing the street/submap families the KITTI rows depend on.
+if _INDOOR:
+    _SCENARIO_P = np.concatenate([_SCENARIO_P * 0.82, np.full(3, 0.06)])
+    _SCENARIO_P = _SCENARIO_P / _SCENARIO_P.sum()
+
 # v24 SUBCAL: street_submap weight 0.10 -> 0.16, others scaled down
 if bool(int(os.environ.get('SUBCAL', '0'))):
     _i_ss = _SCENARIOS.index('street_submap')
@@ -203,6 +214,22 @@ if _SUBCAL:
 # offsets. The DEALIAS pool draws collision-free Poisson vertical sites,
 # per-building facade depth/floor heights, few distinct curb/lane lines and
 # more oblique clutter — targeting real-map multiplicity (~3).
+# INDOOR=1 (v37 foundation): adds the BUILDING-SCALE indoor regimes that the
+# 13 existing families do not cover, aimed at NCLT (Segway + HDL-32E through
+# campus buildings: corridor networks, atriums, planar ground-robot motion,
+# sensor at ~1-2 m) and ScanNet++ (dense laser scan vs iPhone RGB-D: room to
+# multi-room, heavy furniture clutter, full-height handheld coverage).
+#   GEOMETRIC GAP BEING FILLED: our indoor pools live at pos_range ~3 m and the
+#   street pools at 40-250 m — nothing in between, yet NCLT corridors/atriums
+#   and ScanNet++ multi-room scans sit at 15-100 m.  Three families:
+#     building  corridor spine + rooms opening off it, per-room yaw jitter
+#     atrium    tall open volume, railings/balconies repeated at floor heights
+#     cluttered dense short furniture-like edges at varied orientations
+#   plus an indoor HEIGHT-BAND asymmetry (ground robot 0-2.5 m vs handheld/
+#   laser 0-4 m), the indoor analogue of the street height-band disjointness.
+if _INDOOR:                      # defined near _SCENARIOS (needed earlier)
+    os.environ.setdefault('DEALIAS', '1')
+
 _DEALIAS = bool(int(os.environ.get('DEALIAS', '0')))
 if _DEALIAS:
     _SUBCAL = True
@@ -896,12 +923,165 @@ def _make_flip_room_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
     return pool[np.random.permutation(len(pool))].astype(np.float32)[:n]
 
 
+def _make_building_pool(n: int) -> np.ndarray:
+    """v37 INDOOR: a floor plan — one corridor spine with rooms opening off it.
+
+    NCLT/ScanNet++ interiors are neither a single 3 m room nor a 250 m street:
+    corridors run 20-100 m, rooms hang off them, and each room's walls are
+    axis-aligned to ITS OWN frame (buildings are not perfectly Manhattan), so
+    per-room yaw jitter is what breaks the global alias family that a single
+    Manhattan frame would create."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    L = float(np.random.uniform(15.0, 90.0))          # corridor length
+    W = float(np.random.uniform(1.5, 3.5))            # corridor half-width
+    H = float(np.random.uniform(2.4, 4.0))            # ceiling height
+    ez = np.array([0.0, 0.0, 1.0]); ex = np.array([1.0, 0.0, 0.0])
+    ey = np.array([0.0, 1.0, 0.0])
+    lines = []
+    def add(p, d):
+        d = np.asarray(d, np.float64) + np.random.randn(3) * 0.02
+        d /= np.linalg.norm(d) + 1e-9
+        lines.append(np.concatenate([np.cross(np.asarray(p, np.float64), d), d]))
+    # rooms along both sides, each with its own small yaw
+    rooms = []
+    x = 0.0
+    while x < L:
+        rl = float(np.random.uniform(3.0, 9.0))
+        for side in (-1.0, 1.0):
+            yaw = np.random.uniform(-0.06, 0.06)
+            rooms.append((x, min(x + rl, L), side, yaw,
+                          float(np.random.uniform(3.0, 8.0))))
+        x += rl
+    for _ in range(2 * n):
+        r = np.random.random()
+        if r < 0.30:                                   # corridor: wall corners
+            side = -1.0 if np.random.random() < 0.5 else 1.0
+            add([np.random.uniform(0, L), side * W, 0.0], ez)
+        elif r < 0.45:                                 # corridor floor/ceiling run
+            side = -1.0 if np.random.random() < 0.5 else 1.0
+            add([np.random.uniform(0, L), side * W,
+                 np.random.choice([0.0, H])], ex)
+        elif r < 0.75 and rooms:                       # room walls (own yaw)
+            xa, xb, side, yaw, depth = rooms[np.random.randint(len(rooms))]
+            c, sn = np.cos(yaw), np.sin(yaw)
+            Ry = np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
+            u = np.random.random()
+            base = [np.random.uniform(xa, xb), side * (W + np.random.uniform(0, depth)),
+                    np.random.uniform(0, H)]
+            d = ez if u < 0.45 else (Ry @ (ex if u < 0.75 else ey))
+            add(base, d)
+        else:                                          # doors, signage, clutter
+            add([np.random.uniform(0, L), np.random.uniform(-W - 6, W + 6),
+                 np.random.uniform(0, H)], np.random.randn(3))
+    A = np.stack(lines).astype(np.float32)
+    p0 = np.cross(A[:, :3], A[:, 3:])
+    A[:, :3] += np.cross((-np.median(p0, 0))[None].astype(np.float32), A[:, 3:])
+    return A[np.random.choice(len(A), n, replace=(n > len(A)))]
+
+
+def _make_atrium_pool(n: int) -> np.ndarray:
+    """v37 INDOOR: a tall open volume with railings/balconies repeated at floor
+    heights — the NCLT campus atrium / ScanNet++ stairwell regime.  The floor
+    repetition is deliberate structure (it is what makes these spaces alias
+    vertically), but each floor gets its own inset so the copies are not
+    identical."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    R = float(np.random.uniform(6.0, 25.0))            # atrium half-extent
+    nf = np.random.randint(2, 5)                       # floors
+    fh = float(np.random.uniform(3.0, 4.5))
+    ez = np.array([0.0, 0.0, 1.0])
+    lines = []
+    def add(p, d):
+        d = np.asarray(d, np.float64) + np.random.randn(3) * 0.02
+        d /= np.linalg.norm(d) + 1e-9
+        lines.append(np.concatenate([np.cross(np.asarray(p, np.float64), d), d]))
+    insets = np.random.uniform(0.0, 0.25, nf) * R
+    for _ in range(2 * n):
+        r = np.random.random()
+        f = np.random.randint(nf)
+        z = f * fh
+        rr = R - insets[f]
+        if r < 0.40:                                   # balcony railing runs
+            th = np.random.uniform(0, 2 * np.pi)
+            add([rr * np.cos(th), rr * np.sin(th), z + np.random.uniform(0.9, 1.1)],
+                [-np.sin(th), np.cos(th), 0.0])
+        elif r < 0.62:                                 # full-height columns
+            th = np.random.uniform(0, 2 * np.pi)
+            add([rr * np.cos(th), rr * np.sin(th), 0.0], ez)
+        elif r < 0.80:                                 # floor slab edges
+            th = np.random.uniform(0, 2 * np.pi)
+            add([rr * np.cos(th), rr * np.sin(th), z],
+                [-np.sin(th), np.cos(th), 0.0])
+        else:                                          # stairs / clutter
+            add([np.random.uniform(-R, R), np.random.uniform(-R, R),
+                 np.random.uniform(0, nf * fh)], np.random.randn(3))
+    A = np.stack(lines).astype(np.float32)
+    p0 = np.cross(A[:, :3], A[:, 3:])
+    A[:, :3] += np.cross((-np.median(p0, 0))[None].astype(np.float32), A[:, 3:])
+    return A[np.random.choice(len(A), n, replace=(n > len(A)))]
+
+
+def _make_cluttered_pool(n: int) -> np.ndarray:
+    """v37 INDOOR: a room whose line budget is dominated by FURNITURE — many
+    short edges in small locally-axis-aligned clusters at varied orientations.
+    ScanNet++ laser scans resolve this clutter; an iPhone/mono pass sees only
+    part of it, which is the cross-modal asymmetry this family supplies."""
+    if n == 0:
+        return np.zeros((0, 6), np.float32)
+    ext = float(np.random.uniform(3.0, 12.0))
+    H = float(np.random.uniform(2.4, 3.5))
+    lines = []
+    def add(p, d):
+        d = np.asarray(d, np.float64) + np.random.randn(3) * 0.03
+        d /= np.linalg.norm(d) + 1e-9
+        lines.append(np.concatenate([np.cross(np.asarray(p, np.float64), d), d]))
+    n_obj = np.random.randint(6, 20)
+    objs = []
+    for _ in range(n_obj):
+        ctr = np.array([np.random.uniform(-ext, ext), np.random.uniform(-ext, ext),
+                        np.random.uniform(0.0, 1.2)])
+        yaw = np.random.uniform(0, np.pi)
+        size = np.random.uniform(0.3, 1.2, 3)
+        objs.append((ctr, yaw, size))
+    for _ in range(2 * n):
+        if np.random.random() < 0.65 and objs:          # furniture edge
+            ctr, yaw, size = objs[np.random.randint(len(objs))]
+            c, sn = np.cos(yaw), np.sin(yaw)
+            Ry = np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
+            axis = Ry @ np.eye(3)[np.random.randint(3)]
+            off = Ry @ (np.random.uniform(-1, 1, 3) * size)
+            add(ctr + off, axis)
+        else:                                           # room shell
+            u = np.random.random()
+            if u < 0.5:
+                side = np.random.choice([-1.0, 1.0]); ax = np.random.randint(2)
+                p = [0.0, 0.0, np.random.uniform(0, H)]; p[ax] = side * ext
+                p[1 - ax] = np.random.uniform(-ext, ext)
+                add(p, np.eye(3)[2] if np.random.random() < 0.4 else np.eye(3)[1 - ax])
+            else:
+                add([np.random.uniform(-ext, ext), np.random.uniform(-ext, ext),
+                     np.random.choice([0.0, H])], np.eye(3)[np.random.randint(2)])
+    A = np.stack(lines).astype(np.float32)
+    p0 = np.cross(A[:, :3], A[:, 3:])
+    A[:, :3] += np.cross((-np.median(p0, 0))[None].astype(np.float32), A[:, 3:])
+    return A[np.random.choice(len(A), n, replace=(n > len(A)))]
+
+
 def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     if n == 0:
         return np.zeros((0, 6), np.float32)
 
     if pool_type == 'collision':
         return _make_collision_pool(n)
+
+    if pool_type == 'building':
+        return _make_building_pool(n)
+    if pool_type == 'atrium':
+        return _make_atrium_pool(n)
+    if pool_type == 'cluttered':
+        return _make_cluttered_pool(n)
 
     if pool_type in ('street', 'street_submap'):
         # v6: no shuffle here — _make_street_pool's weighted order IS the
@@ -1141,6 +1321,32 @@ def _generate_pair() -> dict:
         noise1       = 0.3
         noise2       = 0.1
         pool_type    = 'street'
+    elif scenario == 'building':
+        # v37 NCLT/ScanNet++ indoor: corridor spine + rooms, 15-90 m.  Both
+        # maps are metric-ish (LiDAR<->laser) OR mono at unknown scale; sizes
+        # sit between room and street.  Height-band asymmetry is applied
+        # below via _indoor_band.
+        n2           = np.random.randint(300, 3000)
+        n1           = max(80, min(int(n2 * np.random.uniform(0.15, 1.4)), 3000))
+        overlap_frac = float(np.random.beta(2.2, 6.0))     # med ~0.25
+        noise1       = float(np.exp(np.random.uniform(np.log(0.01), np.log(0.20))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.002), np.log(0.05))))
+        pool_type    = 'building'
+    elif scenario == 'atrium':
+        n2           = np.random.randint(200, 2200)
+        n1           = max(80, min(int(n2 * np.random.uniform(0.15, 1.4)), 2200))
+        overlap_frac = float(np.random.beta(2.2, 6.0))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.01), np.log(0.20))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.002), np.log(0.05))))
+        pool_type    = 'atrium'
+    elif scenario == 'cluttered':
+        # ScanNet++-like: dense laser reference vs a partial handheld/mono pass
+        n2           = np.random.randint(400, 4000)
+        n1           = max(100, min(int(n2 * np.random.uniform(0.10, 1.0)), 4000))
+        overlap_frac = float(np.random.beta(2.0, 5.0))
+        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.15))))
+        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
+        pool_type    = 'cluttered'
     else:  # corridor
         # Corridor / stairwell — 1-2 dominant directions, higher noise
         n2           = np.random.randint(50, 450)
@@ -1222,6 +1428,18 @@ def _generate_pair() -> dict:
         s = float(np.exp(np.clip(np.random.normal(np.log(16.0), 0.45),
                                  np.log(8.0), np.log(42.0))))
         t_range_eff = 10.0 * s
+    if scenario in ('building', 'atrium', 'cluttered'):
+        # HALF the indoor pairs are metric<->metric (LiDAR vs laser scan:
+        # NCLT-to-NCLT, ScanNet++ laser-to-iPhone-with-depth, s ~ 1) and half
+        # are mono at unknown scale (s 2-40) — covering both cells of the
+        # indoor modality study with margin rather than fitting either.
+        if np.random.random() < 0.5:
+            s = float(np.exp(np.clip(np.random.normal(0.0, 0.15),
+                                     np.log(0.7), np.log(1.4))))
+        else:
+            s = float(np.exp(np.clip(np.random.normal(np.log(6.0), 0.9),
+                                     np.log(1.5), np.log(40.0))))
+        t_range_eff = 0.35 * s
     t   = np.random.uniform(-t_range_eff, t_range_eff, 3).astype(np.float32)
     s_i, R_i, t_i = 1.0 / s, R.T, -(R.T @ t) / s
 
