@@ -108,16 +108,54 @@ class Sim3Solver:
         self.p_q = segments_to_plucker(self.q1, self.q2)
         self.p_r = segments_to_plucker(self.r1, self.r2)
 
-    def matcher_input(self):
+    def matcher_input(self, canon=True):
         """(p_q, p_r) as the network expects them: the already-alpha-normalized
-        Plücker lines with moments whitened by the query moment std.  Reuses
-        p_q/p_r — no second Plücker conversion, no second scaling."""
-        std = float(self.p_q[:, :3].std()) + 1e-6
+        Plücker lines, hemisphere sign-canonicalized, with moments whitened by
+        the query moment std.  Reuses p_q/p_r — no second Plücker conversion,
+        no second scaling.
+
+        `canon=True` (SHIPPED default) applies the hemisphere sign canon, which
+        is what every canon-trained checkpoint expects.  Pass `canon=False` for
+        a legacy `sign_inv=True` checkpoint (e.g. the locked v19), which does
+        its own sign handling in the embedding — feeding it canonicalized lines
+        is a train/test mismatch.  `load_network` sets `model.canon`, so callers
+        should pass that rather than guessing.
+
+        ORDER IS LOAD-BEARING: the training dataloader canonicalizes BEFORE
+        computing the whitening std, and the sign flips change that std, so the
+        canon must come first here too or the scale differs from training.
+        The solver's own self.p_q/self.p_r are NEVER canonicalized (see
+        canonicalize_sign) — only these returned copies are.
+        """
+        p_q, p_r = self.p_q, self.p_r
+        if canon:
+            p_q, p_r = canonicalize_sign(p_q), canonicalize_sign(p_r)
+        std = float(p_q[:, :3].std()) + 1e-6
 
         def w(p):
             return np.concatenate([p[:, :3] / std, p[:, 3:]], 1).astype(np.float32)
 
-        return w(self.p_q), w(self.p_r)
+        return w(p_q), w(p_r)
+
+
+def canonicalize_sign(p):
+    """p: (N, 6) [m; d] -> hemisphere sign canon. Flip each 6-vector JOINTLY so
+    the largest-|component| of the DIRECTION (channels 3:6) is >= 0.
+
+    SHIPPED 2026-08-21 as the matcher's sign handling (replaces the sign-even
+    embedding `sign_inv`, which was REJECTED: rotation sweep gave 95.1% inlier
+    retention at 180 deg for the canon vs 53.2% for sign_inv). Idempotent, so
+    datasets with baked-in random flips are reused unchanged.
+
+    NOTE this is a MATCHER-side operation only. The solver must NEVER canon its
+    own lines: foot points f = d x m are ALREADY sign-invariant, and multiplying
+    them by a sign canon is a bug that once cost a 22 -> 17/37 misread.
+    """
+    d = p[:, 3:6]
+    idx = np.argmax(np.abs(d), axis=1)
+    sg = np.sign(d[np.arange(len(d)), idx])
+    sg[sg == 0] = 1.0
+    return p * sg[:, None]
 
 
 def _skew(v):

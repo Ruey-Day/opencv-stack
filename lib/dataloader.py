@@ -21,7 +21,12 @@ from torch.utils.data import Dataset
 # 3:6, see feedback on inverted channel names) is >= 0. Idempotent w.r.t. the
 # generator's baked-in 50% random sign flips, so the existing dataset is reused
 # unchanged; must be applied identically at inference (segments_to_plucker).
-_CANON = bool(int(os.environ.get('CANON', '0')))
+# SHIPPED 2026-08-21: the hemisphere canon is now the DEFAULT (sign_inv was
+# rejected — see the rotation sweep in CLAUDE.md). CANON=0 reproduces the old
+# sign-even-embedding runs. ONE definition, shared with inference via
+# Sim3Solver.matcher_input(canon=...) so train and eval can never drift apart.
+from lib.sim3_solver import canonicalize_sign          # noqa: E402
+_CANON = bool(int(os.environ.get('CANON', '1')))
 
 # MAX_LINES: cap per-cloud line count in training to bound the O(N^2) attention
 # + dense (n1,n2) match-matrix memory. The FULL dataset has clouds up to ~6000
@@ -63,13 +68,6 @@ def _cap_cloud(pl, matches_ind, row, max_n):
         mi = mi[:, mi[row] >= 0]     # drop matches whose inlier was truncated
         matches_ind = mi
     return pl, matches_ind
-
-def canonicalize_sign(p):
-    """p: (N, 6) [m, d]. Flip [m; d] jointly so d's largest-|comp| >= 0."""
-    d = p[:, 3:6]
-    idx = np.argmax(np.abs(d), axis=1)
-    s = np.sign(d[np.arange(len(d)), idx]); s[s == 0] = 1.0
-    return p * s[:, None]
 
 def variable_collate(batch):
     """

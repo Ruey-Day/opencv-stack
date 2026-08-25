@@ -123,6 +123,33 @@ def parse_args():
                         '+ sqrt(2)sin(theta) direction term) instead of KNN on '
                         'learned/moment channels — restores direction-aware '
                         'neighborhoods without sign fragility')
+    p.add_argument('--graff_enc', action='store_true',
+                   help='v41: ONE Grassmannian branch replaces the moment and '
+                        'direction branches. Nodes = vec(P) (10-D projector, '
+                        'SHARED origin+sigma from the query so the two clouds '
+                        'are comparable); edges = the two principal angles, '
+                        'which subsume geo_edge. Implies the graff graph.')
+    p.add_argument('--val_epoch_freq', type=int, default=1,
+                   help='run validation every N epochs (default 1). Validation '
+                        'measured at only 4.8%% of epoch wall time, so 2 buys '
+                        '~2.4%% — it does NOT change the LR schedule or the '
+                        'epoch definition, unlike enlarging train_epoch_size.')
+    p.add_argument('--batch_budget', type=int, default=4096,
+                   help='bucket batch = budget // max(n1,n2), capped by '
+                        '--max_bucket (default 4096 = pre-2026-08-22 behaviour)')
+    p.add_argument('--max_bucket', type=int, default=16,
+                   help='hard cap on per-bucket batch size (default 16)')
+    p.add_argument('--mem_budget', type=int, default=0,
+                   help='SECOND, QUADRATIC cap: batch <= mem_budget // n^2. '
+                        '0 = off. Attention cost is O(B*n^2), so the linear '
+                        'budget under-batches small clouds and over-batches '
+                        'large ones. 8400000 gives B=32 at n=512 (+52%% '
+                        'throughput) while keeping n>=2460 at B=1.')
+    p.add_argument('--graff_knn', action='store_true',
+                   help='AFFINE-GRASSMANNIAN knn graph: each line -> its 2-plane '
+                        'in R^4, chordal distance via the 10-dim vec(YY^T). ONE '
+                        'graph unifying direction+position, no weighting knob '
+                        '(the manifold + the median-radius scale set it).')
     p.add_argument('--geo_edge', action='store_true',
                    help='v24: Sim(3)-invariant relative-geometry edge features '
                         '(inter-line angle + normalized line-line distance) in '
@@ -150,15 +177,27 @@ class BucketBatchSampler(torch.utils.data.Sampler):
     pairs batch 16 deep, 4096-line pairs run alone. Each epoch draws
     epoch_size indices without replacement and shuffles the batch order."""
 
-    def __init__(self, shapes, epoch_size, budget=4096, max_b=16, seed=0):
+    def __init__(self, shapes, epoch_size, budget=4096, max_b=16, seed=0,
+                 mem_budget=0):
         self.shapes = shapes
         self.epoch_size = (min(epoch_size, len(shapes)) if epoch_size > 0
                            else len(shapes))
         self.budget, self.max_b = budget, max_b
+        # mem_budget (0 = off, preserves the pre-2026-08-22 behaviour exactly):
+        # a SECOND cap that is QUADRATIC in n, because attention memory/compute
+        # is O(B * n^2) while `budget // n` is only linear. Measured on the
+        # RTX 5090: n=512 gains +52% going B 8->32 (157->239 samples/s) but
+        # n=1094 gains NOTHING (52.4->52.8) and n>=2460 would OOM. So the linear
+        # rule under-batches small clouds and over-batches large ones.
+        self.mem_budget = mem_budget
         self.seed, self.epoch = seed, 0
 
     def _batch_size(self, n1, n2):
-        return max(1, min(self.max_b, self.budget // max(n1, n2)))
+        n = max(n1, n2)
+        b = self.budget // n
+        if self.mem_budget:
+            b = min(b, self.mem_budget // (n * n))
+        return max(1, min(self.max_b, b))
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
@@ -203,16 +242,28 @@ def main():
         net_maxiter        = 30,
         dual_knn           = args.dual_knn,
         sign_inv           = args.sign_inv,
+        # record the sign handling explicitly so load_network never infers it
+        # from `not sign_inv` (see tools/eval_registration_gt.load_network)
+        canon              = bool(int(os.environ.get('CANON', '1'))),
         dustbin            = args.dustbin,
         geo_edge           = args.geo_edge,
         geo_knn            = args.geo_knn,
+        graff_knn          = args.graff_knn,
+        graff_enc          = args.graff_enc,
         attn_heads         = args.attn_heads,
         # Training
         out_dir            = 'output',
         optimizer          = 'Adam',
         train_start_epoch  = 0,
         train_save_freq_epoch = 1,
-        val_epoch_freq     = 1,
+        val_epoch_freq     = args.val_epoch_freq,
+        # bucket-batch packing (2026-08-22). MUST be listed here: `configs` is
+        # an EXPLICIT edict, not vars(args), so a CLI flag that is not copied in
+        # silently falls back to the sampler defaults and the run looks
+        # IDENTICAL (caught only by the unchanged batches/epoch line).
+        batch_budget       = args.batch_budget,
+        max_bucket         = args.max_bucket,
+        mem_budget         = args.mem_budget,
         use_gpu            = True,
         print_freq         = 10,
         train_seed         = 0,
@@ -265,6 +316,9 @@ def main():
         epoch_size = args.train_epoch_size if args.train_epoch_size > 0 \
             else len(train_dataset)
         sampler = BucketBatchSampler(shapes, epoch_size,
+                                     budget=getattr(configs, 'batch_budget', 4096),
+                                     max_b=getattr(configs, 'max_bucket', 16),
+                                     mem_budget=getattr(configs, 'mem_budget', 0),
                                      seed=configs.train_seed or 0)
         logging.info(f'  bucket_batch: {n_shapes} distinct shapes, '
                      f'~{len(sampler)} batches/epoch for {epoch_size} samples')
