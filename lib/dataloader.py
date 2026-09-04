@@ -11,22 +11,12 @@ Expected .pkl layout:
         s_gt.pkl        list of float32 scalars
 """
 import os
+import sys
 import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# CANON=1 : hemisphere sign-canonicalisation of [m, d] lines (v14 experiment).
-# Flip each 6-vector jointly so the largest-|component| of the DIRECTION (chan
-# 3:6, see feedback on inverted channel names) is >= 0. Idempotent w.r.t. the
-# generator's baked-in 50% random sign flips, so the existing dataset is reused
-# unchanged; must be applied identically at inference (segments_to_plucker).
-# SHIPPED 2026-08-21: the hemisphere canon is now the DEFAULT (sign_inv was
-# rejected — see the rotation sweep in CLAUDE.md). CANON=0 reproduces the old
-# sign-even-embedding runs. ONE definition, shared with inference via
-# Sim3Solver.matcher_input(canon=...) so train and eval can never drift apart.
-from lib.sim3_solver import canonicalize_sign          # noqa: E402
-_CANON = bool(int(os.environ.get('CANON', '1')))
 
 # MAX_LINES: cap per-cloud line count in training to bound the O(N^2) attention
 # + dense (n1,n2) match-matrix memory. The FULL dataset has clouds up to ~6000
@@ -152,10 +142,6 @@ class Sim3PluckerData(Dataset):
             plucker1 = plucker1[:, :self.in_channel]
             plucker2 = plucker2[:, :self.in_channel]
 
-        if _CANON:                       # v14: remove sign DOF before the encoder
-            plucker1 = canonicalize_sign(plucker1)
-            plucker2 = canonicalize_sign(plucker2)
-
         # Moment normalisation: divide BOTH clouds by plucker2 (query) std.
         # This preserves the scale ratio p1_inlier/p2 ≈ s_gt, which is the
         # key matching signal, while keeping moments in a manageable range.
@@ -182,3 +168,108 @@ class Sim3PluckerData(Dataset):
 
     def __len__(self):
         return self.len
+
+# ── LIVE (on-the-fly) generation ──────────────────────────────────────────────
+# Restored from commit 9736be6 ("code clean up" removed it) and adapted:
+#   * import path moved scripts.generate_synthetic -> generate_synthetic
+#   * buffered per EPOCH so the existing BucketBatchSampler still works
+#     (it needs all shapes up front; a pair's shape is only known after it is
+#     generated, so we materialise one epoch at a time)
+#   * the NEXT epoch is generated asynchronously during training, so at
+#     192 pairs/s (6 workers) vs 62 samples/s consumed it hides entirely.
+# WHY: a fixed set is re-seen 25x (300k) to 154x (50k) over a 240-epoch run,
+# and v63 measured the cost -- the 50k subset trails the 300k parent by 1.98
+# and widening. Live generation removes repetition entirely and frees the
+# ~15 GB the dataset otherwise holds in RAM.
+
+def _live_worker_init(seed):
+    import numpy as _np, os as _os
+    _np.random.seed((seed * 7919 + _os.getpid()) % (2 ** 32))
+
+
+def _live_one(_ignored):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    global _LIVE_GEN
+    try:
+        _LIVE_GEN
+    except NameError:
+        from generate_synthetic import _generate_pair as _g
+        _LIVE_GEN = _g
+    d = _LIVE_GEN()
+    return (d['matches'], d['plucker1'], d['plucker2'],
+            d['R_gt'], d['t_gt'], d['s_gt'])
+
+
+def _pairs_to_dict(rows):
+    return dict(matches=[r[0] for r in rows], plucker1=[r[1] for r in rows],
+                plucker2=[r[2] for r in rows], R_gt=[r[3] for r in rows],
+                t_gt=[r[4] for r in rows], s_gt=[r[5] for r in rows])
+
+
+class Sim3LiveData(Sim3PluckerData):
+    """Sim3PluckerData over a buffer of FRESH pairs, refilled every epoch.
+
+    Reuses the parent __getitem__ verbatim (canon, moment whitening, capping),
+    so live and file-backed training differ ONLY in where the pairs come from.
+    """
+
+    def __init__(self, config, epoch_size, workers=6, seed=0):
+        Dataset.__init__(self)
+        import multiprocessing as _mp
+        self.in_channel = getattr(config, 'in_channel', None)
+        self.epoch_size = int(epoch_size)
+        self._pool = _mp.get_context('spawn').Pool(
+            workers, initializer=_live_worker_init, initargs=(seed,))
+        self.data = self._gen()
+        self.len = self.epoch_size
+        self._pending = None
+        self._first = True      # constructor already made epoch 1
+
+    def _gen(self):
+        # imap, not map: map materialises the ENTIRE 32000-pair result in the
+        # parent at once (~1.5 GB) on top of the buffer already held, giving a
+        # transient peak at every epoch boundary. imap yields incrementally so
+        # only one chunk is in flight. Prefetch was also dropped -- it doubled
+        # the resident buffers for a 12% throughput gain, and live runs kept
+        # dying at epoch boundaries with the whole process group going at once.
+        rows = []
+        for r in self._pool.imap_unordered(_live_one, range(self.epoch_size),
+                                           chunksize=64):
+            rows.append(r)
+        return _pairs_to_dict(rows)
+
+    def _start_prefetch(self):
+        # map_async, NOT a Python thread. A thread that iterates imap and
+        # appends 32000 results holds the GIL throughout, so it does NOT
+        # overlap training -- measured 14.7 min/epoch vs 8.5 file-backed
+        # (generation running effectively serially). map_async collects in
+        # multiprocessing's own handler, which releases the GIL during IPC:
+        # measured 9.6 min/epoch, i.e. 12% overhead instead of 73%.
+        self._pending = self._pool.map_async(_live_one, range(self.epoch_size),
+                                             chunksize=64)
+
+    def regenerate(self):
+        """Swap in the prefetched epoch; start generating the next.
+
+        Overlap matters: generating 32000 pairs takes ~7 min, so doing it
+        synchronously at every epoch boundary would nearly double epoch time
+        (measured: the run stalled 7 min at the start of epoch 0). A THREAD is
+        used rather than map_async because pool.imap releases the GIL while
+        waiting, and imap accumulates incrementally -- map_async materialised a
+        second full copy in the parent, which is the transient peak the earlier
+        crashes coincided with.
+        """
+        if self._first:                      # epoch 1 is already in self.data
+            self._first = False
+            self._start_prefetch()
+            return
+        if self._pending is not None:
+            self.data = _pairs_to_dict(self._pending.get())
+            self._pending = None
+        self._start_prefetch()
+
+    def shapes(self):
+        return [(len(a), len(b)) for a, b in zip(self.data['plucker1'],
+                                                 self.data['plucker2'])]

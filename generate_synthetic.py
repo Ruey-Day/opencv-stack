@@ -73,16 +73,10 @@ _INDOOR = bool(int(os.environ.get('INDOOR', '0')))   # v37 foundation flag
 _SCENARIOS  = ['room', 'submap', 'relocalize', 'loop', 'dense_sparse', 'manhattan', 'corridor', 'hard_noise', 'adversarial', 'outdoor', 'street', 'street_submap', 'collision', 'street_mono']
 if _INDOOR:                      # v37: three building-scale indoor families
     _SCENARIOS = _SCENARIOS + ['building', 'atrium', 'cluttered']
-# v6: add 'street' at 0.14, previous weights scaled by 0.86 (indoor
-# distribution otherwise unchanged for retention when fine-tuning from v5).
-# v7: add 'street_submap' at 0.12 (asymmetric spatial coverage — the KITTI
-# submap-localization test showed v6 never saw a query covering only a
-# fraction of the reference's AREA); previous weights scaled by 0.88.
-# v8: add 'flip_room' at 0.10 (repetitive-room flip alias — the measured
-# chess/seq05-class matcher blindness), previous weights scaled by 0.90.
-# v9: flip_room 0.14. v10: flip_room REPLACED by 'collision' at 0.16
-# (measured failure = learned-descriptor collision on dense similar
-# lines, NOT rotational symmetry; flip_room modeled the wrong thing).
+# Weights below are current; their revision history is in git. One durable
+# finding: a 'flip_room' scenario (repetitive-room ROTATIONAL alias) was tried
+# and REPLACED by 'collision' -- the measured matcher failure is descriptor
+# collision on dense similar lines, not rotational symmetry.
 _SCENARIO_P = np.array([0.0756, 0.0567, 0.0567, 0.0693, 0.0378, 0.0882,
                         0.0567, 0.0567, 0.0945, 0.0567, 0.1029, 0.1008,
                         0.16, 0.0])   # last = street_mono (off unless MONO=1)
@@ -120,6 +114,32 @@ def _random_rotation() -> np.ndarray:
 # training data). Rayleigh(24.6 deg) angle -> median ~29, mean ~31; uniform
 # axis (real axes are general, tilt median 63 deg from vertical). Capped 85 deg.
 _ROT_CAL = bool(int(os.environ.get('ROT_CAL', '0')))
+
+# SOUND=1 : coverage-corrected regime sampling (2026-09-04).  Two measured
+# defects in found8, both fixed here WITHOUT narrowing support:
+#
+#  (a) ROTATION.  "Uniform in angle over [0,180]" sounds assumption-free, but
+#      uniformity is PARAMETERIZATION-dependent: it puts median 80-90 deg and
+#      only ~32% of pairs below 58 deg, while both benchmarks sit at 1-29 deg.
+#      Measured consequence: just 8.0% of found8 lands in the 7-Scenes
+#      operating regime.  The fix is NOT a cap (v19 capped at 90 deg and paid
+#      for it: 4.9% inlier retention at 180 deg vs v41's 91.2%) but a MIXTURE
+#      -- half uniform-in-angle, half log-uniform in angle.  Support is
+#      unchanged (still full SO(3), still 31% of pairs above 90 deg); the
+#      log-uniform half just buys equal mass per OCTAVE of rotation, so the
+#      1-30 deg band stops being starved.
+#
+#  (b) INDOOR SCALE.  building/atrium/cluttered drew scale log-uniform over
+#      [0.25,100] -- 6 octaves, which is assumption-free in the parameter but
+#      leaves only 18.1% of their mass in the indoor band, WORSE than the
+#      generic room/manhattan scenarios' 36%.  Since those three differ from
+#      room ONLY in the line pool, they should share its difficulty regime;
+#      SOUND gives them the same base scale law (plus the metric<->metric bump,
+#      which is a real modality cell, not a fit).
+#
+# This is importance sampling, not benchmark fitting: nothing is removed from
+# the support, density is added where the method is deployed.
+_SOUND = bool(int(os.environ.get('SOUND', '0')))
 # BROAD=1: train on SET broad ranges (rotation, noise severity) that cover the
 # realistic cross-modal regime with margin, INSTEAD of statistics calibrated to
 # the benchmark. Stronger paper argument (we bound the regime, not fit it) and a
@@ -289,7 +309,12 @@ def _pair_rotation() -> np.ndarray:
     if _BROAD:
         ax = np.random.randn(3); ax /= np.linalg.norm(ax) + 1e-12
         # FOUND: full SO(3) coverage (uniform angle 0-180). FULL/BROAD: [0, 90].
-        ang = np.radians(np.random.uniform(0.0, 180.0 if _FOUND else 90.0))
+        _hi = 180.0 if _FOUND else 90.0
+        if _SOUND and np.random.random() < 0.5:
+            # log-uniform half: equal mass per octave of rotation (see _SOUND).
+            ang = np.radians(float(np.exp(np.random.uniform(np.log(0.5), np.log(_hi)))))
+        else:
+            ang = np.radians(np.random.uniform(0.0, _hi))
         K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
         return (np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
     if not _ROT_CAL:
@@ -876,53 +901,6 @@ def _make_collision_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
     return pool[np.random.permutation(len(pool))].astype(np.float32)[:n]
 
 
-def _make_flip_room_pool(n: int, pos_range: float = 3.0) -> np.ndarray:
-    """v8 repetitive room: a Manhattan-world room containing a COPY of a
-    large fraction of its own structure rotated by 90/180 deg about the
-    vertical axis (with jitter) — the internal symmetry that makes real
-    rooms like 7-Scenes chess flip-alias. A matcher that relies on local
-    direction/moment patterns scores ZERO here (every line has a
-    convincing rotated twin); disambiguation requires the asymmetric
-    minority + global moment context. Targets the measured chess/seq05 /
-    stairs failure mode (matcher P@200 = 0 despite 1,000 GT pairs)."""
-    if n == 0:
-        return np.zeros((0, 6), np.float32)
-    # v9 recalibration (v8's exact 2deg/5cm twin made the matcher learn a
-    # brittle "reject all symmetric matches" rule -> real-pair REGRESSION,
-    # zero transfer). Fixes: (a) the twin is a NEAR-flip, angle jittered off
-    # 90/180 by up to +-12deg (real rooms are not exactly orthogonal);
-    # (b) heavy, variable geometric noise (4-11deg / 8-22cm) so twins are
-    # convincing-but-imperfect, not artificial duplicates; (c) more partial
-    # (45-75% of base) and a LARGER asymmetric minority — the disambiguating
-    # signal the model must learn to weight.
-    n_base = max(8, int(n * np.random.uniform(0.35, 0.50)))
-    base = _make_manhattan_world(n_base, pos_range=pos_range)
-    ang = np.deg2rad(np.random.choice([90.0, 180.0, 270.0])
-                     + np.random.uniform(-12.0, 12.0))
-    # near-vertical flip axis, slightly tilted (real rooms aren't gravity-exact)
-    axis = np.array([np.random.uniform(-0.12, 0.12),
-                     np.random.uniform(-0.12, 0.12), 1.0])
-    axis /= np.linalg.norm(axis)
-    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
-                  [-axis[1], axis[0], 0]])
-    Rz = (np.eye(3) + np.sin(ang) * K
-          + (1 - np.cos(ang)) * (K @ K)).astype(np.float32)
-    m, d = base[:, :3], base[:, 3:]
-    twin = np.concatenate([(Rz @ m.T).T, (Rz @ d.T).T],
-                          axis=1).astype(np.float32)
-    twin = _physical_noise(twin, np.random.uniform(4.0, 11.0),
-                           np.random.uniform(0.08, 0.22))
-    n_copy = int(len(twin) * np.random.uniform(0.45, 0.75))
-    twin = twin[np.random.choice(len(twin), n_copy, replace=False)]
-    # asymmetric minority: unique clutter that breaks the symmetry
-    n_rest = max(0, n - len(base) - len(twin))
-    parts = [base, twin]
-    if n_rest > 0:
-        parts.append(_make_outliers(n_rest, pos_range=pos_range))
-    pool = np.concatenate(parts, axis=0)
-    return pool[np.random.permutation(len(pool))].astype(np.float32)[:n]
-
-
 def _make_building_pool(n: int) -> np.ndarray:
     """v37 INDOOR: a floor plan — one corridor spine with rooms opening off it.
 
@@ -1175,201 +1153,127 @@ def _make_pool(n: int, pool_type: str = 'mixed') -> np.ndarray:
     return pool[np.random.permutation(len(pool))].astype(np.float32)
 
 
+
+# ── Scenario table ────────────────────────────────────────────────────────────
+# The generator samples TWO independent things: a STRUCTURE (which pool of line
+# primitives builds the scene) and a DIFFICULTY REGIME (overlap fraction, noise,
+# cloud sizes).  They used to be entangled in a 193-line if/elif chain of 16
+# hand-written branches, which invited "why these sixteen?" -- and three of them
+# (building / atrium / cluttered) were byte-identical apart from the pool.
+#
+# The table below is that chain, transcribed.  Same distributions, declarative.
+# The numbers are FITTED, not chosen -- overlap Betas and size ranges for the
+# street family come from measured KITTI statistics (annotations kept inline).
+# Do not "tidy" those; they are the calibration the zero-shot claim rests on.
+#
+#   size:  ('ratio', n2_lo, n2_hi, r_lo, r_hi, n1_min, n1_cap)
+#              n2 ~ U[n2_lo,n2_hi];  n1 = clip(n2 * U[r_lo,r_hi], n1_min, n1_cap)
+#          ('indep', n1_lo, n1_hi, n2_lo, n2_hi)      both drawn independently
+#          ('equal', lo, hi)                          n1 == n2
+#          ('logbase', b_lo, b_hi, r_lo, r_hi)        log-uniform base, ratio split
+#          ('nested', n1_lo, n1_hi, n2_lo, n2_hi)     n2 >= n1 (submap in a map)
+#   ovl:   Beta(a, b) on the matched fraction of min(n1, n2)
+#   nz1/nz2: log-uniform noise (metres) on query / reference; a scalar means fixed
+
+def _street_sizes():
+    """The street family's sizes/overlap are flag-dependent and CALIBRATED."""
+    if _DEALIAS:   return ('indep', 500, 3500, 800, 6000), (2.5, 7.5)    # mf med ~0.17
+    if _FULL:      return ('indep', 500, 3500, 800, 6000), (1.7, 20.0)   # ~8%, bounds KITTI 2-8
+    if _KITTI_MONO:return ('indep', 900, 3300, 1300, 5600), (2.0, 30.0)  # real 4.5-8%
+    return ('ratio', 600, 2200, 0.4, 1.6, 200, 2200), (2.0, 7.0)         # mean ~0.22
+
+
+def _street_submap_sizes():
+    if _SUBCAL:    return ('indep', 100, 850, 800, 6000), (2.4, 6.8)     # real 27-62%
+    if _FULL:      return ('indep', 250, 1400, 800, 6000), (1.7, 18.0)   # ~9%
+    if _KITTI_MONO:return ('indep', 300, 1200, 1300, 5600), (2.0, 26.0)  # mean ~0.07
+    return ('indep', 150, 600, 800, 2200), (2.0, 6.0)                    # mean ~0.25
+
+
+_INDOOR_CLEAN = dict(nz1=(0.005, 0.12), nz2=(0.001, 0.04))
+_BUILDING     = dict(size=('ratio', 120, 4096, 0.08, 2.0, 64, 4096),
+                     ovl=(1.3, 3.0), nz1=(0.005, 0.35), nz2=(0.001, 0.08))
+
+_SPEC = {
+    'room':        dict(pool='mixed',   size=('ratio', 80, 1100, 0.3, 3.0, 30, 1100),
+                        ovl=(3.0, 2.0), **_INDOOR_CLEAN),
+    'submap':      dict(pool='mixed',   size=('nested', 30, 150, 80, 700),
+                        ovl=(2.5, 3.5), nz1=(0.010, 0.15), nz2=(0.001, 0.04)),
+    'relocalize':  dict(pool='mixed',   size=('logbase', 30, 400, 0.5, 2.0),
+                        ovl=(2.5, 2.5), nz1=(0.005, 0.10), nz2='same'),
+    'loop':        dict(pool='mixed',   size=('equal', 40, 500),
+                        ovl=(5.0, 2.0), nz1=(0.003, 0.06), nz2='same'),
+    'dense_sparse':dict(pool='mixed',   size=('ratio', 150, 700, 0.10, 0.50, 30, 10**9),
+                        ovl=(2.5, 2.0), nz1=(0.005, 0.12), nz2=(0.001, 0.03)),
+    'manhattan':   dict(pool='manhattan', size=('ratio', 80, 900, 0.2, 2.5, 30, 900),
+                        ovl=(3.0, 2.5), **_INDOOR_CLEAN),
+    'corridor':    dict(pool='corridor', size=('ratio', 50, 450, 0.2, 1.8, 30, 450),
+                        ovl=(2.0, 3.0), nz1=(0.010, 0.15), nz2=(0.002, 0.05)),
+    'hard_noise':  dict(pool='mixed',   size=('ratio', 80, 600, 0.3, 2.0, 30, 10**9),
+                        ovl=(1.5, 6.0), nz1=(0.05, 0.50), nz2=(0.01, 0.10), conf=True),
+    'adversarial': dict(pool='adversarial', size=('ratio', 80, 800, 0.3, 2.5, 30, 800),
+                        ovl=(3.0, 2.5), conf=True, **_INDOOR_CLEAN),
+    'collision':   dict(pool='collision', size=('ratio', 300, 1100, 0.4, 2.0, 80, 1100),
+                        ovl=(2.5, 3.0), conf=True, **_INDOOR_CLEAN),
+    'outdoor':     dict(pool='outdoor', size=('ratio', 60, 500, 0.2, 2.0, 30, 500),
+                        ovl=(2.5, 2.0), nz1=(0.02, 0.60), nz2=(0.005, 0.20)),
+    'street':      dict(pool='street',  size=None, ovl=None, nz1=0.3, nz2=0.1),
+    'street_submap':dict(pool='street_submap', size=None, ovl=None, nz1=0.3, nz2=0.1),
+    'street_mono': dict(pool='street',  size=('indep', 300, 3300, 300, 5600),
+                        ovl=(2.0, 9.0), nz1=0.3, nz2=0.1),
+    'building':    dict(pool='building',  **_BUILDING),
+    'atrium':      dict(pool='atrium',    **_BUILDING),
+    'cluttered':   dict(pool='cluttered', **_BUILDING),
+}
+
+
+def _draw_sizes(spec):
+    kind = spec[0]
+    if kind == 'ratio':
+        _, n2lo, n2hi, rlo, rhi, n1min, n1cap = spec
+        n2 = np.random.randint(n2lo, n2hi)
+        return max(n1min, min(int(n2 * np.random.uniform(rlo, rhi)), n1cap)), n2
+    if kind == 'indep':
+        _, a, b, c, d = spec
+        return np.random.randint(a, b), np.random.randint(c, d)
+    if kind == 'equal':
+        n = np.random.randint(spec[1], spec[2]);  return n, n
+    if kind == 'logbase':
+        _, blo, bhi, rlo, rhi = spec
+        base = int(np.exp(np.random.uniform(np.log(blo), np.log(bhi))))
+        r = np.random.uniform(rlo, rhi)
+        return max(30, int(base * r)), max(30, int(base / r))
+    if kind == 'nested':
+        _, a, b, c, d = spec
+        n1 = np.random.randint(a, b)
+        return n1, np.random.randint(max(n1, c), d)
+    raise ValueError(spec)
+
+
+def _logu(rng):
+    return float(np.exp(np.random.uniform(np.log(rng[0]), np.log(rng[1]))))
+
+
+def _sample_scenario():
+    """-> (scenario, n1, n2, overlap_frac, noise1, noise2, pool_type, confusers)"""
+    name = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
+    sp = _SPEC[name]
+    size, ovl = sp['size'], sp['ovl']
+    if name == 'street':          size, ovl = _street_sizes()
+    elif name == 'street_submap': size, ovl = _street_submap_sizes()
+    n1, n2 = _draw_sizes(size)
+    nz1 = sp['nz1'] if np.isscalar(sp['nz1']) else _logu(sp['nz1'])
+    nz2 = nz1 if sp['nz2'] == 'same' else (
+        sp['nz2'] if np.isscalar(sp['nz2']) else _logu(sp['nz2']))
+    return (name, n1, n2, float(np.random.beta(*ovl)), nz1, nz2,
+            sp['pool'], sp.get('conf', False))
+
+
 # ── Pair generator ────────────────────────────────────────────────────────────
 
 def _generate_pair() -> dict:
-    scenario = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
-
-    pool_type   = 'mixed'
-    use_confusers = False  # whether to add near-parallel confuser outliers
-
-    if scenario == 'room':
-        n2           = np.random.randint(80, 1100)
-        n1           = max(30, min(int(n2 * np.random.uniform(0.3, 3.0)), 1100))
-        overlap_frac = float(np.random.beta(3.0, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
-    elif scenario == 'submap':
-        n1           = np.random.randint(30, 150)
-        n2           = np.random.randint(max(n1, 80), 700)
-        overlap_frac = float(np.random.beta(2.5, 3.5))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.15))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
-    elif scenario == 'relocalize':
-        base         = int(np.exp(np.random.uniform(np.log(30), np.log(400))))
-        r            = np.random.uniform(0.5, 2.0)
-        n1           = max(30, int(base * r))
-        n2           = max(30, int(base / r))
-        overlap_frac = float(np.random.beta(2.5, 2.5))
-        noise1 = noise2 = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.10))))
-    elif scenario == 'loop':
-        n1 = n2      = np.random.randint(40, 500)
-        overlap_frac = float(np.random.beta(5.0, 2.0))
-        noise1 = noise2 = float(np.exp(np.random.uniform(np.log(0.003), np.log(0.06))))
-    elif scenario == 'dense_sparse':
-        n2           = np.random.randint(150, 700)
-        n1           = max(30, int(n2 * np.random.uniform(0.10, 0.50)))
-        overlap_frac = float(np.random.beta(2.5, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.03))))
-    elif scenario == 'manhattan':
-        # Indoor manhattan world — 3 orthogonal line families, moderate noise
-        n2           = np.random.randint(80, 900)
-        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 2.5)), 900))
-        overlap_frac = float(np.random.beta(3.0, 2.5))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
-        pool_type    = 'manhattan'
-    elif scenario == 'hard_noise':
-        # Very few inliers (5-20%), high noise, confuser outliers near inlier directions.
-        # Models the worst-case SLAM drift / low-overlap scenario.
-        n2           = np.random.randint(80, 600)
-        n1           = max(30, int(n2 * np.random.uniform(0.3, 2.0)))
-        overlap_frac = float(np.random.beta(1.5, 6.0))   # mode ≈ 0.08, mean ≈ 0.20
-        noise1       = float(np.exp(np.random.uniform(np.log(0.05), np.log(0.50))))  # v3: raised ceiling 0.30→0.50
-        noise2       = float(np.exp(np.random.uniform(np.log(0.01), np.log(0.10))))
-        use_confusers = True
-        pool_type    = 'mixed'
-    elif scenario == 'adversarial':
-        # 3 tight orthogonal direction families, mixed positions — forces moment-based disambiguation.
-        # Directly targets the structured/indoor dense-overlap failure mode.
-        n2           = np.random.randint(80, 800)
-        n1           = max(30, min(int(n2 * np.random.uniform(0.3, 2.5)), 800))
-        overlap_frac = float(np.random.beta(3.0, 2.5))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.12))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.04))))
-        pool_type    = 'adversarial'
-        use_confusers = True
-    elif scenario == 'outdoor':
-        # Large-scale outdoor: building facades and structures at 8–20 m spatial range.
-        # Reference |m| ~ 10–20 m (metric LiDAR); query |m| ~ 4–8 m (mono drone / camera).
-        n2           = np.random.randint(60, 500)
-        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 2.0)), 500))
-        overlap_frac = float(np.random.beta(2.5, 2.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.02), np.log(0.60))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.20))))
-        pool_type    = 'outdoor'
-    elif scenario == 'street':
-        # v6 KITTI-calibrated street canyon: metric-metric scale, large
-        # elongated clouds (real: query 1.3-2.6k, ref 1.8-2.3k lines),
-        # low overlap (measured 18-24% matched query fraction), periodic
-        # facades whose repetitions ARE the confuser structure — no
-        # synthetic confusers needed; the pool aliases itself under
-        # 180-deg flips and street-axis translations.
-        if _DEALIAS:
-            # found6 recalibration: drift-corrected GT corr (1 m gate) measures
-            # matched-query 14-21% on the real mono_best full maps — the old
-            # Beta(1.7,20) ~8% was fit to the pre-drift-correction 0.5 m gate
-            n2           = np.random.randint(800, 6000)
-            n1           = np.random.randint(500, 3500)
-            overlap_frac = float(np.random.beta(2.5, 7.5))   # mf med ~0.17, covers 0.08-0.35
-        elif _FULL:
-            n2           = np.random.randint(800, 6000)    # bounded street-size range
-            n1           = np.random.randint(500, 3500)
-            overlap_frac = float(np.random.beta(1.7, 20.0))  # ~8%, tail ~20% (bounds KITTI 2-8)
-        elif _KITTI_MONO:
-            n2           = np.random.randint(1300, 5600)   # LiDAR ref (real 1273-5599)
-            n1           = np.random.randint(900, 3300)    # mono query (real 942-3295)
-            overlap_frac = float(np.random.beta(2.0, 30.0))  # mean ~0.06 (real 4.5-8%)
-        else:
-            n2           = np.random.randint(600, 2200)
-            n1           = max(200, min(int(n2 * np.random.uniform(0.4, 1.6)),
-                                        2200))
-            overlap_frac = float(np.random.beta(2.0, 7.0))   # mean ~0.22
-        noise1       = 0.3
-        noise2       = 0.1
-        pool_type    = 'street'
-    elif scenario == 'street_submap':
-        # v7: submap localization — the query covers only a contiguous
-        # 15-35% WINDOW of the reference street's area (a short mono drive
-        # inside a full prior LiDAR map), at mono-ambiguous scale. The
-        # reference keeps the whole street; query inliers AND outliers are
-        # confined to the window (asymmetric spatial coverage — the
-        # distribution v6 lacked). Overlap is the shared fraction WITHIN
-        # the window (same height-band logic as 'street').
-        if _SUBCAL:
-            # v24: calibrated to the measured submap-quarter benchmark
-            n2           = np.random.randint(800, 6000)    # full route (real 1273-5599)
-            n1           = np.random.randint(100, 850)     # quarter (real 115-821)
-            overlap_frac = float(np.random.beta(2.4, 6.8))  # found6: mf med ~0.35 (real 27-62%), covers 0.15-0.55
-        elif _FULL:
-            n2           = np.random.randint(800, 6000)    # full route, bounded range
-            n1           = np.random.randint(250, 1400)    # short submap
-            overlap_frac = float(np.random.beta(1.7, 18.0))  # ~9%, tail ~22% within window
-        elif _KITTI_MONO:
-            n2           = np.random.randint(1300, 5600)   # full LiDAR route
-            n1           = np.random.randint(300, 1200)    # short mono submap
-            overlap_frac = float(np.random.beta(2.0, 26.0))  # mean ~0.07 within window
-        else:
-            n2           = np.random.randint(800, 2200)
-            n1           = np.random.randint(150, 600)
-            overlap_frac = float(np.random.beta(2.0, 6.0))   # mean ~0.25 of window
-        noise1       = 0.3
-        noise2       = 0.1
-        pool_type    = 'street_submap'
-    elif scenario == 'collision':
-        # v10 dense-room descriptor-collision (see _make_collision_pool):
-        # many locally-similar lines + heavy near-DUPLICATE query confusers
-        # (moment_dup). Targets the measured chess/seq05 failure: the matcher
-        # produces spurious flip-consistent matches because local descriptors
-        # collide, not because the room is symmetric. High density, moderate
-        # overlap, confusers ON.
-        n2           = np.random.randint(300, 1100)
-        n1           = max(80, min(int(n2 * np.random.uniform(0.4, 2.0)),
-                                   1100))
-        overlap_frac = float(np.random.beta(2.5, 3.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005),
-                                                      np.log(0.12))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001),
-                                                      np.log(0.04))))
-        use_confusers = True
-        pool_type    = 'collision'
-    elif scenario == 'street_mono':
-        # ALIGNED mono full-map -> LiDAR (the KITTI mono_best regime): small
-        # inter-map rotation (overridden below) + LARGE arbitrary mono scale.
-        # Calibrated to test_data/kitti/gt_corr/*_mono_best.npz (03/05/06/07/10):
-        # ref (LiDAR) ~0.9-5.6k lines, query (mono) ~0.3-3.3k, overlap 9-57%
-        # (median ~40%), scale 9-39, rotation 0.6-6 deg (gravity-aligned frames).
-        n2           = np.random.randint(300, 5600)
-        n1           = np.random.randint(300, 3300)
-        overlap_frac = float(np.random.beta(2.0, 9.0))   # found6: unique-matched-query med ~0.17 (real 14-21%), covers to ~0.35
-        noise1       = 0.3
-        noise2       = 0.1
-        pool_type    = 'street'
-    elif scenario == 'building':
-        # v37 NCLT/ScanNet++ indoor: corridor spine + rooms, 15-90 m.  Both
-        # maps are metric-ish (LiDAR<->laser) OR mono at unknown scale; sizes
-        # sit between room and street.  Height-band asymmetry is applied
-        # below via _indoor_band.
-        n2           = np.random.randint(120, 4096)
-        n1           = max(64, min(int(n2 * np.random.uniform(0.08, 2.0)), 4096))
-        overlap_frac = float(np.random.beta(1.3, 3.0))     # spans ~0.03-0.80
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.35))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.08))))
-        pool_type    = 'building'
-    elif scenario == 'atrium':
-        n2           = np.random.randint(120, 4096)
-        n1           = max(64, min(int(n2 * np.random.uniform(0.08, 2.0)), 4096))
-        overlap_frac = float(np.random.beta(1.3, 3.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.35))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.08))))
-        pool_type    = 'atrium'
-    elif scenario == 'cluttered':
-        # ScanNet++-like: dense laser reference vs a partial handheld/mono pass
-        n2           = np.random.randint(120, 4096)
-        n1           = max(64, min(int(n2 * np.random.uniform(0.08, 2.0)), 4096))
-        overlap_frac = float(np.random.beta(1.3, 3.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.005), np.log(0.35))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.001), np.log(0.08))))
-        pool_type    = 'cluttered'
-    else:  # corridor
-        # Corridor / stairwell — 1-2 dominant directions, higher noise
-        n2           = np.random.randint(50, 450)
-        n1           = max(30, min(int(n2 * np.random.uniform(0.2, 1.8)), 450))
-        overlap_frac = float(np.random.beta(2.0, 3.0))
-        noise1       = float(np.exp(np.random.uniform(np.log(0.010), np.log(0.15))))
-        noise2       = float(np.exp(np.random.uniform(np.log(0.002), np.log(0.05))))
-        pool_type    = 'corridor'
+    (scenario, n1, n2, overlap_frac, noise1, noise2,
+     pool_type, use_confusers) = _sample_scenario()
 
     k  = max(_MIN_INLIERS, int(overlap_frac * min(n1, n2)))
     n1 = max(n1, k)
@@ -1453,6 +1357,11 @@ def _generate_pair() -> dict:
         # same-units and unknown-scale cells are covered without fitting either
         if np.random.random() < 0.30:
             s = float(np.exp(np.random.uniform(np.log(0.7), np.log(1.4))))
+        elif _SOUND:
+            # same base law as room/manhattan/corridor -- these scenarios differ
+            # from them only in the line POOL, so they share the regime.
+            s = float(np.exp(np.clip(np.random.normal(_SCALE_LOG_CENTER, 1.0),
+                                     np.log(0.25), np.log(100.0))))
         else:
             s = float(np.exp(np.random.uniform(np.log(0.25), np.log(100.0))))
         t_range_eff = float(np.random.uniform(0.1, 1.0)) * s
@@ -1582,11 +1491,9 @@ def _generate_pair() -> dict:
     if _FOUND and np.random.random() < 0.35:
         query_all = _apply_traj_drift(query_all)
 
-    # v4: ~50% Plücker sign flips on BOTH clouds (endpoint order is arbitrary
-    # in SLAM; a flipped [m,d] is the same line, so labels are unaffected)
-    for arr in (query_all, ref_all):
-        flip = np.random.random(len(arr)) < _V4_SIGN_FLIP
-        arr[flip] *= -1.0
+    # No sign-flip augmentation: the Grassmannian encoder is sign-invariant
+    # BY CONSTRUCTION (measured 0.000e+00), so flipping only burned capacity.
+    # Do not re-add.
 
     i_q = np.random.permutation(len(query_all))
     i_r = np.random.permutation(len(ref_all))
@@ -1715,7 +1622,8 @@ def main():
               f'[4,48]), street overlap Beta(1.7,20) bounded-not-fit, BROAD rotation/severity, '
               f'all {len(_SCENARIOS)} scenarios')
         print(f'Flags: FOUND={_FOUND} INDOOR={_INDOOR} MONO={_MONO} GHOST={_GHOST} '
-              f'SUBCAL={_SUBCAL} DEALIAS={_DEALIAS} KITTI_MONO={_KITTI_MONO}')
+              f'SUBCAL={_SUBCAL} DEALIAS={_DEALIAS} KITTI_MONO={_KITTI_MONO} '
+              f'SOUND={_SOUND}')
     else:
         print(f'Scale distribution: LogNormal(log({np.exp(_SCALE_LOG_CENTER):.1f}), {_SCALE_LOG_STD}) '
               f'clipped to {_SCALE_RANGE}   [BROAD={_BROAD} KITTI_MONO={_KITTI_MONO}]')

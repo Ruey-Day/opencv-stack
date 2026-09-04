@@ -108,34 +108,35 @@ class Sim3Solver:
         self.p_q = segments_to_plucker(self.q1, self.q2)
         self.p_r = segments_to_plucker(self.r1, self.r2)
 
-    def matcher_input(self, canon=True):
+    def matcher_input(self):
         """(p_q, p_r) as the network expects them: the already-alpha-normalized
-        Plücker lines, hemisphere sign-canonicalized, with moments whitened by
-        the query moment std.  Reuses p_q/p_r — no second Plücker conversion,
-        no second scaling.
+        Plücker lines with moments whitened by the QUERY moment std, applied to
+        BOTH clouds.  Reuses p_q/p_r — no second Plücker conversion, no second
+        scaling.
 
-        `canon=True` (SHIPPED default) applies the hemisphere sign canon, which
-        is what every canon-trained checkpoint expects.  Pass `canon=False` for
-        a legacy `sign_inv=True` checkpoint (e.g. the locked v19), which does
-        its own sign handling in the embedding — feeding it canonicalized lines
-        is a train/test mismatch.  `load_network` sets `model.canon`, so callers
-        should pass that rather than guessing.
+        This whitening is the matcher's ONLY normalization, and it is NOT the
+        solver's alpha: alpha cancels here exactly (it scales the query moments
+        and their std by the same factor), so the matcher is invariant to the
+        choice of world units, while the query/reference scale RATIO survives.
+        Verified: scaling both clouds by 1e-2 or 1e2 leaves this output
+        identical to float32 noise.
 
-        ORDER IS LOAD-BEARING: the training dataloader canonicalizes BEFORE
-        computing the whitening std, and the sign flips change that std, so the
-        canon must come first here too or the scale differs from training.
-        The solver's own self.p_q/self.p_r are NEVER canonicalized (see
-        canonicalize_sign) — only these returned copies are.
+        THE HEMISPHERE CANON WAS REMOVED 2026-09-04.  It is a literal no-op for
+        the Grassmannian encoder: flipping [m;d] -> [-m;-d] is the SAME LINE, it
+        leaves p0 = d x m untouched and only sends c1 -> -c1, so the subspace
+        and hence P = Y Y^T are unchanged (measured 0.000e+00 under random
+        per-line flips).  Its only remaining effect was to perturb the whitening
+        std by ~0.14%.  The k-NN graph and graff_stats are sign-invariant too.
+        NOTE the SOLVER's own sign handling is a different thing and STAYS:
+        solve_sim3 canonicalizes query line 1 and proposes BOTH signs of line 2
+        for the G(2,4) criterion to arbitrate (see the module docstring).
         """
-        p_q, p_r = self.p_q, self.p_r
-        if canon:
-            p_q, p_r = canonicalize_sign(p_q), canonicalize_sign(p_r)
-        std = float(p_q[:, :3].std()) + 1e-6
+        std = float(self.p_q[:, :3].std()) + 1e-6
 
         def w(p):
             return np.concatenate([p[:, :3] / std, p[:, 3:]], 1).astype(np.float32)
 
-        return w(p_q), w(p_r)
+        return w(self.p_q), w(self.p_r)
 
 
 def canonicalize_sign(p):
@@ -235,7 +236,11 @@ def _solve_ts_batch(Mq, Dq, Mr, Rs):              # joint (t,s) per hypothesis
         A[:, r + 2, 0] = rd[:, 1]; A[:, r + 2, 1] = -rd[:, 0]
         A[:, r:r + 3, 3] = Rm[:, l]; b[:, r:r + 3] = Mr[:, l]
     AtA = np.einsum('nij,nik->njk', A, A) + 1e-9 * np.eye(4)
-    x = np.linalg.solve(AtA, np.einsum('nij,ni->nj', A, b))
+    # NumPy 2 changed np.linalg.solve broadcasting: with a STACKED (n,4,4)
+    # matrix a (n,4) right-hand side is now read as one matrix, not a batch
+    # of vectors, and raises. Make the batch-of-vectors intent explicit.
+    rhs = np.einsum('nij,ni->nj', A, b)[..., None]
+    x = np.linalg.solve(AtA, rhs)[..., 0]
     return x[:, :3], x[:, 3]
 
 

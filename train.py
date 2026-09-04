@@ -7,9 +7,11 @@ Trains on pre-generated .pkl datasets.
 
 Examples
 --------
-# Standard training (foundation generator, hemisphere canon):
-CANON=1 python train.py --dataset synthetic_found6 --geo_edge --bucket_batch \
-    --match_w 0.2 --batch 1 --iter_size 32 --lr 5e-4 --gamma 0.99 --name v33_hemi
+# Standard training (the shipped configuration -- there are no architecture
+# flags left; the encoder is the Grassmannian one described in lib/model.py):
+FOUND=1 INDOOR=1 MONO=1 DEALIAS=1 python train.py --dataset synthetic_found8 \
+    --bucket_batch --match_w 0.2 --batch 1 --iter_size 32 --lr 5e-4 \
+    --gamma 0.99 --train_epoch_size 32000 --name v69_clean
 
 # Resume a run:
 python train.py --dataset synthetic_found6 --name v33_hemi \
@@ -97,38 +99,22 @@ def parse_args():
                    help='Warm-start from checkpoint (strict=False)')
     p.add_argument('--resume',   default=None,
                    help='Resume training from checkpoint')
-    p.add_argument('--dual_knn', action='store_true',
-                   help='moment sub-network aggregates over a MOMENT-space '
-                        'KNN graph (adds no params; warm-start compatible)')
-    p.add_argument('--sign_inv', action='store_true',
-                   help='per-line sign-EVEN input embedding phi(x)+phi(-x): makes '
-                        'the matcher invariant to Plucker sign by construction '
-                        '(no random-flip aug / canonicalisation needed)')
 
     p.add_argument('--nchannel', type=int, default=128,
                    help='network channel width (v19=128; 256 ~4x params)')
     p.add_argument('--gnn_pairs', type=int, default=6,
                    help='num self+cross GNN layer pairs (v19=6 -> 12 layers)')
 
-    p.add_argument('--dustbin', action='store_true',
-                   help='v24: SuperGlue-style unbalanced Sinkhorn with a '
-                        'learnable no-match bin — unmatched lines park mass '
-                        'in the bin instead of polluting real pairs (real '
-                        'cross-modal overlap is 2-8%%)')
     p.add_argument('--attn_heads', type=int, default=4,
                    help='attention heads in the GNN (default 4 = upstream; '
                         '1 = single-head ablation, same param count)')
-    p.add_argument('--geo_knn', action='store_true',
-                   help='v29: sign-invariant GEOMETRIC KNN graph (foot points '
-                        '+ sqrt(2)sin(theta) direction term) instead of KNN on '
-                        'learned/moment channels — restores direction-aware '
-                        'neighborhoods without sign fragility')
-    p.add_argument('--graff_enc', action='store_true',
-                   help='v41: ONE Grassmannian branch replaces the moment and '
-                        'direction branches. Nodes = vec(P) (10-D projector, '
-                        'SHARED origin+sigma from the query so the two clouds '
-                        'are comparable); edges = the two principal angles, '
-                        'which subsume geo_edge. Implies the graff graph.')
+    
+    p.add_argument('--live', action='store_true',
+                   help='Generate training pairs on the fly: infinite unique pairs, '
+                        'no repetition, ~15 GB less host RAM. One epoch is buffered '
+                        'so BucketBatchSampler still works; the next is prefetched '
+                        'asynchronously (192 pairs/s at 6 workers vs 62/s consumed).')
+    p.add_argument('--live_workers', type=int, default=6)
     p.add_argument('--val_epoch_freq', type=int, default=1,
                    help='run validation every N epochs (default 1). Validation '
                         'measured at only 4.8%% of epoch wall time, so 2 buys '
@@ -145,15 +131,6 @@ def parse_args():
                         'budget under-batches small clouds and over-batches '
                         'large ones. 8400000 gives B=32 at n=512 (+52%% '
                         'throughput) while keeping n>=2460 at B=1.')
-    p.add_argument('--graff_knn', action='store_true',
-                   help='AFFINE-GRASSMANNIAN knn graph: each line -> its 2-plane '
-                        'in R^4, chordal distance via the 10-dim vec(YY^T). ONE '
-                        'graph unifying direction+position, no weighting knob '
-                        '(the manifold + the median-radius scale set it).')
-    p.add_argument('--geo_edge', action='store_true',
-                   help='v24: Sim(3)-invariant relative-geometry edge features '
-                        '(inter-line angle + normalized line-line distance) in '
-                        'the input encoder')
     p.add_argument('--init_from', default=None,
                    help='checkpoint to initialize WEIGHTS from (fresh '
                         'optimizer/scheduler/epoch counter — unlike --resume). '
@@ -191,6 +168,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         # rule under-batches small clouds and over-batches large ones.
         self.mem_budget = mem_budget
         self.seed, self.epoch = seed, 0
+        self.live_ds = None
 
     def _batch_size(self, n1, n2):
         n = max(n1, n2)
@@ -200,6 +178,12 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         return max(1, min(self.max_b, b))
 
     def __iter__(self):
+        # LIVE: pull a fresh epoch of pairs and re-read their shapes. The
+        # buffer was prefetched during the previous epoch, so .regenerate()
+        # normally returns immediately.
+        if getattr(self, 'live_ds', None) is not None:
+            self.live_ds.regenerate()
+            self.shapes = self.live_ds.shapes()
         rng = np.random.default_rng(self.seed + self.epoch)
         self.epoch += 1
         idx = rng.choice(len(self.shapes), self.epoch_size, replace=False)
@@ -240,16 +224,6 @@ def main():
         GNN_layers         = ['self', 'cross'] * args.gnn_pairs,
         net_lambda         = 0.1,
         net_maxiter        = 30,
-        dual_knn           = args.dual_knn,
-        sign_inv           = args.sign_inv,
-        # record the sign handling explicitly so load_network never infers it
-        # from `not sign_inv` (see tools/eval_registration_gt.load_network)
-        canon              = bool(int(os.environ.get('CANON', '1'))),
-        dustbin            = args.dustbin,
-        geo_edge           = args.geo_edge,
-        geo_knn            = args.geo_knn,
-        graff_knn          = args.graff_knn,
-        graff_enc          = args.graff_enc,
         attn_heads         = args.attn_heads,
         # Training
         out_dir            = 'output',
@@ -306,7 +280,16 @@ def main():
     # ── Build data loaders ────────────────────────────────────────────────────
     collate = variable_collate if args.batch > 1 else None
 
-    train_dataset = Sim3PluckerData(phase='train', config=configs)
+    if args.live:
+        from lib.dataloader import Sim3LiveData
+        _ep = args.train_epoch_size if args.train_epoch_size > 0 else 19200
+        logging.info(f'  [live] generating first epoch ({_ep} pairs, '
+                     f'{args.live_workers} workers)...')
+        train_dataset = Sim3LiveData(configs, _ep, workers=args.live_workers,
+                                     seed=configs.train_seed or 0)
+        logging.info('  [live] ready; next epoch prefetches during training')
+    else:
+        train_dataset = Sim3PluckerData(phase='train', config=configs)
 
     if args.bucket_batch:
         shapes = [(len(p1), len(p2)) for p1, p2 in
@@ -320,13 +303,17 @@ def main():
                                      max_b=getattr(configs, 'max_bucket', 16),
                                      mem_budget=getattr(configs, 'mem_budget', 0),
                                      seed=configs.train_seed or 0)
+        if args.live:
+            # the sampler refreshes the buffer + shapes at each __iter__
+            sampler.live_ds = train_dataset
+            sampler.epoch_size = min(epoch_size, len(train_dataset))
         logging.info(f'  bucket_batch: {n_shapes} distinct shapes, '
                      f'~{len(sampler)} batches/epoch for {epoch_size} samples')
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=sampler,
-            num_workers=args.workers, pin_memory=True,
-            persistent_workers=(args.workers > 0),
+            num_workers=(0 if args.live else args.workers), pin_memory=True,
+            persistent_workers=(args.workers > 0 and not args.live),
             collate_fn=variable_collate,
         )
         train_loader.epoch_samples = epoch_size

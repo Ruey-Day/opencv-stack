@@ -15,6 +15,43 @@ from tensorboardX import SummaryWriter
 from lib.utils import load_model, ensure_dir, AverageMeter, Timer
 from lib.loss import TotalLoss
 
+class _DualWriter:
+    """SummaryWriter that also mirrors scalars to Weights & Biases.
+
+    Opt-in via WANDB=1. Every existing self.writer.add_scalar(...) call is
+    forwarded unchanged to TensorBoard, so a run WITHOUT WANDB behaves exactly
+    as before; wandb is a pure add-on. Requires `wandb login` (or WANDB_API_KEY)
+    — scalars are uploaded to wandb.ai.
+    """
+
+    def __init__(self, sw, wb=None):
+        self._sw, self._wb = sw, wb
+        self.spe = None          # iterations per epoch; set by the trainer
+
+    def add_scalar(self, tag, value, global_step=None, *a, **k):
+        self._sw.add_scalar(tag, value, global_step, *a, **k)
+        if self._wb is None:
+            return
+        try:
+            # TensorBoard keeps a separate step series per tag; wandb has ONE
+            # global counter. train/* is logged per ITERATION and val/* per
+            # EPOCH, so forwarding global_step raw would stack every val point
+            # at the far left -- and epoch 0 logs at -n_steps, which wandb
+            # rejects outright. Put both on a shared `epoch` axis instead.
+            row = {tag: float(value)}
+            if global_step is not None:
+                if tag.startswith('train/') and self.spe:
+                    row['epoch'] = global_step / float(self.spe) + 1.0
+                elif not tag.startswith('train/'):
+                    row['epoch'] = float(global_step)
+            self._wb.log(row)
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._sw, name)
+
+
 class Sim3Trainer:
 
     def __init__(self, config, data_loader, val_data_loader=None):
@@ -69,7 +106,30 @@ class Sim3Trainer:
         except Exception as e:
             logging.warning(f'torch.compile unavailable, running eager: {e}')
             self.net = self.model
-        self.writer = SummaryWriter(logdir=self.checkpoint_dir)
+        _wb = None
+        if os.environ.get('WANDB', '0') == '1':
+            try:
+                import wandb as _wandb
+                # DETERMINISTIC id: without one, resume='allow' has nothing to
+                # resume and every restart creates a NEW run. The GPU drives a
+                # display, so the CUDA watchdog kills runs regularly and the
+                # supervisor restarts them -- v65 fragmented into two runs
+                # before this was fixed. md5(name) keeps all restarts on ONE
+                # wandb run, matching tools/wandb_backfill.py.
+                _rn = osp.basename(str(self.checkpoint_dir).rstrip('/'))
+                _wandb.init(project=os.environ.get('WANDB_PROJECT', 'scalepluckernet'),
+                            name=_rn,
+                            id=__import__('hashlib').md5(_rn.encode()).hexdigest()[:8],
+                            config=dict(config), resume='allow')
+                _wandb.define_metric('epoch')
+                _wandb.define_metric('train/*', step_metric='epoch')
+                _wandb.define_metric('val/*', step_metric='epoch')
+                _wb = _wandb
+                logging.info('wandb: streaming to project '
+                             + os.environ.get('WANDB_PROJECT', 'scalepluckernet'))
+            except Exception as e:
+                logging.warning('wandb disabled (%s: %s)' % (type(e).__name__, e))
+        self.writer = _DualWriter(SummaryWriter(logdir=self.checkpoint_dir), _wb)
 
         if config.resume is not None:
             if osp.isfile(config.resume):
@@ -150,7 +210,10 @@ class Sim3Trainer:
         start_iter = (epoch - 1) * max(1, (getattr(self.data_loader, 'epoch_samples', None)
                                            or len(self.data_loader)) // iter_size)
         data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
-        loss_fn = TotalLoss(getattr(self.config, 'match_w', 0.0)).to(self.device)
+        loss_fn = TotalLoss(
+            getattr(self.config, 'match_w', 0.0),
+            getattr(self.config, 'dustbin_w', 0.0) if getattr(self.config, 'dustbin', False) else 0.0
+        ).to(self.device)
 
         # iter_size counts SAMPLES per optimizer step (not loader batches):
         # with a bucketed loader a batch carries B samples, so we accumulate
@@ -159,6 +222,7 @@ class Sim3Trainer:
         n_samples_epoch = getattr(self.data_loader, 'epoch_samples', None) \
             or len(self.data_loader)
         n_steps = max(1, n_samples_epoch // iter_size)
+        self.writer.spe = n_steps
         for curr_iter in range(n_steps):
             self.optimizer.zero_grad()
             # accumulate logging stats on-device; sync once per iteration
